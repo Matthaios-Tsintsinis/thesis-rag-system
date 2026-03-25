@@ -1,0 +1,28 @@
+# Ignore virtual environment folders
+venv/
+env/
+.env/
+
+# Ignore Python cache files (speeds up Python, but doesn't need to be shared)
+__pycache__/
+*.py[cod]
+*$py.class
+
+
+# Ignore the PDFs and data 
+data/*
+!data/.gitkeep
+
+# Ignore local ChromaDB storage 
+chroma_db/
+*.sqlite3
+
+# Mac
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# VS Code / JetBrains
+.vscode/
+.idea/
