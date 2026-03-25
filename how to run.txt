@@ -1,6 +1,0 @@
-put pdf into data folder
-
-run in cmd:
-
-	venv\Scripts\activate
-	python naive_rag.py
