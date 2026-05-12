@@ -71,6 +71,11 @@ CLOSED_BOOK_SYSTEM_PROMPT = (
     "If you do not know the answer, say so explicitly rather than fabricate."
 )
 
+M8_LOW_CONFIDENCE_ANSWER = (
+    "I do not have sufficient evidence in the provided documents to answer "
+    "this question reliably."
+)
+
 
 # --- Typed configs --------------------------------------------------------
 
@@ -114,10 +119,48 @@ class GenerationConfig:
 
 
 @dataclass(frozen=True)
+class M8Config:
+    """M8-specific knobs (ported from existing hierarchical-RAG notebook).
+
+    Linear `alpha_dense` fusion stays here — that's what distinguishes M8.
+    M3 already covers the RRF variant. Don't switch this.
+    """
+
+    # tree
+    tree_max_depth: int = 4
+    tree_min_cluster_size: int = 24
+    tree_branching_factor: int = 4
+    tree_top_branches_per_level: int = 2
+    tree_keywords_top_n: int = 8
+
+    # hybrid fusion (linear; not RRF)
+    alpha_dense: float = 0.75
+
+    # query views (templated only; LLM-generated views are M7's job)
+    max_query_views: int = 4
+    enable_query_view_generation: bool = False
+
+    # candidate selection
+    top_docs_after_tree: int = 5
+    top_chunks_per_doc_for_context: int = 3
+    context_neighbor_radius: int = 1
+    rerank_top_n: int = 30
+    top_k_final: int = FINAL_CONTEXT_CHUNKS
+
+    # abstention (sigmoid of cross-encoder logit)
+    abstention_threshold: float = 0.35
+
+    # TF-IDF keyword extractor fix
+    tfidf_min_df: int = 2
+    tfidf_max_df: float = 0.95
+
+
+@dataclass(frozen=True)
 class HarnessConfig:
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
     chunking: ChunkingConfig = field(default_factory=ChunkingConfig)
     generation: GenerationConfig = field(default_factory=GenerationConfig)
+    m8: M8Config = field(default_factory=M8Config)
 
 
 DEFAULT_CONFIG = HarnessConfig()

@@ -15,6 +15,10 @@ beautifulsoup4>=4.12
 pandas>=2.0
 openpyxl>=3.1                   # xlsx engine for pandas
 
+# --- M8 hierarchical clustering ---
+scikit-learn>=1.4               # MiniBatchKMeans + TfidfVectorizer
+nltk>=3.8                       # EN+EL stopwords for TF-IDF keyword extractor
+
 # --- Generator (Qwen2.5-3B-Instruct, 4-bit NF4 on CUDA) ---
 transformers>=4.44
 torch>=2.2
