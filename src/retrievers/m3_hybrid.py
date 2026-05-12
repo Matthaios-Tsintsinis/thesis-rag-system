@@ -5,24 +5,43 @@ are fused with RRF (k=60) per Cormack et al. (2009). No hierarchy.
 This isolates the value of hybrid retrieval separately from hierarchy,
 so the M4/M7 wins cannot be confounded with "hybrid beat dense-only".
 
-Built in memory; persistent on-disk caching arrives with src.cache in a
-later commit.
+Same content-addressed cache as M2; the cache key also folds in the
+sparse-retriever name so M2 and M3 do not share the same key.
 """
 
 from __future__ import annotations
 
 import re
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from .. import paths
+from ..cache import (
+    CacheDir,
+    Manifest,
+    compute_cache_key,
+    corpus_content_hash,
+    load_chunks,
+    load_pickle,
+    save_chunks,
+    save_embeddings,
+    save_pickle,
+)
 from ..chunking import Chunk, chunk_corpus
-from ..config import BASE_ANSWER_SYSTEM_PROMPT, DEFAULT_CONFIG, HarnessConfig
+from ..config import (
+    BASE_ANSWER_SYSTEM_PROMPT,
+    DEFAULT_CONFIG,
+    EMBEDDER_MODEL,
+    HarnessConfig,
+)
 from ..models import embed_texts, generate
 from ..parsing import walk_corpus
 from .base import AnswerResult, BaseSystem, RetrievedChunk
 
 
 _TOKEN_RE = re.compile(r"\w+", re.UNICODE)
+REQUIRED_FILES = ("chunks.jsonl", "embeddings.npy", "faiss.index", "bm25.pkl")
 
 
 def _tokenize(text: str) -> list[str]:
@@ -54,6 +73,25 @@ class HybridRRFSystem(BaseSystem):
         import faiss
         from rank_bm25 import BM25Okapi
 
+        corpus_path = Path(corpus_path)
+        chash = corpus_content_hash(corpus_path)
+        ckey = compute_cache_key(
+            chunking_config=self.config.chunking,
+            embedder_model=EMBEDDER_MODEL,
+            corpus_hash=chash,
+            extra={"sparse": "bm25okapi", "fusion": "rrf", "rrf_k": self.config.retrieval.rrf_k},
+        )
+        cdir = CacheDir(paths.cache_dir(), self.system_id, ckey)
+
+        if cdir.is_complete(REQUIRED_FILES):
+            print(f"[{self.system_id}] cache hit: {cdir.path}")
+            self.chunks = load_chunks(cdir.chunks_path)
+            self._dense_index = faiss.read_index(str(cdir.faiss_path))
+            self._bm25 = load_pickle(cdir.bm25_path)
+            self._indexed = True
+            return
+
+        print(f"[{self.system_id}] cache miss → building index at {cdir.path}")
         docs = list(
             walk_corpus(corpus_path, min_chars=self.config.chunking.min_chars_per_doc)
         )
@@ -71,6 +109,22 @@ class HybridRRFSystem(BaseSystem):
         self._dense_index = dense_index
 
         self._bm25 = BM25Okapi([_tokenize(c.text) for c in self.chunks])
+
+        save_chunks(self.chunks, cdir.chunks_path)
+        save_embeddings(embeddings, cdir.embeddings_path)
+        faiss.write_index(dense_index, str(cdir.faiss_path))
+        save_pickle(self._bm25, cdir.bm25_path)
+        Manifest(
+            system_id=self.system_id,
+            cache_key=ckey,
+            chunking_config=asdict(self.config.chunking),
+            embedder_model=EMBEDDER_MODEL,
+            corpus_hash=chash,
+            n_chunks=len(self.chunks),
+            files=list(REQUIRED_FILES),
+            extra={"sparse": "bm25okapi", "fusion": "rrf"},
+        ).save(cdir.manifest_path)
+
         self._indexed = True
 
     def retrieve(self, query: str, k: int | None = None) -> list[RetrievedChunk]:
@@ -78,12 +132,10 @@ class HybridRRFSystem(BaseSystem):
         cfg = self.config.retrieval
         k = k or cfg.top_k
 
-        # Dense top-N
         q_vec = embed_texts([query])
         _, dense_idx = self._dense_index.search(q_vec, cfg.first_stage_top_k)
         dense_ranking = [i for i in dense_idx[0].tolist() if i >= 0]
 
-        # Sparse top-N
         bm25_scores = self._bm25.get_scores(_tokenize(query))
         order = bm25_scores.argsort()[::-1][: cfg.first_stage_top_k]
         sparse_ranking = [i for i in order.tolist() if bm25_scores[i] > 0]
@@ -110,5 +162,5 @@ class HybridRRFSystem(BaseSystem):
             answer=ans,
             retrieved=retrieved,
             latency_s=self._now() - t0,
-            n_retrieval_calls=2,  # dense + sparse
+            n_retrieval_calls=2,
         )

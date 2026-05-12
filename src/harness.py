@@ -9,8 +9,9 @@ QuestionRecord(question_id, question, references). Concrete benchmark
 loaders for NarrativeQA, QASPER, QuALITY, MultiHop-RAG, CRAG land
 under benchmarks/ in later steps.
 
-Output destination at this commit is a hardcoded ./outputs/ default.
-Drive-aware path resolution arrives with src.paths in a later commit.
+Output destination is resolved via src.paths so the same code writes
+to Drive on Colab when mounted, /content/thesis_rag/outputs on Colab
+without Drive, and <repo>/local_runs/outputs locally.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Iterable, Protocol
 
+from . import paths
 from .config import DEFAULT_CONFIG, HarnessConfig
 from .retrievers.base import AnswerResult, BaseSystem
 
@@ -88,7 +90,7 @@ def run(
     limit: int | None = None,
     config: HarnessConfig = DEFAULT_CONFIG,
 ) -> Path:
-    out_root = Path(output_dir or config.results_dir)
+    out_root = Path(output_dir) if output_dir is not None else paths.output_dir()
     out_root.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out_path = out_root / f"{benchmark.name}__{system.system_id}__{stamp}.jsonl"

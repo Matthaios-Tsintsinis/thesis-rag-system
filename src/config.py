@@ -14,10 +14,11 @@ from typing import Literal
 
 
 # --- Filesystem ------------------------------------------------------------
+# Path roles (INPUT_DIR / CACHE_DIR / OUTPUT_DIR / HF_CACHE_DIR) are resolved
+# at runtime by src/paths.py — they depend on whether Drive is mounted and
+# on environment-variable overrides. Do not hardcode any of those here.
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-CACHE_DIR = REPO_ROOT / ".cache"
-RESULTS_DIR = REPO_ROOT / "outputs"
 
 
 # --- Shared models ---------------------------------------------------------
@@ -98,8 +99,6 @@ class HarnessConfig:
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
     chunking: ChunkingConfig = field(default_factory=ChunkingConfig)
     generation: GenerationConfig = field(default_factory=GenerationConfig)
-    cache_dir: Path = CACHE_DIR
-    results_dir: Path = RESULTS_DIR
 
 
 DEFAULT_CONFIG = HarnessConfig()
