@@ -32,7 +32,7 @@ from ..config import (
     EMBEDDER_MODEL,
     HarnessConfig,
 )
-from ..models import embed_texts, generate
+from ..models import embed_texts, generate, load_embedder
 from ..parsing import walk_corpus
 from .base import AnswerResult, BaseSystem, RetrievedChunk
 
@@ -71,11 +71,10 @@ class FlatDenseSystem(BaseSystem):
         docs = list(
             walk_corpus(corpus_path, min_chars=self.config.chunking.min_chars_per_doc)
         )
-        self.chunks = chunk_corpus(
-            docs,
-            chunk_words=self.config.chunking.chunk_words,
-            overlap_words=self.config.chunking.overlap_words,
+        embedder = (
+            load_embedder() if self.config.chunking.strategy == "semantic" else None
         )
+        self.chunks = chunk_corpus(docs, self.config.chunking, embedder=embedder)
         if not self.chunks:
             raise RuntimeError(f"No chunks produced from {corpus_path}")
 

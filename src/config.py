@@ -37,11 +37,17 @@ FIRST_STAGE_TOP_K = 50
 RRF_K = 60                       # Cormack et al. (2009)
 
 
-# --- Chunking (word-window placeholder; semantic chunker added later) ----
+# --- Chunking -------------------------------------------------------------
+# Two strategies, selected per HarnessConfig.chunking.strategy:
+#   "semantic"    — sentence-buffered embeddings + percentile breakpoints
+#                   (Greek-aware: . ! ? ; as terminators, · excluded).
+#                   Will be the production default once M4/M7 land; for
+#                   now nothing in the harness uses it and the default
+#                   stays word_window so M1/M2/M3 behaviour is unchanged.
+#   "word_window" — fixed word window + overlap. Used in smoke tests and
+#                   as the current default while baselines are stabilising.
 
-CHUNK_WORDS = 200
-CHUNK_OVERLAP_WORDS = 50
-MIN_CHARS_PER_DOC = 200
+ChunkingStrategy = Literal["semantic", "word_window"]
 
 
 # --- Generation -----------------------------------------------------------
@@ -80,9 +86,22 @@ class RetrievalConfig:
 
 @dataclass(frozen=True)
 class ChunkingConfig:
-    chunk_words: int = CHUNK_WORDS
-    overlap_words: int = CHUNK_OVERLAP_WORDS
-    min_chars_per_doc: int = MIN_CHARS_PER_DOC
+    strategy: ChunkingStrategy = "word_window"
+
+    # --- semantic parameters (notebook chunk_text_semantic defaults) ---
+    breakpoint_percentile: float = 90.0
+    absolute_threshold: float = 0.5
+    min_words: int = 80
+    max_words: int = 400
+    max_if_min_words: int = 500
+    buffer_size: int = 1
+
+    # --- word-window parameters ---
+    chunk_words: int = 200
+    overlap_words: int = 50
+
+    # --- both ---
+    min_chars_per_doc: int = 200
 
 
 @dataclass(frozen=True)
