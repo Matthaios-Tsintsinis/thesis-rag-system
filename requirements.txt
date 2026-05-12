@@ -3,7 +3,17 @@ numpy>=1.26
 sentence-transformers>=3.0      # bge-m3 embedder + bge-reranker-v2-m3 cross-encoder
 faiss-cpu>=1.8                  # swap to faiss-gpu on CUDA hosts
 rank-bm25>=0.2.2
-pypdf>=4.0                      # placeholder PDF parser; will swap to Docling
+
+# --- Parsing (single PDF backend across all systems; M7 will use the
+#     structural-metadata payload Docling produces) ---
+docling>=2.0                    # heavier transitive footprint than PyMuPDF
+                                # (docling-core, docling-ibm-models, onnxruntime);
+                                # confirm `pip install docling` succeeds on the
+                                # target host.
+python-docx>=1.1
+beautifulsoup4>=4.12
+pandas>=2.0
+openpyxl>=3.1                   # xlsx engine for pandas
 
 # --- Generator (Qwen2.5-3B-Instruct, 4-bit NF4 on CUDA) ---
 transformers>=4.44

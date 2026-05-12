@@ -70,10 +70,24 @@ def compute_cache_key(
     embedder_model: str,
     corpus_hash: str,
     extra: dict[str, Any] | None = None,
+    parsing_identity: dict[str, Any] | None = None,
 ) -> str:
+    """Stable hex key from chunking + embedder + parser + corpus + extras.
+
+    Parser identity is folded in automatically (default-loaded from
+    parsing.parsing_identity()) so that swapping PDF backends — e.g.
+    PyMuPDF → Docling — invalidates every cached index across systems.
+    Pass `parsing_identity={}` explicitly to opt out (tests only).
+    """
+    if parsing_identity is None:
+        # Late import to avoid a chunking → parsing → cache cycle at module load.
+        from .parsing import parsing_identity as _parsing_identity
+        parsing_identity = _parsing_identity()
+
     payload = "\n".join([
         f"chunking={_json_repr(chunking_config)}",
         f"embedder={embedder_model}",
+        f"parsing={_json_repr(parsing_identity)}",
         f"corpus={corpus_hash}",
         f"extra={_json_repr(extra or {})}",
     ])
