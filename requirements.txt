@@ -1,3 +1,2 @@
-ollama
-chromadb
-PyPDF2
+# Dependencies are added per-module as the harness comes online.
+# See README.md for current install instructions.
