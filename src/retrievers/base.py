@@ -10,11 +10,6 @@ quality.
 
 M1 (closed-book) returns an empty list from `retrieve` — same interface,
 no chunks. This keeps the harness uniform.
-
-`Chunk` is annotated as a forward string here; the concrete dataclass
-ships in src.chunking once that module lands. PEP 563 (`from __future__
-import annotations`) means the annotation never resolves at import time,
-so this module loads cleanly even without src.chunking.
 """
 
 from __future__ import annotations
@@ -24,12 +19,13 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..chunking import Chunk
 from ..config import DEFAULT_CONFIG, HarnessConfig
 
 
 @dataclass
 class RetrievedChunk:
-    chunk: "Chunk"
+    chunk: Chunk
     score: float
     rank: int
 

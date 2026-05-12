@@ -1,0 +1,15 @@
+Photosynthesis is the process by which green plants, algae, and certain bacteria convert
+light energy into chemical energy. The overall reaction takes carbon dioxide and water as
+inputs and produces glucose and oxygen as outputs, powered by sunlight. The reaction is
+catalysed by chlorophyll, a green pigment housed in organelles called chloroplasts.
+
+Photosynthesis is conventionally divided into two stages. The light-dependent reactions
+occur in the thylakoid membranes and capture photons to produce ATP and NADPH while
+splitting water molecules to release oxygen. The light-independent reactions, also known
+as the Calvin cycle, occur in the stroma and use the ATP and NADPH produced earlier to
+fix carbon dioxide into three-carbon sugars, ultimately yielding glucose.
+
+The discovery that plants release oxygen during photosynthesis is generally credited to
+Joseph Priestley in 1771, who observed that a candle burning in a sealed jar with a
+mint plant did not extinguish as quickly as one alone. Jan Ingenhousz later established
+in 1779 that this restorative effect required sunlight.

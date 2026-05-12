@@ -1,0 +1,18 @@
+The Transformer is a neural network architecture introduced by Vaswani et al. in 2017
+in the paper "Attention Is All You Need". It dispenses with recurrence and convolution
+entirely and relies on a mechanism called self-attention to model dependencies between
+input and output tokens regardless of their distance in the sequence.
+
+A Transformer is composed of an encoder stack and a decoder stack. Each layer in either
+stack contains a multi-head self-attention sub-layer and a position-wise feed-forward
+sub-layer, with residual connections and layer normalisation applied around each. The
+decoder additionally includes a masked self-attention sub-layer to prevent attending
+to future tokens during training, plus a cross-attention sub-layer that attends to the
+encoder output.
+
+Self-attention computes for each token a weighted sum of all token representations in
+the sequence, where the weights are derived from compatibility scores between learned
+query, key, and value projections. Because attention is parallelisable across positions
+in a way that recurrence is not, Transformers train faster than RNNs on long sequences
+and have become the dominant architecture for modern language models, including BERT,
+GPT, and T5.

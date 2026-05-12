@@ -1,0 +1,32 @@
+[
+  {
+    "question_id": "smoke-001",
+    "question": "What two molecules are produced by the light-dependent reactions of photosynthesis?",
+    "references": ["ATP and NADPH"],
+    "question_type": "specific_fact"
+  },
+  {
+    "question_id": "smoke-002",
+    "question": "Who was the first person to set foot on the Moon, and on what date did the landing occur?",
+    "references": ["Neil Armstrong, 20 July 1969"],
+    "question_type": "specific_fact"
+  },
+  {
+    "question_id": "smoke-003",
+    "question": "Which paper introduced the Transformer architecture and in what year?",
+    "references": ["Attention Is All You Need, 2017"],
+    "question_type": "specific_fact"
+  },
+  {
+    "question_id": "smoke-004",
+    "question": "Compare the role of self-attention in Transformers to the role of chlorophyll in photosynthesis: what does each enable in its respective system?",
+    "references": ["Self-attention enables tokens to model dependencies across the sequence regardless of distance; chlorophyll captures light energy that powers the photosynthesis reactions."],
+    "question_type": "comparison"
+  },
+  {
+    "question_id": "smoke-005",
+    "question": "Which scientist established that the restorative effect of plants on air required sunlight, and which US president set the goal of a manned Moon landing?",
+    "references": ["Jan Ingenhousz (1779) established the sunlight requirement; John F. Kennedy (1961) set the Moon landing goal."],
+    "question_type": "multi_aspect"
+  }
+]

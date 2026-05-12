@@ -1,2 +1,12 @@
-# Dependencies are added per-module as the harness comes online.
-# See README.md for current install instructions.
+# --- Shared infra (M1-M3) ---
+numpy>=1.26
+sentence-transformers>=3.0      # bge-m3 embedder + bge-reranker-v2-m3 cross-encoder
+faiss-cpu>=1.8                  # swap to faiss-gpu on CUDA hosts
+rank-bm25>=0.2.2
+pypdf>=4.0                      # placeholder PDF parser; will swap to Docling
+
+# --- Generator (Qwen2.5-3B-Instruct, 4-bit NF4 on CUDA) ---
+transformers>=4.44
+torch>=2.2
+accelerate>=0.33
+bitsandbytes>=0.43 ; platform_system == "Linux"   # 4-bit quant; Linux/CUDA only
