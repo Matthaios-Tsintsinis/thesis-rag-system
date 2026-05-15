@@ -1,0 +1,18 @@
+The Calvin cycle, also called the light-independent reactions of photosynthesis, is the
+metabolic pathway that fixes atmospheric carbon dioxide into organic sugars. It takes
+place in the stroma of chloroplasts and was elucidated by Melvin Calvin, Andrew Benson,
+and James Bassham at the University of California, Berkeley, in the late 1940s and
+early 1950s. Calvin was awarded the 1961 Nobel Prize in Chemistry for the work.
+
+The cycle proceeds in three stages. In carbon fixation, the enzyme RuBisCO attaches a
+molecule of carbon dioxide to ribulose 1,5-bisphosphate, a five-carbon sugar, producing
+an unstable six-carbon intermediate that immediately splits into two molecules of
+3-phosphoglycerate. In the reduction phase, ATP and NADPH from the light reactions
+convert 3-phosphoglycerate into glyceraldehyde 3-phosphate, a three-carbon sugar. Some
+of the glyceraldehyde 3-phosphate exits the cycle to be used in glucose, sucrose, and
+starch synthesis. The remaining molecules enter the regeneration phase, where they are
+rearranged through a series of enzymatic steps to regenerate ribulose 1,5-bisphosphate
+so the cycle can continue.
+
+Three turns of the cycle fix three carbon dioxide molecules and produce one net
+molecule of glyceraldehyde 3-phosphate, consuming nine ATP and six NADPH in the process.

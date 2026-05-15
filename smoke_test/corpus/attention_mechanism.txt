@@ -1,0 +1,21 @@
+The attention mechanism is a technique in neural networks that allows a model to
+dynamically focus on different parts of its input when producing each part of its
+output. It was introduced for machine translation by Bahdanau, Cho, and Bengio in 2014
+to address a limitation of fixed-size encoder representations: when a long sentence is
+compressed into a single vector, information about earlier tokens tends to be diluted
+by the time the decoder needs them.
+
+The general formulation computes a similarity score between a query vector and a set of
+key vectors, normalises the scores into a probability distribution using softmax, and
+uses the distribution to produce a weighted average of associated value vectors. The
+output is therefore a context-dependent summary of the values, with greater weight
+placed on values whose keys best match the query.
+
+Self-attention is the special case in which the queries, keys, and values are all
+derived from the same input sequence by linear projections. Multi-head attention runs
+several self-attention operations in parallel with separately learned projections,
+allowing each head to attend to different relational patterns. These mechanisms are
+the central building block of the Transformer architecture and underlie modern large
+language models. Variants such as scaled dot-product attention, additive attention, and
+sparse or local attention have been developed to balance expressiveness against
+computational cost.

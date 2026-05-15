@@ -1,0 +1,17 @@
+Chlorophyll is the green pigment found in the chloroplasts of plants, algae, and
+cyanobacteria. It absorbs light most strongly in the blue and red regions of the visible
+spectrum and reflects green light, which gives most photosynthetic organisms their
+characteristic colour. The molecule has a porphyrin ring with a central magnesium atom
+and a long hydrocarbon tail that anchors it in the thylakoid membrane.
+
+Two main forms exist in higher plants: chlorophyll a and chlorophyll b. Chlorophyll a is
+the primary pigment that drives the light reactions of photosynthesis, while chlorophyll
+b is an accessory pigment that broadens the range of wavelengths captured and transfers
+the absorbed energy to chlorophyll a. The two pigments together allow plants to harvest
+a wider portion of the visible spectrum than chlorophyll a alone.
+
+When chlorophyll absorbs a photon, an electron in the molecule is promoted to a higher
+energy state. In the thylakoid membrane, this energised electron is passed down an
+electron transport chain, generating the ATP and NADPH used by the Calvin cycle. The
+pigment was first isolated and named by Pierre-Joseph Pelletier and Joseph Bienaime
+Caventou in 1817.
