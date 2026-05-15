@@ -119,6 +119,50 @@ class GenerationConfig:
 
 
 @dataclass(frozen=True)
+class RaptorBuildParams:
+    """RAPTOR cluster-tree topology (PIPELINE_DESIGN.md section 3.4).
+
+    Defaults match the document. Smoke overrides them to produce a
+    tree on the small fixture corpus.
+    """
+    branching_factor: int = 4
+    min_cluster_size: int = 24
+    max_depth: int = 4
+
+
+@dataclass(frozen=True)
+class ExpansionParams:
+    """Per-node-type expansion (PIPELINE_DESIGN.md section 4.4)."""
+    max_children_to_follow_from_broad_summary: int = 2
+    summary_expansion_top_k_chunks: int = 3
+    max_descendant_chunks_for_direct_expansion: int = 50
+    max_expansion_recursion_depth: int = 2
+    # Depth boundaries: 0-1 high (root excluded from flat index), 2 mid, 3+ low.
+    high_level_max_depth: int = 1
+    mid_level_depth: int = 2
+    low_level_min_depth: int = 3
+
+
+@dataclass(frozen=True)
+class M4Config:
+    """M4-specific knobs.
+
+    M4 is the official-RAPTOR collapsed-retrieval baseline. No
+    cross-encoder rerank (matches the published paper; rerank is M7's
+    contribution, not M4's). Trace is opt-in: smoke flips it on for
+    routing-path sanity checks; production benchmarks leave it off.
+    """
+    build: RaptorBuildParams = field(default_factory=RaptorBuildParams)
+    expansion: ExpansionParams = field(default_factory=ExpansionParams)
+    first_stage_top_k: int = FIRST_STAGE_TOP_K
+    rrf_k: int = RRF_K
+    include_root_in_flat_index: bool = False
+    summary_model: str = JUDGE_MODEL  # gpt-4o-mini by project decision
+    top_k_final: int = FINAL_CONTEXT_CHUNKS
+    trace: bool = False
+
+
+@dataclass(frozen=True)
 class M8Config:
     """M8-specific knobs (ported from existing hierarchical-RAG notebook).
 
@@ -160,6 +204,7 @@ class HarnessConfig:
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
     chunking: ChunkingConfig = field(default_factory=ChunkingConfig)
     generation: GenerationConfig = field(default_factory=GenerationConfig)
+    m4: M4Config = field(default_factory=M4Config)
     m8: M8Config = field(default_factory=M8Config)
 
 

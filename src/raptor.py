@@ -31,37 +31,13 @@ from typing import Any, Callable, Literal
 
 import numpy as np
 
-from .config import NodeType
+from .config import ExpansionParams, NodeType, RaptorBuildParams
 
 
 SummarizeFn = Callable[[list[str]], str]
 EmbedFn = Callable[[list[str]], np.ndarray]
 
 FlatRefKind = Literal["chunk", "summary"]
-
-
-# --- Params ---------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class RaptorBuildParams:
-    """Tree topology knobs. Cache-key components for M4/M7."""
-    branching_factor: int = 4
-    min_cluster_size: int = 24
-    max_depth: int = 4
-
-
-@dataclass(frozen=True)
-class ExpansionParams:
-    """Per-node-type expansion knobs (PIPELINE_DESIGN section 4.4)."""
-    max_children_to_follow_from_broad_summary: int = 2
-    summary_expansion_top_k_chunks: int = 3
-    max_descendant_chunks_for_direct_expansion: int = 50
-    max_expansion_recursion_depth: int = 2
-    # Depth boundaries between high/mid/low summary buckets.
-    high_level_max_depth: int = 1   # depth in [0, 1] -> high (root excluded later)
-    mid_level_depth: int = 2        # depth == 2 -> mid
-    low_level_min_depth: int = 3    # depth >= 3 -> low
 
 
 # --- Tree dataclasses -----------------------------------------------------
@@ -599,8 +575,6 @@ def load_flat_index(
 __all__ = [
     "SummarizeFn",
     "EmbedFn",
-    "RaptorBuildParams",
-    "ExpansionParams",
     "RaptorNode",
     "RaptorTree",
     "FlatCollapsedIndex",
