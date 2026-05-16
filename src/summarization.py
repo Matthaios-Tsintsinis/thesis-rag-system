@@ -60,7 +60,21 @@ def summarization_identity(
 
 
 def _resolve_openai_key() -> str:
-    """Colab Secrets first, env var fallback. Raise with actionable message."""
+    """Env var first, Colab Secrets fallback. Raise with actionable message.
+
+    Env var is checked first because Colab `userdata` does NOT propagate
+    secrets to subprocesses spawned via `!python -m ...` — only to
+    in-kernel cells. The smoke runner and full-eval driver run as
+    subprocesses, so env-first is the order that works in every context
+    (notebook-direct and subprocess). The notebook sets
+    `os.environ["OPENAI_API_KEY"] = userdata.get("OPENAI_API_KEY")`
+    once at the top; the userdata branch below remains as a fallback
+    for in-kernel use where the env var was not exported.
+    """
+    key = os.environ.get("OPENAI_API_KEY")
+    if key:
+        return key
+
     try:
         from google.colab import userdata  # type: ignore[import-not-found]
 
@@ -68,12 +82,8 @@ def _resolve_openai_key() -> str:
         if key:
             return key
     except Exception:
-        # Not on Colab, or secret not set; fall through to env var.
+        # Not on Colab, or secret not set; fall through to the error.
         pass
-
-    key = os.environ.get("OPENAI_API_KEY")
-    if key:
-        return key
 
     raise RuntimeError(
         "OPENAI_API_KEY not found. Set Colab secret 'OPENAI_API_KEY' "
