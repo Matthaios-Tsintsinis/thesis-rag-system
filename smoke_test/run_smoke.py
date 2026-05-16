@@ -207,8 +207,8 @@ def main() -> None:
                     m3_rankings[q.question_id] = ids
                 elif sid == "M4":
                     m4_chunk_counts.append(len(ar.retrieved))
-                    paths = system.last_trace.get("paths_exercised", [])
-                    m4_paths_union.update(paths)
+                    exercised_paths = system.last_trace.get("paths_exercised", [])
+                    m4_paths_union.update(exercised_paths)
                 elif sid == "M8":
                     m8_chunk_counts.append(len(ar.retrieved))
 
