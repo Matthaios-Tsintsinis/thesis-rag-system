@@ -258,8 +258,18 @@ HYDE_MAX_TOKENS = 160
 
 @dataclass(frozen=True)
 class Aspect:
-    """One answer aspect extracted from the user query (§4.1)."""
+    """One answer aspect extracted from the user query (§4.1).
+
+    `name` is a short label only — used in the final prompt's
+    `[Aspect: <name>]` header. `text` is the retrieval string that
+    every view (paraphrase/HyDE), the preliminary-confidence probe, the
+    per-aspect rerank query and the aspect-section bias derive from.
+    For a simple question the LLM returns the placeholder name "main";
+    `text` is then the original query, NOT the literal token "main"
+    (otherwise simple-question retrieval would search for "main").
+    """
     name: str
+    text: str
     importance: float
 
 
@@ -305,14 +315,37 @@ def extract_aspects(
         _label="extract_aspects",
     )
 
+    stripped = _strip_json_fences(raw)
     try:
-        obj = json.loads(_strip_json_fences(raw))
-    except json.JSONDecodeError as e:
-        raise ValueError(f"extract_aspects: unparseable JSON: {raw!r}") from e
+        obj = json.loads(stripped)
+    except json.JSONDecodeError:
+        # Prose-wrapped JSON ("Here is the JSON: { ... }. Hope that
+        # helps."): retry on the first-{ … last-} span before giving up.
+        lo, hi = stripped.find("{"), stripped.rfind("}")
+        if lo != -1 and hi > lo:
+            try:
+                obj = json.loads(stripped[lo : hi + 1])
+            except json.JSONDecodeError as e:
+                raise ValueError(
+                    f"extract_aspects: unparseable JSON: {raw!r}"
+                ) from e
+        else:
+            raise ValueError(
+                f"extract_aspects: unparseable JSON: {raw!r}"
+            )
 
     kind = obj.get("type")
     if kind not in ("simple", "multi_aspect"):
         raise ValueError(f"extract_aspects: bad type field: {obj!r}")
+
+    q = query.strip()
+    if kind == "simple":
+        # The "main" name is a placeholder label; the retrieval text is
+        # the original query (finding #1 — never search for "main").
+        return AspectExtraction(
+            kind="simple",
+            aspects=[Aspect(name="main", text=q, importance=1.0)],
+        )
 
     raw_aspects = obj.get("aspects")
     if not isinstance(raw_aspects, list) or not raw_aspects:
@@ -331,9 +364,17 @@ def extract_aspects(
             raise ValueError(
                 f"extract_aspects: non-numeric importance: {a!r}"
             ) from e
-        aspects.append(Aspect(name=name, importance=max(0.0, min(1.0, importance))))
+        # For multi-aspect the LLM's noun-phrase/sub-question IS the
+        # retrieval text; it doubles as the header label.
+        aspects.append(
+            Aspect(
+                name=name,
+                text=name,
+                importance=max(0.0, min(1.0, importance)),
+            )
+        )
 
-    return AspectExtraction(kind=kind, aspects=aspects)
+    return AspectExtraction(kind="multi_aspect", aspects=aspects)
 
 
 def paraphrase_view(

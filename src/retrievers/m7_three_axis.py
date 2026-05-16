@@ -396,7 +396,7 @@ class ThreeAxisSystem(BaseSystem):
         for v in plan.views:
             for cid, sc in self._view_candidates(
                 v.text, use_bm25=use_bm25, use_structural=use_structural,
-                aspect_text=plan.name,
+                aspect_text=plan.text,
             ):
                 best[cid] = max(best.get(cid, -1.0), sc)
         ranked = sorted(best.items(), key=lambda kv: (-kv[1], kv[0]))
@@ -507,7 +507,7 @@ class ThreeAxisSystem(BaseSystem):
                 use_structural=m7.use_docling_structural_axis,
             )
             if m7.quota_preserving_rerank:
-                reranked = self._rerank(p.name, pool)
+                reranked = self._rerank(p.text, pool)
                 per_aspect.append((p, reranked))
             else:
                 # A6: defer to a single global rerank across all aspects.
@@ -644,6 +644,10 @@ class ThreeAxisSystem(BaseSystem):
         abstained: list[str] = []
         blocks: list[str] = []
         seen_orient: set[str] = set()
+        # Cross-aspect evidence dedupe (finding #2): a chunk assigned once
+        # by step 7 must be printed under one aspect only, not repeated
+        # under every aspect whose rerank list also contains it.
+        emitted: set[str] = set()
 
         def _evidence(cids: list[str]) -> list[str]:
             lines: list[str] = []
@@ -655,15 +659,19 @@ class ThreeAxisSystem(BaseSystem):
             return lines
 
         for p in plans:
+            # Abstention is a property of the aspect's confidence, not of
+            # whether its chunks survived cross-aspect dedupe — record it
+            # before any skip.
+            low = p.retrieval_confidence < thr
+            if low and p.name not in abstained:
+                abstained.append(p.name)
             chosen = [
                 c for c, _ in per_aspect.get(p.name, [])[: max(p.budget, 0)]
-                if c in sel_set
+                if c in sel_set and c not in emitted
             ]
             if not chosen:
                 continue
-            low = p.retrieval_confidence < thr
-            if low:
-                abstained.append(p.name)
+            emitted.update(chosen)
             header = f"[Aspect: {p.name}]"
             if m7.pass_retrieval_confidence_to_llm:
                 header += f" (retrieval_confidence: {p.retrieval_confidence:.2f})"
@@ -685,7 +693,10 @@ class ThreeAxisSystem(BaseSystem):
             blocks.append("  [Primary Evidence]")
             blocks.extend(_evidence(chosen))
 
-        gsel = [c for c, _ in state["global_sel"] if c in sel_set]
+        gsel = [
+            c for c, _ in state["global_sel"]
+            if c in sel_set and c not in emitted
+        ]
         if gsel:
             blocks.append("[Global View]")
             if m7.pass_retrieval_confidence_to_llm:

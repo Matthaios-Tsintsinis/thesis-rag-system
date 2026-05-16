@@ -52,7 +52,8 @@ class ViewSpec:
 
 @dataclass
 class AspectPlan:
-    name: str
+    name: str          # short label for the [Aspect: <name>] prompt header
+    text: str          # retrieval string (views/probe/rerank/bias use this)
     importance: float
     views: list[ViewSpec] = field(default_factory=list)
     retrieval_confidence: float = 0.0
@@ -90,17 +91,21 @@ def decompose(
     paraphrase_fn = paraphrase_fn or _paraphrase_view
     hyde_fn = hyde_fn or _hyde_view
 
+    # The "main" fallback aspect's retrieval text is the original query,
+    # never the literal token "main" (finding #1).
+    main = Aspect(name="main", text=query.strip(), importance=1.0)
+
     if not cfg.use_intent_decomposition:
-        aspects = [Aspect(name="main", importance=1.0)]
+        aspects = [main]
     else:
         try:
             result = extract_fn(query)
             aspects = list(result.aspects)  # type: ignore[attr-defined]
         except Exception:
-            aspects = [Aspect(name="main", importance=1.0)]
+            aspects = [main]
 
     if not aspects:
-        aspects = [Aspect(name="main", importance=1.0)]
+        aspects = [main]
 
     # Drop sub-threshold aspects entirely (NOT min-quota'd) — spurious
     # aspects must not consume protected budget (§4.1).
@@ -119,24 +124,29 @@ def decompose(
 
     plans: list[AspectPlan] = []
     for a in aspects:
-        plan = AspectPlan(name=a.name, importance=float(a.importance))
+        # `text` is the retrieval string; older/mocked extractors that
+        # omit it fall back to the label so behaviour stays defined.
+        a_text = (getattr(a, "text", "") or a.name).strip()
+        plan = AspectPlan(
+            name=a.name, text=a_text, importance=float(a.importance)
+        )
         for vt in cfg.view_types:
             if vt == "paraphrase":
-                txt = paraphrase_fn(a.name)
+                txt = paraphrase_fn(a_text)
             elif vt == "hyde":
-                txt = hyde_fn(a.name)
+                txt = hyde_fn(a_text)
             elif vt == "paraphrase2":
                 # A3 ablation: a second, distinct paraphrase. Paraphrase
                 # the paraphrase so the surface form differs from view 1
                 # without a temperature change or summarization.py edit.
-                txt = paraphrase_fn(paraphrase_fn(a.name))
+                txt = paraphrase_fn(paraphrase_fn(a_text))
             else:
                 raise ValueError(f"unknown view_type {vt!r}")
             txt = (txt or "").strip()
             if not txt:
                 # View generation returned empty — fall back to the raw
                 # aspect text so the view still retrieves something.
-                txt = a.name
+                txt = a_text
             plan.views.append(ViewSpec(a.name, vt, txt))
         plans.append(plan)
     return plans
@@ -171,7 +181,7 @@ def score_aspects(
             (v for v in p.views if v.view_type in ("paraphrase", "paraphrase2")),
             p.views[0] if p.views else None,
         )
-        probe = para.text if para is not None else p.name
+        probe = para.text if para is not None else p.text
         conf = float(confidence_fn(probe))
         if conf < 0.0 or conf > 1.0:
             conf = _sigmoid(conf)
