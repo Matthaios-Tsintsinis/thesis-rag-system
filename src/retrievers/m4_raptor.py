@@ -58,6 +58,7 @@ from ..config import (
 from ..models import embed_texts, generate, load_embedder
 from ..parsing import walk_corpus
 from ..raptor import (
+    RAPTOR_SUBSTRATE_NAMESPACE,
     FlatCollapsedIndex,
     RaptorNode,
     RaptorTree,
@@ -66,12 +67,12 @@ from ..raptor import (
     expand_node,
     load_flat_index,
     load_raptor_tree,
+    raptor_substrate_extra,
     save_flat_index,
     save_raptor_tree,
 )
 from ..summarization import (
-    DEFAULT_SUMMARY_MODEL,
-    summarization_identity,
+    SUMMARY_PROMPT_VERSION,
     summarize_passages,
 )
 from .base import AnswerResult, BaseSystem, RetrievedChunk
@@ -129,21 +130,23 @@ class RaptorSystem(BaseSystem):
         m4 = self.config.m4
         corpus_path = Path(corpus_path)
         chash = corpus_content_hash(corpus_path)
+        # Shared RAPTOR substrate key: no system_id field, so M4 and M7
+        # land on the same RAPTOR/<substrate_hash>/ directory and reuse
+        # one copy of chunks/embeddings/bm25/tree/flat index.
+        substrate_extra = raptor_substrate_extra(
+            build=m4.build,
+            summary_model=m4.summary_model,
+            summary_prompt_version=SUMMARY_PROMPT_VERSION,
+            include_root=m4.include_root_in_flat_index,
+            rrf_k=m4.rrf_k,
+        )
         ckey = compute_cache_key(
             chunking_config=self.config.chunking,
             embedder_model=EMBEDDER_MODEL,
             corpus_hash=chash,
-            extra={
-                "system": "M4",
-                "tree": asdict(m4.build),
-                **summarization_identity(model=m4.summary_model),
-                "include_root_in_flat_index": m4.include_root_in_flat_index,
-                "sparse": "bm25okapi",
-                "fusion": "rrf",
-                "rrf_k": m4.rrf_k,
-            },
+            extra=substrate_extra,
         )
-        cdir = CacheDir(paths.cache_dir(), self.system_id, ckey)
+        cdir = CacheDir(paths.cache_dir(), RAPTOR_SUBSTRATE_NAMESPACE, ckey)
 
         if cdir.is_complete(REQUIRED_FILES):
             print(f"[{self.system_id}] cache hit: {cdir.path}")
@@ -226,7 +229,7 @@ class RaptorSystem(BaseSystem):
 
         self._index_stats = self._collect_index_stats(summary_calls=summary_calls[0])
         Manifest(
-            system_id=self.system_id,
+            system_id=RAPTOR_SUBSTRATE_NAMESPACE,
             cache_key=ckey,
             chunking_config=asdict(self.config.chunking),
             embedder_model=EMBEDDER_MODEL,

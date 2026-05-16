@@ -40,6 +40,49 @@ EmbedFn = Callable[[list[str]], np.ndarray]
 FlatRefKind = Literal["chunk", "summary"]
 
 
+# --- Shared substrate cache identity --------------------------------------
+
+# Every RAPTOR-family system (M4, M7, M7 ablations, future variants) is a
+# *consumer* of one shared substrate: chunks + embeddings + BM25 + the
+# LLM-summarised cluster tree + flat collapsed index. These artifacts
+# depend only on the corpus, the parser, the chunking config, the
+# embedder, the tree topology params, and the summariser identity — never
+# on which system reads them. They therefore live under a single shared
+# cache namespace keyed by `raptor_substrate_extra()` with NO system_id
+# field, so M4 and M7 share one copy instead of rebuilding per system.
+RAPTOR_SUBSTRATE_NAMESPACE = "RAPTOR"
+
+
+def raptor_substrate_extra(
+    *,
+    build: RaptorBuildParams,
+    summary_model: str,
+    summary_prompt_version: str,
+    include_root: bool,
+    rrf_k: int,
+    sparse: str = "bm25okapi",
+    fusion: str = "rrf",
+) -> dict:
+    """Substrate-only cache-key extras shared across RAPTOR-family systems.
+
+    Folded into `compute_cache_key(... extra=...)` together with the
+    shared chunking/embedder/parsing/corpus inputs. Deliberately omits
+    any system identifier: the produced artifacts are identical no
+    matter which system triggers the build, so M4 and M7 must land on
+    the same `RAPTOR/<substrate_hash>/` directory. Tree topology params
+    are included because the tree artifact itself depends on them.
+    """
+    return {
+        "tree": asdict(build),
+        "summary_model": summary_model,
+        "summary_prompt_version": summary_prompt_version,
+        "include_root_in_flat_index": bool(include_root),
+        "sparse": sparse,
+        "fusion": fusion,
+        "rrf_k": int(rrf_k),
+    }
+
+
 # --- Tree dataclasses -----------------------------------------------------
 
 
@@ -573,6 +616,8 @@ def load_flat_index(
 
 
 __all__ = [
+    "RAPTOR_SUBSTRATE_NAMESPACE",
+    "raptor_substrate_extra",
     "SummarizeFn",
     "EmbedFn",
     "RaptorNode",
