@@ -18,8 +18,10 @@ indexing turns out to be the wall-clock bottleneck.
 
 from __future__ import annotations
 
+import json
 import os
 import time
+from dataclasses import dataclass
 from typing import Any
 
 # Public knobs --------------------------------------------------------------
@@ -36,6 +38,49 @@ SUMMARY_PROMPT_TEMPLATE = (
     "Passages:\n{passages}"
 )
 
+# --- M7 query-time prompts (PIPELINE_DESIGN.md §4.1) -----------------------
+# Each template has its own _VERSION constant folded into
+# summarization_identity() so a wording change invalidates only the
+# M7-namespace cache, never the shared RAPTOR substrate (the tree
+# summary prompt is the only substrate-affecting prompt).
+
+ASPECT_EXTRACTION_PROMPT_VERSION = "v1"
+ASPECT_EXTRACTION_PROMPT_TEMPLATE = (
+    "You analyze a search question for a retrieval system. "
+    "Classify it as \"simple\" (one information need) or \"multi_aspect\" "
+    "(several distinct sub-questions that need separate evidence).\n"
+    "For \"simple\": return exactly one aspect named \"main\" with "
+    "importance 1.0.\n"
+    "For \"multi_aspect\": return up to 3 aspects. Each aspect is a short "
+    "self-contained noun phrase or sub-question covering one part of the "
+    "answer. Give each an importance in [0,1] reflecting how central it is "
+    "to fully answering the question; importances should sum to roughly 1.\n"
+    "Answer in the same language as the question. Output ONLY a JSON object, "
+    "no prose, no code fences:\n"
+    "{{\"type\": \"simple\" | \"multi_aspect\", "
+    "\"aspects\": [{{\"name\": string, \"importance\": number}}]}}\n\n"
+    "Question: {query}"
+)
+
+PARAPHRASE_PROMPT_VERSION = "v1"
+PARAPHRASE_PROMPT_TEMPLATE = (
+    "Rephrase the following search query so the wording and surface form "
+    "change but the information need is preserved exactly. Keep it in the "
+    "same language. Output only the rephrased query on a single line, with "
+    "no preamble or quotation marks.\n\n"
+    "Query: {aspect}"
+)
+
+HYDE_PROMPT_VERSION = "v1"
+HYDE_PROMPT_TEMPLATE = (
+    "Write a short hypothetical passage of 2-3 sentences that would "
+    "directly answer the question below, written in the style of an "
+    "extract from a relevant source document. Be specific and factual in "
+    "tone. Do not hedge and do not state that it is hypothetical. Write "
+    "in the same language as the question. Output only the passage.\n\n"
+    "Question: {aspect}"
+)
+
 
 # Identity for cache invalidation ------------------------------------------
 
@@ -43,16 +88,27 @@ SUMMARY_PROMPT_TEMPLATE = (
 def summarization_identity(
     model: str = DEFAULT_SUMMARY_MODEL,
     prompt_version: str = SUMMARY_PROMPT_VERSION,
+    *,
+    aspect_prompt_version: str = ASPECT_EXTRACTION_PROMPT_VERSION,
+    paraphrase_prompt_version: str = PARAPHRASE_PROMPT_VERSION,
+    hyde_prompt_version: str = HYDE_PROMPT_VERSION,
 ) -> dict[str, str]:
-    """Fold into cache key extras alongside chunking/embedder/parser.
+    """Summariser + M7-prompt identity for M7-namespace cache keys.
 
-    Bumping `SUMMARY_PROMPT_VERSION` or swapping the model invalidates
-    every cached tree-summary artifact across systems that share the
-    summarization substrate (M4, M7).
+    The shared RAPTOR substrate key does NOT use this helper — it folds
+    only the tree-summary model + `SUMMARY_PROMPT_VERSION` via
+    `raptor.raptor_substrate_extra()`, because the aspect/paraphrase/HyDE
+    prompts are query-time only and never alter the cached tree. M7's
+    own cache key uses this full identity so bumping any M7 prompt
+    version invalidates M7-only artifacts without rebuilding the
+    substrate that M4 also depends on.
     """
     return {
         "summary_model": model,
         "summary_prompt_version": prompt_version,
+        "aspect_prompt_version": aspect_prompt_version,
+        "paraphrase_prompt_version": paraphrase_prompt_version,
+        "hyde_prompt_version": hyde_prompt_version,
     }
 
 
@@ -114,29 +170,23 @@ def _get_client() -> Any:
 # Core call ----------------------------------------------------------------
 
 
-def summarize_passages(
-    passages: list[str],
+def _chat(
+    prompt: str,
     *,
-    model: str = DEFAULT_SUMMARY_MODEL,
-    max_tokens: int = DEFAULT_MAX_TOKENS,
-    temperature: float = DEFAULT_TEMPERATURE,
+    model: str,
+    max_tokens: int,
+    temperature: float,
     max_retries: int = 3,
     retry_backoff_s: float = 2.0,
+    _label: str = "chat",
 ) -> str:
-    """One API call. Returns the summary text, stripped.
+    """One single-user-message completion. Returns stripped content.
 
     Retries on transient errors (rate limits, timeouts). Non-transient
     errors (auth, bad request) propagate immediately so misconfiguration
-    surfaces loudly during smoke instead of hiding in retry loops.
+    surfaces loudly during smoke instead of hiding in retry loops. Shared
+    by the RAPTOR tree summariser and every M7 query-time prompt.
     """
-    if not passages:
-        raise ValueError("summarize_passages: passages must be non-empty")
-
-    joined = DEFAULT_PASSAGE_SEPARATOR.join(p.strip() for p in passages if p.strip())
-    if not joined:
-        raise ValueError("summarize_passages: all passages were empty after strip")
-
-    prompt = SUMMARY_PROMPT_TEMPLATE.format(passages=joined)
     client = _get_client()
 
     # Local imports so the module imports cleanly without openai installed.
@@ -166,10 +216,162 @@ def summarize_passages(
                 break
             time.sleep(retry_backoff_s * (2**attempt))
 
-    # All retries exhausted on a transient error.
     raise RuntimeError(
-        f"summarize_passages: exhausted {max_retries} retries against {model}"
+        f"{_label}: exhausted {max_retries} retries against {model}"
     ) from last_exc
+
+
+def summarize_passages(
+    passages: list[str],
+    *,
+    model: str = DEFAULT_SUMMARY_MODEL,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    temperature: float = DEFAULT_TEMPERATURE,
+    max_retries: int = 3,
+    retry_backoff_s: float = 2.0,
+) -> str:
+    """One API call. Returns the RAPTOR node summary text, stripped."""
+    if not passages:
+        raise ValueError("summarize_passages: passages must be non-empty")
+
+    joined = DEFAULT_PASSAGE_SEPARATOR.join(p.strip() for p in passages if p.strip())
+    if not joined:
+        raise ValueError("summarize_passages: all passages were empty after strip")
+
+    return _chat(
+        SUMMARY_PROMPT_TEMPLATE.format(passages=joined),
+        model=model,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        max_retries=max_retries,
+        retry_backoff_s=retry_backoff_s,
+        _label="summarize_passages",
+    )
+
+
+# --- M7 query-time helpers (PIPELINE_DESIGN.md §4.1) -----------------------
+
+ASPECT_MAX_TOKENS = 220
+PARAPHRASE_MAX_TOKENS = 80
+HYDE_MAX_TOKENS = 160
+
+
+@dataclass(frozen=True)
+class Aspect:
+    """One answer aspect extracted from the user query (§4.1)."""
+    name: str
+    importance: float
+
+
+@dataclass(frozen=True)
+class AspectExtraction:
+    """Result of query decomposition. `kind` is "simple" or "multi_aspect"."""
+    kind: str
+    aspects: list[Aspect]
+
+
+def _strip_json_fences(text: str) -> str:
+    """Drop ```json ... ``` / ``` ... ``` fences an LLM may wrap JSON in."""
+    t = text.strip()
+    if t.startswith("```"):
+        t = t.split("\n", 1)[1] if "\n" in t else t[3:]
+        if t.rstrip().endswith("```"):
+            t = t.rstrip()[:-3]
+    return t.strip()
+
+
+def extract_aspects(
+    query: str,
+    *,
+    model: str = DEFAULT_SUMMARY_MODEL,
+    max_tokens: int = ASPECT_MAX_TOKENS,
+    temperature: float = DEFAULT_TEMPERATURE,
+) -> AspectExtraction:
+    """LLM simple/multi-aspect classification + aspect list (§4.1).
+
+    Raises `ValueError` if the model output is not parseable as the
+    expected JSON schema. Callers (the M7 orchestrator) catch this and
+    fall back to a single protected `main` aspect — aspect-extractor
+    failure must degrade, never crash the pipeline.
+    """
+    if not query or not query.strip():
+        raise ValueError("extract_aspects: query must be non-empty")
+
+    raw = _chat(
+        ASPECT_EXTRACTION_PROMPT_TEMPLATE.format(query=query.strip()),
+        model=model,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        _label="extract_aspects",
+    )
+
+    try:
+        obj = json.loads(_strip_json_fences(raw))
+    except json.JSONDecodeError as e:
+        raise ValueError(f"extract_aspects: unparseable JSON: {raw!r}") from e
+
+    kind = obj.get("type")
+    if kind not in ("simple", "multi_aspect"):
+        raise ValueError(f"extract_aspects: bad type field: {obj!r}")
+
+    raw_aspects = obj.get("aspects")
+    if not isinstance(raw_aspects, list) or not raw_aspects:
+        raise ValueError(f"extract_aspects: missing/empty aspects: {obj!r}")
+
+    aspects: list[Aspect] = []
+    for a in raw_aspects:
+        if not isinstance(a, dict) or "name" not in a or "importance" not in a:
+            raise ValueError(f"extract_aspects: malformed aspect: {a!r}")
+        name = str(a["name"]).strip()
+        if not name:
+            raise ValueError(f"extract_aspects: empty aspect name: {a!r}")
+        try:
+            importance = float(a["importance"])
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"extract_aspects: non-numeric importance: {a!r}"
+            ) from e
+        aspects.append(Aspect(name=name, importance=max(0.0, min(1.0, importance))))
+
+    return AspectExtraction(kind=kind, aspects=aspects)
+
+
+def paraphrase_view(
+    aspect_text: str,
+    *,
+    model: str = DEFAULT_SUMMARY_MODEL,
+    max_tokens: int = PARAPHRASE_MAX_TOKENS,
+    temperature: float = DEFAULT_TEMPERATURE,
+) -> str:
+    """Intent-preserving reword of an aspect (§4.1 paraphrase view)."""
+    if not aspect_text or not aspect_text.strip():
+        raise ValueError("paraphrase_view: aspect_text must be non-empty")
+    return _chat(
+        PARAPHRASE_PROMPT_TEMPLATE.format(aspect=aspect_text.strip()),
+        model=model,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        _label="paraphrase_view",
+    )
+
+
+def hyde_view(
+    aspect_text: str,
+    *,
+    model: str = DEFAULT_SUMMARY_MODEL,
+    max_tokens: int = HYDE_MAX_TOKENS,
+    temperature: float = DEFAULT_TEMPERATURE,
+) -> str:
+    """Hypothetical 2-3 sentence answer to an aspect (§4.1 HyDE view)."""
+    if not aspect_text or not aspect_text.strip():
+        raise ValueError("hyde_view: aspect_text must be non-empty")
+    return _chat(
+        HYDE_PROMPT_TEMPLATE.format(aspect=aspect_text.strip()),
+        model=model,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        _label="hyde_view",
+    )
 
 
 __all__ = [
@@ -178,6 +380,17 @@ __all__ = [
     "DEFAULT_TEMPERATURE",
     "SUMMARY_PROMPT_VERSION",
     "SUMMARY_PROMPT_TEMPLATE",
+    "ASPECT_EXTRACTION_PROMPT_VERSION",
+    "ASPECT_EXTRACTION_PROMPT_TEMPLATE",
+    "PARAPHRASE_PROMPT_VERSION",
+    "PARAPHRASE_PROMPT_TEMPLATE",
+    "HYDE_PROMPT_VERSION",
+    "HYDE_PROMPT_TEMPLATE",
+    "Aspect",
+    "AspectExtraction",
     "summarization_identity",
     "summarize_passages",
+    "extract_aspects",
+    "paraphrase_view",
+    "hyde_view",
 ]
