@@ -199,12 +199,135 @@ class M8Config:
     tfidf_max_df: float = 0.95
 
 
+# --- M7 sub-configs (PIPELINE_DESIGN.md §5 CONFIG, verbatim) --------------
+
+
+@dataclass(frozen=True)
+class AspectParams:
+    """§4.1 query decomposition."""
+    max_aspects: int = 3
+    min_aspect_importance: float = 0.25
+    drop_low_importance_aspects: bool = True
+
+
+@dataclass(frozen=True)
+class AspectScoringParams:
+    """§4.2 aspect scoring = w_i·importance + w_c·retrieval_confidence.
+
+    retrieval_confidence = sigmoid(top-1 cross-encoder logit) over the
+    preliminary-rerank top-K first-stage hits of the aspect's paraphrase
+    view. Source is fixed (cross_encoder_top1) by design — not a knob.
+    """
+    importance_weight: float = 0.5
+    retrieval_confidence_weight: float = 0.5
+    preliminary_rerank_top_k: int = 10
+
+
+@dataclass(frozen=True)
+class BudgetParams:
+    """§4.3 final-context budget allocation."""
+    final_context_chunks: int = FINAL_CONTEXT_CHUNKS  # 15 = 13 aspect + 2 global
+    global_view_quota: int = 2
+    min_chunks_per_aspect: int = 2
+    max_chunks_per_aspect: int = 8
+
+
+@dataclass(frozen=True)
+class MultiBranchParams:
+    """§4.4 Axis-1 Part B multi-branch tree traversal."""
+    top_k_depth_1: int = 3
+    top_k_per_level: int = 2
+    max_depth: int = 4
+    leaves_per_path: int = 5
+
+
+@dataclass(frozen=True)
+class StructuralAxisParams:
+    """§4.4 Axis-2 Docling structural rerank/diversification."""
+    section_diversity_cap: int = 3
+    neighbor_radius: int = 1
+    aspect_section_bias_factor: float = 1.15
+    include_section_title_header: bool = True
+
+
+@dataclass(frozen=True)
+class DiversityParams:
+    """§4.5 anti-redundancy caps (cluster ancestry tagged at index time)."""
+    max_chunks_per_raptor_cluster: int = 4
+
+
+@dataclass(frozen=True)
+class ContextPackingParams:
+    """§4.8 parent-summary orientation context packing."""
+    max_ancestor_summaries_per_chunk_group: int = 2
+    max_parent_summaries_per_chunk_group: int = 2
+    max_parent_summary_tokens: int = 80
+    summary_context_token_ratio: float = 0.15
+    chunk_context_token_ratio: float = 0.85
+    include_root_summary: bool = False
+
+
+@dataclass(frozen=True)
+class AbstentionParams:
+    """§4.9 retrieval-side abstention signal."""
+    retrieval_confidence_threshold: float = 0.40
+
+
+@dataclass(frozen=True)
+class M7Config:
+    """M7 — three-axis hybrid over RAPTOR (the thesis contribution).
+
+    Reuses the shared RAPTOR substrate: `build` / `expansion` /
+    `summary_model` / `rrf_k` / `include_root_in_flat_index` MUST keep
+    M4's defaults so M7 and M4 land on the same RAPTOR/<substrate_hash>/
+    cache directory (see raptor.raptor_substrate_extra). Changing them
+    forks the substrate and forces a rebuild.
+
+    The eight ablation switches are top-level fields so the eval grid
+    (evaluation_plan.pdf §4, A1-A8) flips exactly one off per row via
+    config, never a code change. Six are pure toggles; A3 (view_types)
+    and A6 (quota_preserving_rerank) gate explicit code branches in the
+    orchestrator.
+    """
+    # --- shared RAPTOR substrate (keep == M4 defaults) ---
+    build: RaptorBuildParams = field(default_factory=RaptorBuildParams)
+    expansion: ExpansionParams = field(default_factory=ExpansionParams)
+    summary_model: str = JUDGE_MODEL  # gpt-4o-mini
+    first_stage_top_k: int = FIRST_STAGE_TOP_K
+    rrf_k: int = RRF_K
+    include_root_in_flat_index: bool = False
+
+    # --- M7 query-time sub-configs ---
+    aspects: AspectParams = field(default_factory=AspectParams)
+    scoring: AspectScoringParams = field(default_factory=AspectScoringParams)
+    budget: BudgetParams = field(default_factory=BudgetParams)
+    multi_branch: MultiBranchParams = field(default_factory=MultiBranchParams)
+    structural: StructuralAxisParams = field(default_factory=StructuralAxisParams)
+    diversity: DiversityParams = field(default_factory=DiversityParams)
+    packing: ContextPackingParams = field(default_factory=ContextPackingParams)
+    abstention: AbstentionParams = field(default_factory=AbstentionParams)
+
+    # --- ablation switches (evaluation_plan.pdf §4) ---
+    use_docling_structural_axis: bool = True          # A1
+    use_intent_decomposition: bool = True             # A2
+    view_types: tuple[str, ...] = ("paraphrase", "hyde")  # A3 -> (..,"paraphrase2")
+    use_bm25: bool = True                             # A4
+    include_parent_summaries: bool = True             # A5
+    quota_preserving_rerank: bool = True              # A6
+    pass_retrieval_confidence_to_llm: bool = True     # A7
+    always_include_global_query_view: bool = True     # A8
+
+    # --- diagnostics (smoke flips on for sanity checks; eval leaves off) ---
+    trace: bool = False
+
+
 @dataclass(frozen=True)
 class HarnessConfig:
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
     chunking: ChunkingConfig = field(default_factory=ChunkingConfig)
     generation: GenerationConfig = field(default_factory=GenerationConfig)
     m4: M4Config = field(default_factory=M4Config)
+    m7: M7Config = field(default_factory=M7Config)
     m8: M8Config = field(default_factory=M8Config)
 
 
