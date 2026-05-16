@@ -530,6 +530,19 @@ class ThreeAxisSystem(BaseSystem):
             global_sel = g_re[: m7.budget.global_view_quota]
         trace["global_confidence"] = round(g_conf, 4)
 
+        # Efficiency metric (finding #9, eval-plan §8): every first-stage
+        # retrieval invocation, not just len(views)+1. Preliminary
+        # confidence = one collapsed retrieval per aspect (via
+        # score_aspects) + one for the global view; each aspect view and
+        # the global view each run collapsed + multi-branch (×2).
+        n_retrieval_calls = len(plans)
+        n_retrieval_calls += sum(
+            len(p.views) * 2 for p in plans if p.budget > 0
+        )
+        if m7.always_include_global_query_view:
+            n_retrieval_calls += 1 + 2
+        trace["n_retrieval_calls"] = n_retrieval_calls
+
         # A6 branch: one global cross-encoder rerank, no per-aspect quota.
         if not m7.quota_preserving_rerank:
             uniq: dict[str, float] = {}
@@ -543,11 +556,18 @@ class ThreeAxisSystem(BaseSystem):
             self._last_trace = trace
             return selected, {
                 "plans": plans, "per_aspect": [(p, c) for p, c in per_aspect],
-                "global_sel": global_sel, "g_conf": g_conf, "trace": trace,
+                "aspect_selected": [], "a6": True,
+                "global_sel": global_sel, "g_conf": g_conf,
+                "n_retrieval_calls": n_retrieval_calls, "trace": trace,
             }
 
-        # Step 7 — concat aspects + global, global dedupe, backfill
+        # Step 7 — concat aspects + global, global dedupe, backfill.
+        # `aspect_selected` records exactly the (cid,score) chunks kept
+        # per aspect — including backfilled ones — so answer() shows the
+        # generator precisely what was selected (finding N-A) and keyed
+        # positionally, not by aspect name (finding #7).
         selected: list[tuple[str, float]] = []
+        aspect_selected: list[tuple[AspectPlan, list[tuple[str, float]]]] = []
         seen: set[str] = set()
         for p, reranked in per_aspect:
             chosen = [c for c in reranked[: p.budget]]
@@ -565,6 +585,7 @@ class ThreeAxisSystem(BaseSystem):
                         p.budget, m7.budget.min_chunks_per_aspect
                     ):
                         break
+            aspect_selected.append((p, kept))
             selected.extend(kept)
         for c, s in global_sel:
             if c not in seen:
@@ -573,14 +594,16 @@ class ThreeAxisSystem(BaseSystem):
 
         trace["n_selected"] = len(selected)
         if m7.trace:
-            sel_ids = {c for c, _ in selected}
-            trace["per_aspect_selected"] = {
-                p.name: sum(
-                    1 for c, _ in reranked[: max(p.budget, 0)]
-                    if c in sel_ids
-                )
-                for p, reranked in per_aspect
-            }
+            # Codex P3: count the ACTUAL delivered chunks per aspect
+            # (post-dedupe + backfill `aspect_selected`), not the
+            # pre-dedupe `reranked[:budget]` intent. This makes the
+            # smoke quota check validate the same state answer() emits.
+            # Accumulate so duplicate aspect names sum rather than
+            # clobber (consistent with finding #7).
+            pas: dict[str, int] = {}
+            for p, kept in aspect_selected:
+                pas[p.name] = pas.get(p.name, 0) + len(kept)
+            trace["per_aspect_selected"] = pas
             # Multi-branch subtree breadth on the raw query (diagnostic
             # only; one extra traverse, no LLM/rerank).
             assert self._tree is not None and self.chunk_embeddings is not None
@@ -594,14 +617,21 @@ class ThreeAxisSystem(BaseSystem):
         self._last_trace = trace
         return selected, {
             "plans": plans, "per_aspect": per_aspect,
-            "global_sel": global_sel, "g_conf": g_conf, "trace": trace,
+            "aspect_selected": aspect_selected, "a6": False,
+            "global_sel": global_sel, "g_conf": g_conf,
+            "n_retrieval_calls": n_retrieval_calls, "trace": trace,
         }
 
     # --- step 8: parent-summary packing ----------------------------------
 
-    def _orientation_for(self, cid: str) -> tuple[list[str], str | None]:
-        """Nearest RAPTOR parent summary (+ ≤1 higher) and the Docling
-        section title for a chunk (§4.8). Never the root summary."""
+    def _orientation_for(
+        self, cid: str
+    ) -> tuple[list[str], str | None, str | None]:
+        """Nearest RAPTOR parent summary (+ ≤1 higher), the Docling
+        section title, and the doc-scoped section_key for a chunk
+        (§4.8). Never the root summary. section_key (not the title) is
+        the dedupe key so same-titled sections in different documents
+        (QASPER "Introduction") are not collapsed (finding N-B)."""
         assert self._tree is not None
         m7 = self.config.m7
         idx = self._id_to_idx.get(cid)
@@ -625,7 +655,8 @@ class ThreeAxisSystem(BaseSystem):
                     break
         ref = self._sections.get(cid)
         sec_title = ref.section_title if ref is not None else None
-        return summaries, sec_title
+        sec_key = ref.section_key if ref is not None else None
+        return summaries, sec_title, sec_key
 
     # --- answer -----------------------------------------------------------
 
@@ -635,18 +666,15 @@ class ThreeAxisSystem(BaseSystem):
         selected, state = self._run_pipeline(query)
         m7 = self.config.m7
         plans: list[AspectPlan] = state["plans"]
-        per_aspect = dict(
-            (p.name, c) for p, c in state["per_aspect"]
-        )
         sel_set = {c for c, _ in selected}
 
         thr = m7.abstention.retrieval_confidence_threshold
         abstained: list[str] = []
         blocks: list[str] = []
         seen_orient: set[str] = set()
-        # Cross-aspect evidence dedupe (finding #2): a chunk assigned once
-        # by step 7 must be printed under one aspect only, not repeated
-        # under every aspect whose rerank list also contains it.
+        # Cross-aspect evidence dedupe (finding #2). With aspect_selected
+        # (the exact step-7 kept lists) the lists are already disjoint;
+        # `emitted` is kept as a defensive guard and for the A6 path.
         emitted: set[str] = set()
 
         def _evidence(cids: list[str]) -> list[str]:
@@ -658,40 +686,70 @@ class ThreeAxisSystem(BaseSystem):
                 lines.append(f"  Chunk {cid}: {self.chunks[idx].text}")
             return lines
 
+        def _orient_lines(cids: list[str]) -> list[str]:
+            out: list[str] = []
+            for cid in cids:
+                summaries, sec_title, sec_key = self._orientation_for(cid)
+                # Dedupe on the doc-scoped section_key, not the title, so
+                # same-titled sections across documents are not
+                # collapsed (finding N-B).
+                if sec_key and f"sec::{sec_key}" not in seen_orient:
+                    seen_orient.add(f"sec::{sec_key}")
+                    out.append(f"  [Orientation section: {sec_title}]")
+                for s in summaries:
+                    key = f"sum::{hash(s)}"
+                    if key in seen_orient:
+                        continue
+                    seen_orient.add(key)
+                    out.append(f"  [Orientation: {s}]")
+            return out
+
+        # Abstention is a property of each aspect's confidence,
+        # independent of whether its chunks survived dedupe.
         for p in plans:
-            # Abstention is a property of the aspect's confidence, not of
-            # whether its chunks survived cross-aspect dedupe — record it
-            # before any skip.
-            low = p.retrieval_confidence < thr
-            if low and p.name not in abstained:
+            if p.retrieval_confidence < thr and p.name not in abstained:
                 abstained.append(p.name)
-            chosen = [
-                c for c, _ in per_aspect.get(p.name, [])[: max(p.budget, 0)]
-                if c in sel_set and c not in emitted
+
+        if state.get("a6"):
+            # A6 ablation: quota/aspect structure removed by design — a
+            # single global-rerank evidence block, no per-aspect headers.
+            gset = {c for c, _ in state["global_sel"]}
+            body = [
+                c for c, _ in selected if c in sel_set and c not in gset
             ]
-            if not chosen:
-                continue
-            emitted.update(chosen)
-            header = f"[Aspect: {p.name}]"
-            if m7.pass_retrieval_confidence_to_llm:
-                header += f" (retrieval_confidence: {p.retrieval_confidence:.2f})"
-                if low:
-                    header += " [LOW CONFIDENCE - abstain or hedge here]"
-            blocks.append(header)
-            if m7.include_parent_summaries:
-                for cid in chosen:
-                    summaries, sec = self._orientation_for(cid)
-                    if sec and f"sec::{sec}" not in seen_orient:
-                        seen_orient.add(f"sec::{sec}")
-                        blocks.append(f"  [Orientation section: {sec}]")
-                    for s in summaries:
-                        key = f"sum::{hash(s)}"
-                        if key in seen_orient:
-                            continue
-                        seen_orient.add(key)
-                        blocks.append(f"  [Orientation: {s}]")
-            blocks.append("  [Primary Evidence]")
-            blocks.extend(_evidence(chosen))
+            if body:
+                blocks.append("[Retrieved Evidence (global rerank)]")
+                if m7.include_parent_summaries:
+                    blocks.extend(_orient_lines(body))
+                blocks.append("  [Primary Evidence]")
+                blocks.extend(_evidence(body))
+                emitted.update(body)
+        else:
+            # Iterate the exact per-aspect kept lists positionally
+            # (findings #7 + N-A): includes backfilled chunks, keyed by
+            # position not aspect name.
+            for p, kept in state["aspect_selected"]:
+                low = p.retrieval_confidence < thr
+                chosen = [
+                    c for c, _ in kept
+                    if c in sel_set and c not in emitted
+                ]
+                if not chosen:
+                    continue
+                emitted.update(chosen)
+                header = f"[Aspect: {p.name}]"
+                if m7.pass_retrieval_confidence_to_llm:
+                    header += (
+                        f" (retrieval_confidence: "
+                        f"{p.retrieval_confidence:.2f})"
+                    )
+                    if low:
+                        header += " [LOW CONFIDENCE - abstain or hedge here]"
+                blocks.append(header)
+                if m7.include_parent_summaries:
+                    blocks.extend(_orient_lines(chosen))
+                blocks.append("  [Primary Evidence]")
+                blocks.extend(_evidence(chosen))
 
         gsel = [
             c for c, _ in state["global_sel"]
@@ -746,7 +804,9 @@ class ThreeAxisSystem(BaseSystem):
             answer=ans,
             retrieved=retrieved,
             latency_s=self._now() - t0,
-            n_retrieval_calls=sum(len(p.views) for p in plans) + 1,
+            n_retrieval_calls=state.get(
+                "n_retrieval_calls", sum(len(p.views) for p in plans) + 1
+            ),
             extra=extra,
         )
 

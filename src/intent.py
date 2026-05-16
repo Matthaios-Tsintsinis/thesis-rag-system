@@ -108,14 +108,17 @@ def decompose(
         aspects = [main]
 
     # Drop sub-threshold aspects entirely (NOT min-quota'd) — spurious
-    # aspects must not consume protected budget (§4.1).
+    # aspects must not consume protected budget (§4.1). Finding #3: if
+    # EVERY aspect is sub-threshold, collapse to the single protected
+    # `main` aspect. N-C guard: reuse the query-backed `main` built
+    # above — a bare Aspect("main") here would reintroduce finding #1
+    # (retrieval on the literal token "main") for this path.
     if cfg.aspects.drop_low_importance_aspects and len(aspects) > 1:
         kept = [
             a for a in aspects
             if a.importance >= cfg.aspects.min_aspect_importance
         ]
-        if kept:
-            aspects = kept
+        aspects = kept if kept else [main]
 
     # Cap to MAX_ASPECTS, keeping the most important. Stable on ties.
     if len(aspects) > cfg.aspects.max_aspects:
@@ -288,6 +291,20 @@ def allocate_budget(plans: list[AspectPlan], cfg: M7Config) -> list[AspectPlan]:
                 progressed = True
         if not progressed:
             break
+
+    # Hard cap (finding #4): if `total` is smaller than the MIN floor
+    # could honour (total < n·MIN, e.g. a pathologically small budget
+    # config), the deficit loop above stalls at MIN and the sum still
+    # exceeds `total`. Relax MIN and drain the weakest aspects to 0
+    # until the sum equals `total` — never allocate more than the hard
+    # FINAL_CONTEXT budget.
+    if assigned > total:
+        for p in sorted(active, key=lambda p: p.score):  # weakest first
+            while assigned > total and alloc[id(p)] > 0:
+                alloc[id(p)] -= 1
+                assigned -= 1
+            if assigned <= total:
+                break
 
     for p in active:
         p.budget = alloc[id(p)]
