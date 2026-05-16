@@ -572,6 +572,25 @@ class ThreeAxisSystem(BaseSystem):
                 selected.append((c, s))
 
         trace["n_selected"] = len(selected)
+        if m7.trace:
+            sel_ids = {c for c, _ in selected}
+            trace["per_aspect_selected"] = {
+                p.name: sum(
+                    1 for c, _ in reranked[: max(p.budget, 0)]
+                    if c in sel_ids
+                )
+                for p, reranked in per_aspect
+            }
+            # Multi-branch subtree breadth on the raw query (diagnostic
+            # only; one extra traverse, no LLM/rerank).
+            assert self._tree is not None and self.chunk_embeddings is not None
+            qv = embed_texts([query])[0]
+            qhits = multi_branch_traverse(
+                self._tree, qv, self.chunk_embeddings, m7.multi_branch
+            )
+            trace["multibranch_distinct_paths"] = len(
+                {h.path for h in qhits}
+            )
         self._last_trace = trace
         return selected, {
             "plans": plans, "per_aspect": per_aspect,

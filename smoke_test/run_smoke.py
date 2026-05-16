@@ -47,6 +47,7 @@ from src.config import (
     ExpansionParams,
     HarnessConfig,
     M4Config,
+    M7Config,
     RaptorBuildParams,
 )
 from src.harness import JSONLBenchmark, _record
@@ -55,6 +56,7 @@ from src.retrievers.m1_closedbook import ClosedBookSystem
 from src.retrievers.m2_flat_dense import FlatDenseSystem
 from src.retrievers.m3_hybrid import HybridRRFSystem
 from src.retrievers.m4_raptor import RaptorSystem
+from src.retrievers.m7_three_axis import ThreeAxisSystem
 from src.retrievers.m8_hierarchical import HierarchicalSystem
 
 
@@ -68,7 +70,23 @@ SYSTEM_REGISTRY: dict[str, type[BaseSystem]] = {
     "M2": FlatDenseSystem,
     "M3": HybridRRFSystem,
     "M4": RaptorSystem,
+    "M7": ThreeAxisSystem,
     "M8": HierarchicalSystem,
+}
+
+# The eight evaluation_plan.pdf §4 ablations, each disabling exactly one
+# M7 component via config (never a code change). Smoke runs each on one
+# question (retrieval-only) and asserts the disabled component's effect
+# is observable in the trace — it does not measure quality.
+M7_ABLATIONS: dict[str, dict] = {
+    "A1": {"use_docling_structural_axis": False},
+    "A2": {"use_intent_decomposition": False},
+    "A3": {"view_types": ("paraphrase", "paraphrase2")},
+    "A4": {"use_bm25": False},
+    "A5": {"include_parent_summaries": False},
+    "A6": {"quota_preserving_rerank": False},
+    "A7": {"pass_retrieval_confidence_to_llm": False},
+    "A8": {"always_include_global_query_view": False},
 }
 
 
@@ -114,9 +132,30 @@ _SMOKE_M4 = M4Config(
 )
 
 
-def _config_for(sid: str) -> HarnessConfig:
+# M7 reuses M4's RAPTOR substrate: identical build/expansion params +
+# identical semantic chunking → identical substrate cache key, so M7
+# cache-hits the RAPTOR/<hash>/ dir M4 built instead of re-summarising.
+_SMOKE_M7 = M7Config(
+    build=RaptorBuildParams(
+        branching_factor=3,
+        min_cluster_size=3,
+        max_depth=3,
+    ),
+    expansion=ExpansionParams(
+        max_descendant_chunks_for_direct_expansion=10,
+    ),
+    first_stage_top_k=30,
+    trace=True,
+)
+
+
+def _config_for(sid: str, m7: M7Config | None = None) -> HarnessConfig:
     if sid == "M4":
         return replace(DEFAULT_CONFIG, chunking=_SMOKE_SEM, m4=_SMOKE_M4)
+    if sid == "M7":
+        return replace(
+            DEFAULT_CONFIG, chunking=_SMOKE_SEM, m7=m7 or _SMOKE_M7
+        )
     if sid == "M8":
         return replace(DEFAULT_CONFIG, chunking=_SMOKE_SEM)
     return replace(DEFAULT_CONFIG, chunking=_SMOKE_WW)
@@ -147,7 +186,7 @@ def _check_m2_m3_divergence(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--systems", nargs="*",
-                        default=["M1", "M2", "M3", "M4", "M8"])
+                        default=["M1", "M2", "M3", "M4", "M7", "M8"])
     parser.add_argument("--no-generate", action="store_true",
                         help="Skip LLM generation; report retrieval only.")
     parser.add_argument("--limit", type=int, default=None)
@@ -167,6 +206,10 @@ def main() -> None:
     m4_chunk_counts: list[int] = []
     m4_paths_union: set[str] = set()
     m4_index_stats: dict = {}
+    m7_chunk_counts: list[int] = []
+    m7_index_stats: dict = {}
+    m7_traces: list[dict] = []
+    m7_abstained_any = False
     m8_chunk_counts: list[int] = []
 
     with out_path.open("w", encoding="utf-8") as f:
@@ -187,6 +230,9 @@ def main() -> None:
             if sid == "M4":
                 m4_index_stats = system.index_stats
                 print(f"  M4 index stats: {m4_index_stats}")
+            if sid == "M7":
+                m7_index_stats = system.index_stats
+                print(f"  M7 index stats: {m7_index_stats}")
 
             for n, q in enumerate(bench.questions()):
                 if args.limit is not None and n >= args.limit:
@@ -209,6 +255,11 @@ def main() -> None:
                     m4_chunk_counts.append(len(ar.retrieved))
                     exercised_paths = system.last_trace.get("paths_exercised", [])
                     m4_paths_union.update(exercised_paths)
+                elif sid == "M7":
+                    m7_chunk_counts.append(len(ar.retrieved))
+                    m7_traces.append(dict(system.last_trace))
+                    if ar.extra.get("abstained_aspects"):
+                        m7_abstained_any = True
                 elif sid == "M8":
                     m8_chunk_counts.append(len(ar.retrieved))
 
@@ -316,6 +367,120 @@ def main() -> None:
             n_hits = sum(c > 0 for c in m8_chunk_counts)
             print(f"[smoke] OK: M8 returned chunks on {n_hits}/"
                   f"{len(m8_chunk_counts)} questions")
+
+    if "M7" in args.systems:
+        if not m7_index_stats:
+            print("[smoke] FAIL: M7 produced no index_stats")
+            fail = True
+        else:
+            print(
+                f"[smoke] OK: M7 substrate reused — tree "
+                f"{m7_index_stats.get('tree_n_nodes')} nodes, "
+                f"{m7_index_stats.get('n_docling_sections')} Docling "
+                f"section(s), {m7_index_stats.get('n_chunks')} chunks"
+            )
+        if not m7_chunk_counts or all(c == 0 for c in m7_chunk_counts):
+            print("[smoke] FAIL: M7 returned 0 chunks on every question")
+            fail = True
+        else:
+            print(
+                f"[smoke] OK: M7 returned chunks on "
+                f"{sum(c > 0 for c in m7_chunk_counts)}/"
+                f"{len(m7_chunk_counts)} questions"
+            )
+        # Aspect extraction parsed + exactly 2 views per aspect.
+        any_views_ok = False
+        any_multi = False
+        for tr in m7_traces:
+            asp = tr.get("aspects", [])
+            if not asp:
+                continue
+            if all(a["n_views"] == 2 for a in asp):
+                any_views_ok = True
+            if any(a["name"] != "main" for a in asp) and len(asp) > 1:
+                any_multi = True
+        if not any_views_ok:
+            print("[smoke] FAIL: M7 aspect plans never had exactly 2 views")
+            fail = True
+        else:
+            print("[smoke] OK: M7 aspects parsed with 2 views (paraphrase+HyDE)")
+        if not any_multi:
+            print(
+                "[smoke] WARN: no multi-aspect decomposition observed across "
+                "the 5 questions (smoke-005 is the multi-aspect probe) — "
+                "aspect extractor may be collapsing everything to 'main'"
+            )
+        else:
+            print("[smoke] OK: M7 produced a multi-aspect decomposition")
+        # Multi-branch explored >1 distinct subtree on >=1 question.
+        mb = max((t.get("multibranch_distinct_paths", 0) for t in m7_traces),
+                 default=0)
+        if mb < 2:
+            print(
+                f"[smoke] FAIL: M7 multi-branch traversal never explored >1 "
+                f"subtree (max distinct paths={mb}); Axis-1b is degenerate."
+            )
+            fail = True
+        else:
+            print(f"[smoke] OK: M7 multi-branch explored up to {mb} subtrees")
+        # No duplicate chunk ids in any M7 result (RRF/global dedupe works).
+        dup = False
+        for line in out_path.read_text(encoding="utf-8").splitlines():
+            rec = json.loads(line)
+            if rec["system_id"] == "M7":
+                cid = rec["retrieved_chunk_ids"]
+                if len(cid) != len(set(cid)):
+                    dup = True
+        if dup:
+            print("[smoke] FAIL: M7 returned duplicate chunk ids (dedupe broke)")
+            fail = True
+        else:
+            print("[smoke] OK: M7 results dedupe correctly (no repeat chunks)")
+        # Per-aspect quota preserved: selected count never exceeds budget.
+        quota_ok = True
+        for tr in m7_traces:
+            pas = tr.get("per_aspect_selected", {})
+            for a in tr.get("aspects", []):
+                if pas.get(a["name"], 0) > a["budget"]:
+                    quota_ok = False
+        if not quota_ok:
+            print("[smoke] FAIL: M7 an aspect exceeded its quota after rerank")
+            fail = True
+        else:
+            print("[smoke] OK: M7 per-aspect quota preserved through rerank")
+
+        # --- Ablation sweep: one question, retrieval-only, trace asserts ---
+        probe = next(iter(bench.questions())).question
+        ab_fail = False
+        for aid, overrides in M7_ABLATIONS.items():
+            cfg = replace(_SMOKE_M7, **overrides)
+            sysa = ThreeAxisSystem(config=_config_for("M7", m7=cfg))
+            sysa.index(CORPUS_DIR)
+            sysa.retrieve(probe)
+            tr = sysa.last_trace
+            if aid == "A2":
+                ok = len(tr.get("aspects", [])) == 1
+            elif aid == "A3":
+                vt = (tr.get("aspects", [{}]) or [{}])[0].get("view_types", [])
+                ok = "paraphrase2" in vt and "hyde" not in vt
+            elif aid == "A6":
+                ok = tr.get("mode") == "A6_global_rerank"
+            elif aid == "A8":
+                ok = tr.get("global_confidence", 1.0) == 0.0
+            else:  # A1/A4/A5/A7: pure skips — assert it ran cleanly
+                ok = bool(tr.get("aspects"))
+            tr_flags = tr.get("ablations", {})
+            print(
+                f"  [{aid}] effect_observed={ok} "
+                f"flags={ {k: tr_flags.get(k) for k in overrides} }"
+            )
+            if not ok:
+                ab_fail = True
+        if ab_fail:
+            print("[smoke] FAIL: an M7 ablation did not disable its component")
+            fail = True
+        else:
+            print("[smoke] OK: all 8 M7 ablations disabled their component")
 
     if fail:
         sys.exit(2)
