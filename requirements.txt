@@ -1,5 +1,8 @@
 # --- Shared infra (M1-M3) ---
-numpy>=1.26
+numpy>=2.1,<3                    # floored at 2.1 by graphrag (M5); single
+                                # numpy 2.x ABI generation across all systems.
+                                # Upper <3 guards against a future numpy 3
+                                # ABI break entering silently.
 sentence-transformers>=3.0      # bge-m3 embedder + bge-reranker-v2-m3 cross-encoder
 faiss-cpu>=1.8                  # swap to faiss-gpu on CUDA hosts
 rank-bm25>=0.2.2
@@ -24,3 +27,10 @@ transformers>=4.44
 torch>=2.2
 accelerate>=0.33
 bitsandbytes>=0.43 ; platform_system == "Linux"   # 4-bit quant; Linux/CUDA only
+
+# --- M5 (GraphRAG baseline; wraps the authors' implementation) ---
+graphrag==3.0.9                 # pinned; folded into the M5 cache key so a
+                                # library bump invalidates graph artifacts.
+                                # LLM-API-centric — does not constrain the
+                                # torch / transformers / sentence-transformers
+                                # / faiss / bitsandbytes stack.
