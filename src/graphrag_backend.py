@@ -32,9 +32,9 @@ without graphrag installed — e.g. the Windows dev worktree, where
 AST/import verification runs. Code paths that touch the graphrag API
 cannot be exercised off-Colab; those are marked COLAB-VERIFIED-ONLY and
 are smoke-verified on Colab T4 at milestone C4, not in local CI. The
-exact signatures of the LLMEmbedding ABC members and the build_context
-result shape were not captured by introspection — those spots are
-flagged inline as C4 fix points.
+build_context result shape and a few parquet column names were not
+captured by introspection — those spots are flagged inline as C4 fix
+points.
 """
 
 from __future__ import annotations
@@ -208,8 +208,8 @@ def write_input_documents(docs: dict[str, str], project_dir: Path) -> Path:
 # === COLAB-VERIFIED-ONLY ==================================================
 # Everything below touches the graphrag 3.0.9 API. It cannot run on a host
 # without graphrag installed and is smoke-verified on Colab T4 at C4. The
-# LLMEmbedding ABC member signatures and the build_context result shape
-# were not captured by introspection — inline notes mark the C4 fix points.
+# build_context result shape and a few parquet column names were not
+# captured by introspection — inline notes mark the C4 fix points.
 # ==========================================================================
 
 
@@ -226,18 +226,27 @@ def _approx_tokenizer() -> Any:
     return tiktoken.get_encoding("cl100k_base")
 
 
-def _build_embedding_response(response_cls: Any, vectors: list[list[float]]) -> Any:
-    """Construct an LLMEmbeddingResponse from raw vectors.
+def _build_embedding_response(vectors: list[list[float]]) -> Any:
+    """Build an LLMEmbeddingResponse via the graphrag_llm factory.
 
-    Observed accessors in graphrag_llm usage: resp.embeddings (list of
-    vectors) and resp.data (list of items each with .embedding). The
-    constructor shape was not introspected — tries embeddings=, then
-    data=. C4 fix point.
+    graphrag_llm.utils.create_embedding_response.create_embedding_response
+    is the intended construction path (verified by introspection):
+    create_embedding_response(embeddings: list[float], batch_size: int = 1).
+    `embeddings` is the flattened float stream and `batch_size` the number
+    of inputs, so the factory reshapes it into per-input vectors. The
+    flat-vs-nested form is the one remaining C4-checkable detail — a
+    nested fallback covers the loose-annotation case.
     """
+    from graphrag_llm.utils.create_embedding_response import (
+        create_embedding_response,
+    )
+
+    n = len(vectors)
+    flat = [x for vec in vectors for x in vec]
     try:
-        return response_cls(embeddings=vectors)
+        return create_embedding_response(embeddings=flat, batch_size=n)
     except Exception:
-        return response_cls(data=[{"embedding": v} for v in vectors])
+        return create_embedding_response(embeddings=vectors, batch_size=n)
 
 
 class _MinimalMetricsStore:
@@ -267,13 +276,12 @@ def _make_bge_m3_embedding_class(cfg: M5Config) -> Any:
     embedder parity that evaluation_plan.pdf section 7 requires.
 
     The verified abstract surface is __init__, embedding, embedding_async,
-    metrics_store, tokenizer. Exact ABC member signatures were not
-    introspected; the implementations target the contract observed in
-    graphrag_llm usage examples — permissive *args/**kwargs absorb
-    whatever GraphRAG passes. C4 fix point.
+    metrics_store, tokenizer. embedding / embedding_async are implemented
+    against the introspected signature (self, /, **kwargs: Unpack[
+    LLMEmbeddingArgs]) — the input texts arrive under the 'input' key.
+    metrics_store and tokenizer remain defensively stubbed (C4 fix points).
     """
     from graphrag_llm.embedding import LLMEmbedding
-    from graphrag_llm.types import LLMEmbeddingResponse
 
     from .models import embed_texts
 
@@ -290,12 +298,21 @@ def _make_bge_m3_embedding_class(cfg: M5Config) -> Any:
             vecs = embed_texts(texts, self._model_name)
             return [v.tolist() for v in vecs]
 
-        def embedding(self, input: Any, **kwargs: Any) -> Any:  # noqa: A002
-            return _build_embedding_response(LLMEmbeddingResponse, self._encode(input))
+        @staticmethod
+        def _input_texts(kwargs: dict[str, Any]) -> Any:
+            # LLMEmbedding.embedding takes **kwargs: Unpack[LLMEmbeddingArgs];
+            # the texts to embed arrive under the 'input' key.
+            for key in ("input", "texts", "text"):
+                if kwargs.get(key) is not None:
+                    return kwargs[key]
+            raise KeyError("LLMEmbedding call missing an 'input' argument")
 
-        async def embedding_async(self, input: Any, **kwargs: Any) -> Any:  # noqa: A002
+        def embedding(self, /, **kwargs: Any) -> Any:
+            return _build_embedding_response(self._encode(self._input_texts(kwargs)))
+
+        async def embedding_async(self, /, **kwargs: Any) -> Any:
             # bge-m3 runs locally and synchronously; no real async work.
-            return self.embedding(input, **kwargs)
+            return self.embedding(**kwargs)
 
         @property
         def metrics_store(self) -> Any:
