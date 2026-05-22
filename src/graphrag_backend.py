@@ -60,7 +60,7 @@ GRAPHRAG_LANCEDB_SUBDIR = f"{GRAPHRAG_OUTPUT_SUBDIR}/lancedb"
 # resolve these names by default, so reusing them avoids per-workflow
 # *_model_id overrides in the generated settings.
 EMBEDDING_MODEL_ID = "default_embedding_model"
-COMPLETION_MODEL_ID = "default_chat_model"
+COMPLETION_MODEL_ID = "default_completion_model"
 
 # Registry key for the bge-m3 embedder, placed in the embedding
 # ModelConfig's `type` field so GraphRAG resolves it to our model.
