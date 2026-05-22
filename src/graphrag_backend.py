@@ -548,7 +548,10 @@ def local_search_context(
     from graphrag.query.structured_search.local_search.mixed_context import (
         LocalSearchMixedContext,
     )
-    from graphrag_vectors import IndexSchema, LanceDBVectorStore
+    # IndexSchema is a top-level export; LanceDBVectorStore is not — it
+    # lives in the graphrag_vectors.lancedb submodule.
+    from graphrag_vectors import IndexSchema
+    from graphrag_vectors.lancedb import LanceDBVectorStore
 
     level = cfg.community_level
     entities = read_indexer_entities(artifacts.entities, artifacts.communities, level)
