@@ -102,13 +102,21 @@ def _prepare_fresh(directory: Path) -> None:
 
 
 def _lancedb_valid(project_dir: Path) -> bool:
-    """True if every lancedb table under output/lancedb/ is committed.
+    """True if every lancedb table under output/lancedb/ is usable.
 
-    A lancedb table directory with an empty _versions/ is the Drive-FUSE
-    corruption signature: lancedb finalises a table version via an atomic
-    rename that Drive forbids, so the table lists but cannot be opened.
-    Every *.lance directory is checked, not just entity_description, so a
-    future GraphRAG version that writes more tables is covered.
+    Two corruption modes are checked — passing the first but not the
+    second is what let a broken index reach the cache and surface only at
+    query time:
+
+      * Empty _versions/ — the Drive-FUSE signature: lancedb finalises a
+        table version via an atomic rename Drive forbids, so the table
+        lists but cannot be opened.
+      * Committed but empty (0 rows) — the embedding-workflow-failed
+        signature: the table is written and version-committed, but
+        generate_text_embeddings errored before populating it.
+
+    Every *.lance directory is checked (not just entity_description) so a
+    future GraphRAG version writing more tables is covered.
     """
     lancedb_root = Path(project_dir) / GRAPHRAG_LANCEDB_SUBDIR
     if not lancedb_root.is_dir():
@@ -116,10 +124,24 @@ def _lancedb_valid(project_dir: Path) -> bool:
     table_dirs = [p for p in lancedb_root.glob("*.lance") if p.is_dir()]
     if not table_dirs:
         return False
+
+    # Structural check — every table version-committed.
     for table in table_dirs:
         versions = table / "_versions"
         if not versions.is_dir() or not any(versions.iterdir()):
             return False
+
+    # Content check — every table opens and holds rows. A committed but
+    # 0-row table means an embedding workflow errored silently.
+    import lancedb
+
+    try:
+        db = lancedb.connect(str(lancedb_root))
+        for table in table_dirs:
+            if db.open_table(table.stem).count_rows() <= 0:
+                return False
+    except Exception:
+        return False
     return True
 
 
