@@ -144,7 +144,9 @@ def build_settings(cfg: M5Config) -> dict[str, Any]:
             "file_type": "text",
         },
         "output": {"type": "file", "base_dir": GRAPHRAG_OUTPUT_SUBDIR},
-        "cache": {"type": "file", "base_dir": GRAPHRAG_CACHE_SUBDIR},
+        # CacheType has no "file" — valid values are json / memory / none.
+        # "json" is the file-backed JSON cache (the GraphRagConfig default).
+        "cache": {"type": "json", "base_dir": GRAPHRAG_CACHE_SUBDIR},
         "vector_store": {
             "default_vector_store": {
                 "type": "lancedb",
@@ -370,9 +372,11 @@ def make_bge_m3_embedder(cfg: M5Config) -> Any:
 def build_index(cfg: M5Config, project_dir: Path) -> list:
     """Run the GraphRAG indexing pipeline in-process.
 
-    Registers the bge-m3 embedder, loads the generated settings, and runs
-    the async build_index pipeline to completion. Returns the list of
-    PipelineRunResult; raises RuntimeError if any workflow errored.
+    Registers the bge-m3 embedder, force-imports GraphRAG's factory
+    modules so their built-in types register, loads the generated
+    settings, and runs the async build_index pipeline to completion.
+    Returns the list of PipelineRunResult; raises RuntimeError if any
+    workflow errored.
 
     settings.yaml and the input documents must already be written into
     project_dir (write_settings / write_input_documents) — the C3 wrapper
@@ -380,6 +384,16 @@ def build_index(cfg: M5Config, project_dir: Path) -> list:
     custom embedding-model injection is library-only.
     """
     register_bge_m3_embedding(cfg)
+
+    # GraphRAG's built-in cache / storage / table / vector-store types
+    # register at module import time via module-level register_*() calls.
+    # The CLI pulls these in transitively; the in-process path must import
+    # the factory modules explicitly, or the factories stay empty and
+    # run_pipeline raises "type '...' is not registered".
+    import graphrag_cache.cache_factory  # noqa: F401
+    import graphrag_storage.storage_factory  # noqa: F401
+    import graphrag_storage.tables.table_provider_factory  # noqa: F401
+    import graphrag_vectors.vector_store_factory  # noqa: F401
 
     import graphrag.api as api
     from graphrag.config.enums import IndexingMethod
