@@ -84,12 +84,45 @@ def hf_cache_dir() -> Path:
     return _LOCAL_FALLBACK_ROOT / "hf_cache"
 
 
+def staging_dir() -> Path:
+    """Local real-filesystem scratch root — never Drive.
+
+    lancedb (GraphRAG / M5, and likely M6) commits a table by an atomic
+    rename, which the Drive FUSE mount forbids (EPERM). Such systems must
+    build on a real local disk and copy the finished artifacts to the
+    Drive cache. On Colab that is /content; off-Colab a repo-local dir.
+    Override with THESIS_STAGING_DIR.
+    """
+    val = os.environ.get("THESIS_STAGING_DIR")
+    if val:
+        return Path(val).expanduser()
+    if _on_colab():
+        return Path("/content/thesis_staging")
+    return _LOCAL_FALLBACK_ROOT / "staging"
+
+
+def cache_dir_needs_staging() -> bool:
+    """True when the cache dir sits on the Drive FUSE mount.
+
+    Callers writing rename-sensitive stores (lancedb) must then build on
+    staging_dir() and copy the result into the cache. False for a local
+    cache dir (local dev, or Colab without Drive), where the cache dir is
+    itself a real filesystem and can be written in place.
+    """
+    try:
+        cd = cache_dir().resolve()
+    except OSError:
+        return False
+    return cd == _DRIVE_MARKER or _DRIVE_MARKER in cd.parents
+
+
 def all_paths() -> dict[str, Path]:
     return {
         "INPUT_DIR": input_dir(),
         "CACHE_DIR": cache_dir(),
         "OUTPUT_DIR": output_dir(),
         "HF_CACHE_DIR": hf_cache_dir(),
+        "STAGING_DIR": staging_dir(),
     }
 
 

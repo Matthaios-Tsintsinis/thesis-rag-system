@@ -49,6 +49,7 @@ context builder across queries.
 
 from __future__ import annotations
 
+import shutil
 from dataclasses import asdict
 from pathlib import Path
 
@@ -62,6 +63,7 @@ from ..config import (
     HarnessConfig,
 )
 from ..graphrag_backend import (
+    GRAPHRAG_LANCEDB_SUBDIR,
     GraphRAGContextUnit,
     build_index,
     graphrag_identity,
@@ -87,6 +89,38 @@ REQUIRED_FILES = (
     "output/community_reports.parquet",
     "output/text_units.parquet",
 )
+
+
+def _prepare_fresh(directory: Path) -> None:
+    """Remove `directory` if it exists, then recreate it empty.
+
+    Guarantees the directory holds exactly one index — no stale files
+    from a prior build merged with freshly built or copied-in ones.
+    """
+    shutil.rmtree(directory, ignore_errors=True)
+    directory.mkdir(parents=True, exist_ok=True)
+
+
+def _lancedb_valid(project_dir: Path) -> bool:
+    """True if every lancedb table under output/lancedb/ is committed.
+
+    A lancedb table directory with an empty _versions/ is the Drive-FUSE
+    corruption signature: lancedb finalises a table version via an atomic
+    rename that Drive forbids, so the table lists but cannot be opened.
+    Every *.lance directory is checked, not just entity_description, so a
+    future GraphRAG version that writes more tables is covered.
+    """
+    lancedb_root = Path(project_dir) / GRAPHRAG_LANCEDB_SUBDIR
+    if not lancedb_root.is_dir():
+        return False
+    table_dirs = [p for p in lancedb_root.glob("*.lance") if p.is_dir()]
+    if not table_dirs:
+        return False
+    for table in table_dirs:
+        versions = table / "_versions"
+        if not versions.is_dir() or not any(versions.iterdir()):
+            return False
+    return True
 
 
 class GraphRAGSystem(BaseSystem):
@@ -115,19 +149,47 @@ class GraphRAGSystem(BaseSystem):
             extra=graphrag_identity(m5),
         )
         cdir = CacheDir(paths.cache_dir(), M5_CACHE_NAMESPACE, ckey)
-        project_dir = cdir.path
 
-        if cdir.is_complete(REQUIRED_FILES):
-            print(f"[{self.system_id}] cache hit: {project_dir}")
-            self._project_dir = project_dir
-            self._index_stats = self._collect_stats(project_dir)
-            self._indexed = True
-            return
-
-        print(
-            f"[{self.system_id}] cache miss -> building GraphRAG index at "
-            f"{project_dir}"
+        # lancedb commits a table by an atomic rename that the Drive FUSE
+        # mount forbids — so when the cache dir is on Drive, GraphRAG must
+        # build on local disk (the work dir) and the finished project is
+        # copied to the Drive cache for cross-session persistence. When
+        # the cache dir is already a real filesystem, build in place.
+        staging = paths.cache_dir_needs_staging()
+        work_dir = (
+            paths.staging_dir() / M5_CACHE_NAMESPACE / ckey
+            if staging
+            else cdir.path
         )
+
+        # --- cache hit (with lancedb self-healing) ---
+        if cdir.is_complete(REQUIRED_FILES):
+            if staging:
+                print(
+                    f"[{self.system_id}] cache hit: {cdir.path} "
+                    f"-> staging to {work_dir}"
+                )
+                _prepare_fresh(work_dir)
+                shutil.copytree(cdir.path, work_dir, dirs_exist_ok=True)
+            else:
+                print(f"[{self.system_id}] cache hit: {cdir.path}")
+
+            if _lancedb_valid(work_dir):
+                self._project_dir = work_dir
+                self._index_stats = self._collect_stats(work_dir)
+                self._indexed = True
+                return
+
+            print(
+                f"[{self.system_id}] cached lancedb invalid (empty "
+                f"_versions) — treating as cache miss, re-running GraphRAG "
+                f"indexing (gpt-4o-mini spend)"
+            )
+            # fall through to a full rebuild
+
+        # --- build: cache miss, or self-heal rebuild of a corrupt index ---
+        print(f"[{self.system_id}] building GraphRAG index at {work_dir}")
+        _prepare_fresh(work_dir)
         parsed = list(
             walk_corpus(corpus_path, min_chars=self.config.chunking.min_chars_per_doc)
         )
@@ -135,17 +197,25 @@ class GraphRAGSystem(BaseSystem):
             raise RuntimeError(f"No parseable documents in {corpus_path}")
         docs = {d.doc_id: d.text for d in parsed}
 
-        project_dir.mkdir(parents=True, exist_ok=True)
-        write_settings(m5, project_dir)
-        write_input_documents(docs, project_dir)
-        results = build_index(m5, project_dir)
+        write_settings(m5, work_dir)
+        write_input_documents(docs, work_dir)
+        results = build_index(m5, work_dir)
         print(
             f"[{self.system_id}] GraphRAG indexing finished: "
             f"{len(results)} workflows"
         )
 
-        self._project_dir = project_dir
-        self._index_stats = self._collect_stats(project_dir)
+        self._project_dir = work_dir
+        self._index_stats = self._collect_stats(work_dir)
+
+        # Persist the finished project to the (Drive) cache. copytree is a
+        # plain file copy — no rename — so Drive accepts it and the
+        # lancedb tables arrive with their _versions/ intact.
+        if staging:
+            print(f"[{self.system_id}] persisting index -> {cdir.path}")
+            _prepare_fresh(cdir.path)
+            shutil.copytree(work_dir, cdir.path, dirs_exist_ok=True)
+
         Manifest(
             system_id=M5_CACHE_NAMESPACE,
             cache_key=ckey,

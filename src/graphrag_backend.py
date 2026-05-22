@@ -563,29 +563,14 @@ def local_search_context(
     # opening the table — no error, but retrieval returns nothing.
     # vector_size must be bge-m3's 1024; the base default is 3072 (the
     # OpenAI dimension) and would mismatch the 1024-dim table. db_uri is
-    # a constructor argument; connect() takes none.
-    lancedb_uri = str(Path(project_dir) / GRAPHRAG_LANCEDB_SUBDIR)
-    # TEMPORARY DIAGNOSTICS — trace the LanceDB connect path. Remove once
-    # the empty-bare-lancedb-dir bug is diagnosed.
-    print(f"[M5 debug] lancedb db_uri to construct: {lancedb_uri!r}")
+    # a constructor argument; connect() takes none. project_dir is the
+    # local staging copy — lancedb cannot be read off a Drive mount.
     store = LanceDBVectorStore(
-        db_uri=lancedb_uri,
+        db_uri=str(Path(project_dir) / GRAPHRAG_LANCEDB_SUBDIR),
         index_name="entity_description",
         vector_size=EMBEDDING_DIM,
     )
-    print(
-        f"[M5 debug] store.db_uri before connect: "
-        f"{getattr(store, 'db_uri', '<absent>')!r}"
-    )
     store.connect()
-    _conn = getattr(store, "db_connection", None)
-    _tables = list(_conn.table_names()) if _conn is not None else "<no db_connection>"
-    print(
-        f"[M5 debug] after connect: table_names={_tables} "
-        f"index_name={getattr(store, 'index_name', '<absent>')!r} "
-        f"document_collection_set="
-        f"{getattr(store, 'document_collection', None) is not None}"
-    )
 
     context_builder = LocalSearchMixedContext(
         community_reports=reports,
