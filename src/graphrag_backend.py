@@ -224,17 +224,37 @@ def write_input_documents(docs: dict[str, str], project_dir: Path) -> Path:
 # ==========================================================================
 
 
-def _approx_tokenizer() -> Any:
-    """Approximate tokenizer for GraphRAG's embed-input token accounting.
+def _make_tokenizer() -> Any:
+    """Build a graphrag_llm Tokenizer for embed-input batch sizing.
 
-    bge-m3's true tokenizer is XLM-RoBERTa; GraphRAG uses the embedder
-    tokenizer only to size embed batches, not for retrieval correctness,
-    so a tiktoken cl100k_base encoding is an acceptable approximation.
-    C4 fix point if GraphRAG expects a stricter tokenizer interface.
+    GraphRAG's _create_text_batches sizes embed batches with
+    tokenizer.num_tokens(...) — a concrete method on the
+    graphrag_llm.tokenizer.tokenizer.Tokenizer ABC, derived from the
+    abstract encode/decode. A bare tiktoken Encoding has encode/decode
+    but is not a Tokenizer subclass, so it lacks num_tokens. This wraps a
+    tiktoken cl100k_base encoding in a real Tokenizer subclass, which
+    inherits num_tokens / num_prompt_tokens.
+
+    Token counts here affect only batch boundaries, never the embeddings
+    themselves — bge-m3's embedding() produces every vector — so this
+    approximation does not touch embedder parity. COLAB-VERIFIED-ONLY.
     """
     import tiktoken
+    from graphrag_llm.tokenizer.tokenizer import Tokenizer
 
-    return tiktoken.get_encoding("cl100k_base")
+    class _TiktokenTokenizer(Tokenizer):
+        """tiktoken-backed Tokenizer; inherits num_tokens / num_prompt_tokens."""
+
+        def __init__(self) -> None:
+            self._enc = tiktoken.get_encoding("cl100k_base")
+
+        def encode(self, text: str) -> list[int]:
+            return self._enc.encode(text)
+
+        def decode(self, tokens: Any) -> str:
+            return self._enc.decode(list(tokens))
+
+    return _TiktokenTokenizer()
 
 
 def _build_embedding_response(vectors: list[list[float]]) -> Any:
@@ -290,7 +310,8 @@ def _make_bge_m3_embedding_class(cfg: M5Config) -> Any:
     metrics_store, tokenizer. embedding / embedding_async are implemented
     against the introspected signature (self, /, **kwargs: Unpack[
     LLMEmbeddingArgs]) — the input texts arrive under the 'input' key.
-    metrics_store and tokenizer remain defensively stubbed (C4 fix points).
+    metrics_store is a minimal duck-typed stub; tokenizer is a real
+    graphrag_llm Tokenizer subclass (see _make_tokenizer).
     """
     from graphrag_llm.embedding import LLMEmbedding
 
@@ -302,7 +323,7 @@ def _make_bge_m3_embedding_class(cfg: M5Config) -> Any:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             self._model_name = cfg.embedder_model
             self._metrics = _MinimalMetricsStore()
-            self._tokenizer = _approx_tokenizer()
+            self._tokenizer = _make_tokenizer()
 
         def _encode(self, model_input: Any) -> list[list[float]]:
             texts = [model_input] if isinstance(model_input, str) else list(model_input)
@@ -581,7 +602,7 @@ def local_search_context(
         entity_text_embeddings=store,
         embedding_vectorstore_key=EntityVectorStoreKey.ID,
         text_embedder=make_bge_m3_embedder(cfg),
-        tokenizer=_approx_tokenizer(),
+        tokenizer=_make_tokenizer(),
     )
 
     result = context_builder.build_context(query=query, **_LOCAL_CONTEXT_PARAMS)

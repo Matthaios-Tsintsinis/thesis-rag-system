@@ -200,6 +200,19 @@ class GraphRAGSystem(BaseSystem):
         write_settings(m5, work_dir)
         write_input_documents(docs, work_dir)
         results = build_index(m5, work_dir)
+        # build_index already raises on any PipelineRunResult.errors, but
+        # a workflow can fail without populating that field — the silent
+        # generate_text_embeddings failure that produced an empty vector
+        # store and surfaced only at query time. Assert the critical
+        # post-condition explicitly: a usable lancedb must exist, or the
+        # build is a failure regardless of the reported workflow count.
+        if not _lancedb_valid(work_dir):
+            raise RuntimeError(
+                f"[{self.system_id}] GraphRAG indexing finished "
+                f"({len(results)} workflows) but produced no valid lancedb "
+                f"vector store — a workflow (likely generate_text_embeddings) "
+                f"errored silently. See the GraphRAG logs above."
+            )
         print(
             f"[{self.system_id}] GraphRAG indexing finished: "
             f"{len(results)} workflows"
