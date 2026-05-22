@@ -548,9 +548,8 @@ def local_search_context(
     from graphrag.query.structured_search.local_search.mixed_context import (
         LocalSearchMixedContext,
     )
-    # IndexSchema is a top-level export; LanceDBVectorStore is not — it
+    # LanceDBVectorStore is not a top-level graphrag_vectors export — it
     # lives in the graphrag_vectors.lancedb submodule.
-    from graphrag_vectors import IndexSchema
     from graphrag_vectors.lancedb import LanceDBVectorStore
 
     level = cfg.community_level
@@ -559,10 +558,18 @@ def local_search_context(
     reports = read_indexer_reports(artifacts.community_reports, artifacts.communities, level)
     text_units = read_indexer_text_units(artifacts.text_units)
 
+    # index_name must equal the entity-embedding table GraphRAG wrote
+    # ("entity_description"). A wrong name makes connect() silently skip
+    # opening the table — no error, but retrieval returns nothing.
+    # vector_size must be bge-m3's 1024; the base default is 3072 (the
+    # OpenAI dimension) and would mismatch the 1024-dim table. db_uri is
+    # a constructor argument; connect() takes none.
     store = LanceDBVectorStore(
-        index_schema=IndexSchema(index_name="default-entity-description")
+        db_uri=str(Path(project_dir) / GRAPHRAG_LANCEDB_SUBDIR),
+        index_name="entity_description",
+        vector_size=EMBEDDING_DIM,
     )
-    store.connect(db_uri=str(Path(project_dir) / GRAPHRAG_LANCEDB_SUBDIR))
+    store.connect()
 
     context_builder = LocalSearchMixedContext(
         community_reports=reports,
