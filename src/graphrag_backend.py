@@ -116,17 +116,26 @@ def build_settings(cfg: M5Config) -> dict[str, Any]:
     return {
         "completion_models": {
             COMPLETION_MODEL_ID: {
+                # `type` selects the resolution strategy; "litellm" is the
+                # ModelConfig schema default and routes OpenAI calls.
+                "type": "litellm",
+                # model_provider is a required ModelConfig field but is
+                # label-only — it forms the model_id label
+                # f"{model_provider}/{model}", it does not drive resolution.
                 "model_provider": "openai",
                 "model": cfg.index_llm_model,
-                "auth_method": "api_key",
                 "api_key": "${OPENAI_API_KEY}",
             },
         },
         "embedding_models": {
-            # `type` carries the register_embedding() key — GraphRAG
-            # resolves it to the in-process bge-m3 model.
             EMBEDDING_MODEL_ID: {
+                # `type` is the register_embedding() strategy key — the
+                # embedding factory resolves the in-process bge-m3 model on
+                # this exact string. It must equal BGE_M3_EMBEDDING_TYPE,
+                # the value passed to register_embedding().
                 "type": BGE_M3_EMBEDDING_TYPE,
+                # Required by ModelConfig; label-only for a custom type.
+                "model_provider": "harness",
                 "model": cfg.embedder_model,
             },
         },
