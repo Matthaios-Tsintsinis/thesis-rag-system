@@ -66,6 +66,16 @@ COMPLETION_MODEL_ID = "default_completion_model"
 # ModelConfig's `type` field so GraphRAG resolves it to our model.
 BGE_M3_EMBEDDING_TYPE = "harness_bge_m3"
 
+# Fields embedded by GraphRAG's embed_text workflow — each gets its own
+# lancedb table and requires an index_schema entry sized to bge-m3's
+# 1024-dim vectors (else the table defaults to OpenAI's 3072 dim and the
+# bge-m3 writes are rejected).
+EMBED_TEXT_FIELDS = (
+    "entity_description",
+    "community_full_content",
+    "text_unit_text",
+)
+
 
 # --- Paradigm-neutral retrieval unit --------------------------------------
 
@@ -151,7 +161,24 @@ def build_settings(cfg: M5Config) -> dict[str, Any]:
             "default_vector_store": {
                 "type": "lancedb",
                 "db_uri": GRAPHRAG_LANCEDB_SUBDIR,
+                # Store-level default — harmless; the indexer reads the
+                # per-field index_schema entries, but a reader that
+                # consults the store-level value also lands on 1024.
                 "vector_size": EMBEDDING_DIM,
+                # IndexSchema.vector_size defaults to 3072 (OpenAI 3-large)
+                # PER ENTRY, so every embed_text field needs an explicit
+                # 1024-dim entry — otherwise the write store is built at
+                # 3072 and bge-m3's 1024 vectors are rejected. `fields` is
+                # required by the schema (no default) but is not consulted
+                # for the dimension; an empty dict validates.
+                "index_schema": {
+                    name: {
+                        "index_name": name,
+                        "vector_size": EMBEDDING_DIM,
+                        "fields": {},
+                    }
+                    for name in EMBED_TEXT_FIELDS
+                },
             },
         },
         "chunks": {"size": cfg.chunk_size, "overlap": cfg.chunk_overlap},
@@ -390,6 +417,49 @@ def make_bge_m3_embedder(cfg: M5Config) -> Any:
     return _make_bge_m3_embedding_class(cfg)()
 
 
+def _assert_vector_dim_matches(config: Any, expected: int) -> None:
+    """Pre-flight check on the parsed vector_store index schema.
+
+    Without this, a settings/schema mismatch (e.g. a missing index_schema
+    entry, leaving the per-entry default at 3072) is discovered only
+    after a full GraphRAG rebuild errors or persists an empty table —
+    the prior failure mode. The check walks plausible parsed shapes for
+    `vector_store` (a dict-of-stores or a single resolved object) and
+    `index_schema` (dict-of-entries or a values()-bearing object), and
+    raises on any entry whose vector_size differs from `expected`. When
+    the schema cannot be introspected at all it stays silent — the
+    post-build row-count check is the backstop.
+    """
+    vs = getattr(config, "vector_store", None)
+    if vs is None:
+        return
+    stores = vs.values() if isinstance(vs, dict) else [vs]
+    bad: list[str] = []
+    for store in stores:
+        schema = getattr(store, "index_schema", None)
+        if schema is None:
+            continue
+        if isinstance(schema, dict):
+            entries = list(schema.values())
+        elif hasattr(schema, "values") and callable(getattr(schema, "values", None)):
+            try:
+                entries = list(schema.values())
+            except Exception:
+                continue
+        else:
+            continue
+        for entry in entries:
+            dim = getattr(entry, "vector_size", None)
+            if dim is not None and dim != expected:
+                bad.append(f"{getattr(entry, 'index_name', '<?>')}={dim}")
+    if bad:
+        raise RuntimeError(
+            f"GraphRAG vector_store index_schema dimensions wrong "
+            f"(expected {expected}, bge-m3): {bad}. Fix build_settings "
+            f"before re-running indexing."
+        )
+
+
 def build_index(cfg: M5Config, project_dir: Path) -> list:
     """Run the GraphRAG indexing pipeline in-process.
 
@@ -421,6 +491,7 @@ def build_index(cfg: M5Config, project_dir: Path) -> list:
     from graphrag.config.load_config import load_config
 
     config = load_config(Path(project_dir))
+    _assert_vector_dim_matches(config, EMBEDDING_DIM)
     results = asyncio.run(
         api.build_index(config=config, method=IndexingMethod.Standard)
     )
