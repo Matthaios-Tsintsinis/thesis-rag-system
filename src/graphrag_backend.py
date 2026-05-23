@@ -289,26 +289,36 @@ def _make_tokenizer() -> Any:
 
 
 def _build_embedding_response(vectors: list[list[float]]) -> Any:
-    """Build an LLMEmbeddingResponse via the graphrag_llm factory.
+    """Construct an LLMEmbeddingResponse with one entry per input vector.
 
-    graphrag_llm.utils.create_embedding_response.create_embedding_response
-    is the intended construction path (verified by introspection):
-    create_embedding_response(embeddings: list[float], batch_size: int = 1).
-    `embeddings` is the flattened float stream and `batch_size` the number
-    of inputs, so the factory reshapes it into per-input vectors. The
-    flat-vs-nested form is the one remaining C4-checkable detail — a
-    nested fallback covers the loose-annotation case.
+    graphrag_llm.utils.create_embedding_response is for SINGLE-vector
+    responses — it takes one vector and replicates it `batch_size` times,
+    which produced the silent shape bug that made the entity_description
+    table reject bge-m3 writes (one batch-flat list per input rather than
+    one 1024-dim vector per input).
+
+    For our bge-m3 batch — one vector per input — we build the response
+    directly against the verified pydantic schema: data is a list of
+    LLMEmbedding objects, one per input. LLMEmbeddingResponse.embeddings
+    is a derived property over data, so downstream code that does
+    zip(ids, response.embeddings, strict=True) gets one vector per id.
     """
-    from graphrag_llm.utils.create_embedding_response import (
-        create_embedding_response,
+    from graphrag_llm.types import (
+        LLMEmbedding,
+        LLMEmbeddingResponse,
+        LLMEmbeddingUsage,
     )
 
-    n = len(vectors)
-    flat = [x for vec in vectors for x in vec]
-    try:
-        return create_embedding_response(embeddings=flat, batch_size=n)
-    except Exception:
-        return create_embedding_response(embeddings=vectors, batch_size=n)
+    data = [
+        LLMEmbedding(object="embedding", embedding=vec, index=i)
+        for i, vec in enumerate(vectors)
+    ]
+    return LLMEmbeddingResponse(
+        object="list",
+        data=data,
+        model="harness/BAAI/bge-m3",
+        usage=LLMEmbeddingUsage(prompt_tokens=0, total_tokens=0),
+    )
 
 
 class _MinimalMetricsStore:
