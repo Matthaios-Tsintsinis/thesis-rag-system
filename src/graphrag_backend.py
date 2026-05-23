@@ -157,28 +157,32 @@ def build_settings(cfg: M5Config) -> dict[str, Any]:
         # CacheType has no "file" — valid values are json / memory / none.
         # "json" is the file-backed JSON cache (the GraphRagConfig default).
         "cache": {"type": "json", "base_dir": GRAPHRAG_CACHE_SUBDIR},
+        # `vector_store` IS a VectorStoreConfig in GraphRAG 3.0.9 — NOT
+        # a dict-of-stores keyed by name. type / db_uri / vector_size /
+        # index_schema sit directly under this key. An extra wrapper
+        # (vector_store.default_vector_store: {...}) parses as an
+        # ignored extraneous attribute and the loader silently uses
+        # every VectorStoreConfig default, notably vector_size=3072.
         "vector_store": {
-            "default_vector_store": {
-                "type": "lancedb",
-                "db_uri": GRAPHRAG_LANCEDB_SUBDIR,
-                # Store-level default — harmless; the indexer reads the
-                # per-field index_schema entries, but a reader that
-                # consults the store-level value also lands on 1024.
-                "vector_size": EMBEDDING_DIM,
-                # IndexSchema.vector_size defaults to 3072 (OpenAI 3-large)
-                # PER ENTRY, so every embed_text field needs an explicit
-                # 1024-dim entry — otherwise the write store is built at
-                # 3072 and bge-m3's 1024 vectors are rejected. `fields` is
-                # required by the schema (no default) but is not consulted
-                # for the dimension; an empty dict validates.
-                "index_schema": {
-                    name: {
-                        "index_name": name,
-                        "vector_size": EMBEDDING_DIM,
-                        "fields": {},
-                    }
-                    for name in EMBED_TEXT_FIELDS
-                },
+            "type": "lancedb",
+            "db_uri": GRAPHRAG_LANCEDB_SUBDIR,
+            # Store-level default — harmless; the indexer reads the
+            # per-field index_schema entries, but a reader consulting
+            # the store-level value also lands on 1024.
+            "vector_size": EMBEDDING_DIM,
+            # IndexSchema.vector_size defaults to 3072 (OpenAI 3-large)
+            # PER ENTRY, so every embed_text field needs an explicit
+            # 1024-dim entry — otherwise the write store is built at
+            # 3072 and bge-m3's 1024 vectors are rejected. `fields` is
+            # required by the schema (no default) but is not consulted
+            # for the dimension; an empty dict validates.
+            "index_schema": {
+                name: {
+                    "index_name": name,
+                    "vector_size": EMBEDDING_DIM,
+                    "fields": {},
+                }
+                for name in EMBED_TEXT_FIELDS
             },
         },
         "chunks": {"size": cfg.chunk_size, "overlap": cfg.chunk_overlap},
