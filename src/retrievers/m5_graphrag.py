@@ -91,14 +91,39 @@ REQUIRED_FILES = (
 )
 
 
-def _prepare_fresh(directory: Path) -> None:
-    """Remove `directory` if it exists, then recreate it empty.
+def _prepare_fresh(directory: Path, keep: tuple[str, ...] = ()) -> None:
+    """Wipe `directory` and recreate it empty, optionally preserving
+    named top-level subpaths.
 
     Guarantees the directory holds exactly one index — no stale files
     from a prior build merged with freshly built or copied-in ones.
+
+    `keep` is a tuple of top-level entry names to preserve across the
+    wipe. Used by the build path to keep GraphRAG's internal LLM-call
+    cache (`<work>/cache/`) across rebuilds so a late-workflow failure
+    does not re-spend the earlier workflows' gpt-4o-mini cost on the
+    next attempt. The cache-hit copy-in path and the persist path use
+    keep=() — both want a strictly clean target before the copytree.
     """
-    shutil.rmtree(directory, ignore_errors=True)
-    directory.mkdir(parents=True, exist_ok=True)
+    directory = Path(directory)
+    if not directory.exists():
+        directory.mkdir(parents=True, exist_ok=True)
+        return
+    if not keep:
+        shutil.rmtree(directory, ignore_errors=True)
+        directory.mkdir(parents=True, exist_ok=True)
+        return
+    keep_set = set(keep)
+    for entry in directory.iterdir():
+        if entry.name in keep_set:
+            continue
+        if entry.is_dir():
+            shutil.rmtree(entry, ignore_errors=True)
+        else:
+            try:
+                entry.unlink()
+            except OSError:
+                pass
 
 
 def _lancedb_valid(project_dir: Path) -> bool:
@@ -211,7 +236,11 @@ class GraphRAGSystem(BaseSystem):
 
         # --- build: cache miss, or self-heal rebuild of a corrupt index ---
         print(f"[{self.system_id}] building GraphRAG index at {work_dir}")
-        _prepare_fresh(work_dir)
+        # Preserve GraphRAG's internal LLM-call cache across rebuilds —
+        # a late-workflow failure (e.g. generate_text_embeddings) would
+        # otherwise re-pay extract_graph + summarize_descriptions +
+        # community_reports gpt-4o-mini cost on the next attempt.
+        _prepare_fresh(work_dir, keep=("cache",))
         parsed = list(
             walk_corpus(corpus_path, min_chars=self.config.chunking.min_chars_per_doc)
         )
