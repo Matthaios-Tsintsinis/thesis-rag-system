@@ -510,7 +510,15 @@ def _preflight_check_settings(config: Any, m5: M5Config) -> None:
                     f"vector_size={dim} (expected {EMBEDDING_DIM})"
                 )
 
-    # input_storage / output_storage base_dirs reach the parsed config
+    # input_storage / output_storage base_dirs reach the parsed config.
+    # GraphRAG resolves base_dir to an absolute path relative to the
+    # project dir at load time, so compare on basename rather than the
+    # literal string we wrote.
+    def _basename_matches(actual: Any, expected: str) -> bool:
+        if actual is None:
+            return False
+        return Path(str(actual)).name == Path(expected).name
+
     for field, expected in (
         ("input_storage", GRAPHRAG_INPUT_SUBDIR),
         ("output_storage", GRAPHRAG_OUTPUT_SUBDIR),
@@ -520,9 +528,10 @@ def _preflight_check_settings(config: Any, m5: M5Config) -> None:
             errors.append(f"config.{field} missing")
             continue
         actual = getattr(sect, "base_dir", None)
-        if actual != expected:
+        if not _basename_matches(actual, expected):
             errors.append(
-                f"{field}.base_dir={actual!r} (expected {expected!r})"
+                f"{field}.base_dir={actual!r} "
+                f"(expected basename {expected!r})"
             )
 
     # cache.storage.base_dir — nested, not at the cache top level
@@ -535,10 +544,10 @@ def _preflight_check_settings(config: Any, m5: M5Config) -> None:
             errors.append("cache.storage missing")
         else:
             actual = getattr(cstorage, "base_dir", None)
-            if actual != GRAPHRAG_CACHE_SUBDIR:
+            if not _basename_matches(actual, GRAPHRAG_CACHE_SUBDIR):
                 errors.append(
                     f"cache.storage.base_dir={actual!r} "
-                    f"(expected {GRAPHRAG_CACHE_SUBDIR!r})"
+                    f"(expected basename {GRAPHRAG_CACHE_SUBDIR!r})"
                 )
 
     # chunking — verifies our chunk_size/overlap reach the parsed config
