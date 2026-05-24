@@ -149,14 +149,36 @@ def build_settings(cfg: M5Config) -> dict[str, Any]:
                 "model": cfg.embedder_model,
             },
         },
-        "input": {
-            "storage": {"type": "file", "base_dir": GRAPHRAG_INPUT_SUBDIR},
-            "file_type": "text",
+        # `input` and `input_storage` are SEPARATE top-level keys per the
+        # canonical INIT_YAML template. The earlier "input.storage"
+        # nesting parsed into an ignored extra; the loader silently used
+        # defaults.
+        "input": {"type": "text"},
+        "input_storage": {
+            "type": "file",
+            "base_dir": GRAPHRAG_INPUT_SUBDIR,
         },
-        "output": {"type": "file", "base_dir": GRAPHRAG_OUTPUT_SUBDIR},
-        # CacheType has no "file" — valid values are json / memory / none.
-        # "json" is the file-backed JSON cache (the GraphRagConfig default).
-        "cache": {"type": "json", "base_dir": GRAPHRAG_CACHE_SUBDIR},
+        # Outputs live under top-level `output_storage` — GraphRagConfig
+        # has no `output` field. The earlier `output:` key was an ignored
+        # extra falling back to a default that happened to match.
+        "output_storage": {
+            "type": "file",
+            "base_dir": GRAPHRAG_OUTPUT_SUBDIR,
+        },
+        # `reporting` is a separate top-level section; defaults work but
+        # set it explicitly to match the canonical template.
+        "reporting": {"type": "file", "base_dir": "logs"},
+        # `cache.storage` is nested under cache (CacheType declares only
+        # json / memory / none — no "file"). The earlier `cache.base_dir`
+        # at the top was an ignored extra; the on-disk cache path was
+        # the default, not our value.
+        "cache": {
+            "type": "json",
+            "storage": {
+                "type": "file",
+                "base_dir": GRAPHRAG_CACHE_SUBDIR,
+            },
+        },
         # `vector_store` IS a VectorStoreConfig in GraphRAG 3.0.9 — NOT
         # a dict-of-stores keyed by name. type / db_uri / vector_size /
         # index_schema sit directly under this key. An extra wrapper
@@ -185,7 +207,14 @@ def build_settings(cfg: M5Config) -> dict[str, Any]:
                 for name in EMBED_TEXT_FIELDS
             },
         },
-        "chunks": {"size": cfg.chunk_size, "overlap": cfg.chunk_overlap},
+        # `chunking` (not `chunks`). The earlier `chunks` key was an
+        # ignored extra — every prior run used the GraphRAG default
+        # chunk size (1200 tokens), NOT our configured cfg.chunk_size.
+        "chunking": {
+            "type": "tokens",
+            "size": cfg.chunk_size,
+            "overlap": cfg.chunk_overlap,
+        },
         "embed_text": {"embedding_model_id": EMBEDDING_MODEL_ID},
     }
 
@@ -431,46 +460,108 @@ def make_bge_m3_embedder(cfg: M5Config) -> Any:
     return _make_bge_m3_embedding_class(cfg)()
 
 
-def _assert_vector_dim_matches(config: Any, expected: int) -> None:
-    """Pre-flight check on the parsed vector_store index schema.
+def _preflight_check_settings(config: Any, m5: M5Config) -> None:
+    """Pre-flight: confirm critical settings actually parsed where we
+    expect, not into ignored extras.
 
-    Without this, a settings/schema mismatch (e.g. a missing index_schema
-    entry, leaving the per-entry default at 3072) is discovered only
-    after a full GraphRAG rebuild errors or persists an empty table —
-    the prior failure mode. The check walks plausible parsed shapes for
-    `vector_store` (a dict-of-stores or a single resolved object) and
-    `index_schema` (dict-of-entries or a values()-bearing object), and
-    raises on any entry whose vector_size differs from `expected`. When
-    the schema cannot be introspected at all it stays silent — the
-    post-build row-count check is the backstop.
+    Catches the default_vector_store / input.storage / output /
+    cache.base_dir / chunks-vs-chunking class of structure-mismatch
+    bug — fields that look right in YAML but parse into ignored extras,
+    leaving GraphRAG to silently use its defaults. Bugs of this shape
+    passed several full rebuilds before surfacing via dimension mismatch
+    or empty tables; this raises before any work is done.
+
+    Checks:
+      - vector_store.vector_size and every index_schema entry's
+        vector_size equal EMBEDDING_DIM (the original pre-flight).
+      - input_storage.base_dir and output_storage.base_dir match the
+        configured subdirs.
+      - cache.storage.base_dir matches.
+      - chunking.size / chunking.overlap match the M5Config values
+        (catches the silent fallback to GraphRAG's 1200/100 default).
     """
+    errors: list[str] = []
+
+    # vector_store + index_schema dimensions
     vs = getattr(config, "vector_store", None)
     if vs is None:
-        return
-    stores = vs.values() if isinstance(vs, dict) else [vs]
-    bad: list[str] = []
-    for store in stores:
-        schema = getattr(store, "index_schema", None)
-        if schema is None:
-            continue
+        errors.append("config.vector_store missing")
+    else:
+        if getattr(vs, "vector_size", None) != EMBEDDING_DIM:
+            errors.append(
+                f"vector_store.vector_size="
+                f"{getattr(vs, 'vector_size', '?')} (expected {EMBEDDING_DIM})"
+            )
+        schema = getattr(vs, "index_schema", None) or {}
         if isinstance(schema, dict):
             entries = list(schema.values())
         elif hasattr(schema, "values") and callable(getattr(schema, "values", None)):
             try:
                 entries = list(schema.values())
             except Exception:
-                continue
+                entries = []
         else:
-            continue
+            entries = []
         for entry in entries:
             dim = getattr(entry, "vector_size", None)
-            if dim is not None and dim != expected:
-                bad.append(f"{getattr(entry, 'index_name', '<?>')}={dim}")
-    if bad:
+            if dim is not None and dim != EMBEDDING_DIM:
+                errors.append(
+                    f"index_schema[{getattr(entry, 'index_name', '?')}]."
+                    f"vector_size={dim} (expected {EMBEDDING_DIM})"
+                )
+
+    # input_storage / output_storage base_dirs reach the parsed config
+    for field, expected in (
+        ("input_storage", GRAPHRAG_INPUT_SUBDIR),
+        ("output_storage", GRAPHRAG_OUTPUT_SUBDIR),
+    ):
+        sect = getattr(config, field, None)
+        if sect is None:
+            errors.append(f"config.{field} missing")
+            continue
+        actual = getattr(sect, "base_dir", None)
+        if actual != expected:
+            errors.append(
+                f"{field}.base_dir={actual!r} (expected {expected!r})"
+            )
+
+    # cache.storage.base_dir — nested, not at the cache top level
+    cache = getattr(config, "cache", None)
+    if cache is None:
+        errors.append("config.cache missing")
+    else:
+        cstorage = getattr(cache, "storage", None)
+        if cstorage is None:
+            errors.append("cache.storage missing")
+        else:
+            actual = getattr(cstorage, "base_dir", None)
+            if actual != GRAPHRAG_CACHE_SUBDIR:
+                errors.append(
+                    f"cache.storage.base_dir={actual!r} "
+                    f"(expected {GRAPHRAG_CACHE_SUBDIR!r})"
+                )
+
+    # chunking — verifies our chunk_size/overlap reach the parsed config
+    chunking = getattr(config, "chunking", None)
+    if chunking is None:
+        errors.append("config.chunking missing")
+    else:
+        actual_size = getattr(chunking, "size", None)
+        if actual_size != m5.chunk_size:
+            errors.append(
+                f"chunking.size={actual_size} (expected {m5.chunk_size})"
+            )
+        actual_overlap = getattr(chunking, "overlap", None)
+        if actual_overlap != m5.chunk_overlap:
+            errors.append(
+                f"chunking.overlap={actual_overlap} (expected {m5.chunk_overlap})"
+            )
+
+    if errors:
         raise RuntimeError(
-            f"GraphRAG vector_store index_schema dimensions wrong "
-            f"(expected {expected}, bge-m3): {bad}. Fix build_settings "
-            f"before re-running indexing."
+            "GraphRAG settings did not parse as expected — fields landed "
+            "in ignored extras or fell back to defaults. Errors:\n  - "
+            + "\n  - ".join(errors)
         )
 
 
@@ -505,7 +596,7 @@ def build_index(cfg: M5Config, project_dir: Path) -> list:
     from graphrag.config.load_config import load_config
 
     config = load_config(Path(project_dir))
-    _assert_vector_dim_matches(config, EMBEDDING_DIM)
+    _preflight_check_settings(config, cfg)
     results = asyncio.run(
         api.build_index(config=config, method=IndexingMethod.Standard)
     )
