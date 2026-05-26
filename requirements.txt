@@ -29,6 +29,14 @@ torch>=2.2
 accelerate>=0.33
 bitsandbytes>=0.43 ; platform_system == "Linux"   # 4-bit quant; Linux/CUDA only
 
+# --- M6 (HippoRAG 1, NeurIPS'24 — port, not wrap) ---
+python-igraph>=0.11             # Personalized PageRank via prpack on the phrase
+                                # graph. The legacy HippoRAG repo pins numpy 1.x
+                                # and torch 1.13, so we cannot install its env;
+                                # the algorithm is ported using our modern stack
+                                # plus this single new dep. Wheels exist for
+                                # numpy 2.x on Linux + Windows.
+
 # --- DEPRECATED: M5 (GraphRAG) is archived under
 #     src/retrievers/deprecated/. The dependency below is no longer
 #     pulled by a normal install; uncomment only to resurrect M5.

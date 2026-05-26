@@ -192,6 +192,64 @@ class M4Config:
 # `src/retrievers/deprecated/_archived_config.py` for resurrection.
 
 
+@dataclass(frozen=True)
+class M6Config:
+    """M6 — HippoRAG 1 (legacy, NeurIPS'24), single-step retrieval.
+
+    Faithful port of the OSU-NLP-Group/HippoRAG legacy branch. Components
+    per the paper's main-experiment shell scripts (not the constructor
+    defaults, which are stubs — see notes below).
+
+    Damping convention: igraph's `personalized_pagerank(damping=...)` is
+    the continue-walk probability (1 - restart probability). The legacy
+    main_exps + ablations + case_study + ircot_main_exps shell scripts
+    all use `--damping 0.5`, overriding the constructor default of 0.1.
+    M6Config.damping = 0.5 is byte-for-byte faithful at the call site.
+
+    Empty-NER policy: when query NER returns zero entities, the legacy
+    code falls back to uniform doc_prob (random top-k). M6 preserves
+    that fallback for paper faithfulness and logs every empty-NER event
+    so the impact can be quantified in analysis (do NOT silently fix).
+
+    Multilingual: Contriever is English-centric; processing_phrases
+    drops non-ASCII characters. Greek queries degrade — documented as a
+    paper-faithfulness limitation alongside M4's mpnet.
+    """
+
+    # --- index-time LLM (paper used gpt-3.5-turbo-1106; modernised) ---
+    openie_llm: str = JUDGE_MODEL  # gpt-4o-mini
+    openie_prompt_version: str = "v1"  # bumped when any prompt string changes
+
+    # --- graph build (paper defaults) ---
+    sim_threshold: float = 0.8       # synonymy edge cutoff
+    synonym_top_k_cap: int = 100     # per-source-phrase neighbour cap (legacy line 280)
+    node_specificity: bool = True
+
+    # --- PPR (paper main-experiment values, NOT constructor defaults) ---
+    damping: float = 0.5             # continue-walk probability; see class docstring
+    doc_ensemble: bool = False       # paper headline = single-step + no DPR ensemble
+    dpr_only: bool = False
+
+    # --- query ---
+    max_query_ner: int = 8           # bound personalisation-vector size (soft cap, not in paper)
+    top_k_final: int = FINAL_CONTEXT_CHUNKS
+
+    # --- component overrides (per-paper assignment) ---
+    # Contriever (768-dim) per the HippoRAG paper / legacy
+    # main_exps.sh:5. Same dim as M4's mpnet but different model;
+    # M4 and M6 cache namespaces are entirely separate (no shared
+    # substrate — M6 has its own graph-based artifacts in cache/M6/).
+    # Chunker falls through to the harness default (paper takes
+    # pre-chunked passages; chunking is OUR choice, faithful to no
+    # specific paper choice). Reranker stays None (HippoRAG has no
+    # cross-encoder rerank).
+    embedder: str | None = "facebook/contriever"
+    chunker: ChunkingConfig | None = None
+    reranker: str | None = None
+
+    trace: bool = False
+
+
 # --- M7 sub-configs (PIPELINE_DESIGN.md §5 CONFIG, verbatim) --------------
 
 
@@ -332,6 +390,7 @@ class HarnessConfig:
     chunking: ChunkingConfig = field(default_factory=ChunkingConfig)
     generation: GenerationConfig = field(default_factory=GenerationConfig)
     m4: M4Config = field(default_factory=M4Config)
+    m6: M6Config = field(default_factory=M6Config)
     m7: M7Config = field(default_factory=M7Config)
 
 
