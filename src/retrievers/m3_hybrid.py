@@ -37,7 +37,6 @@ from ..components import (
 from ..config import (
     DEFAULT_CONFIG,
     HarnessConfig,
-    RETRIEVAL_RANKING_DEPTH,
 )
 from ..models import embed_texts, load_embedder
 from ..parsing import walk_corpus
@@ -145,11 +144,11 @@ class HybridRRFSystem(BaseSystem):
         self._require_indexed()
         assert self._resolved is not None
         cfg = self.config.retrieval
-        # CK-4: default to RETRIEVAL_RANKING_DEPTH (=50). RRF over the
-        # first_stage_top_k dense + sparse rankings is unaffected; the
-        # `[:k]` tail is what changes. Top-15 bit-identity gate
-        # applies — top of RRF-fused 50-deep == top of prior 15-deep.
-        k = k or RETRIEVAL_RANKING_DEPTH
+        # Natural top-K (FINAL_CONTEXT_CHUNKS=15 default). M3 baseline
+        # feeds the generator at its paper-validated context size. RRF
+        # over first_stage_top_k inputs is deterministic; the `[:k]`
+        # tail respects the natural baseline.
+        k = k or cfg.top_k
 
         q_vec = embed_texts([query], model_name=self._resolved.embedder_id)
         _, dense_idx = self._dense_index.search(q_vec, cfg.first_stage_top_k)

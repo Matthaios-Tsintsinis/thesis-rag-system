@@ -57,7 +57,6 @@ from ..components import (
 from ..config import (
     DEFAULT_CONFIG,
     HarnessConfig,
-    RETRIEVAL_RANKING_DEPTH,
 )
 from ..models import embed_texts, load_embedder
 from ..parsing import walk_corpus
@@ -301,10 +300,11 @@ class RaptorSystem(BaseSystem):
         self._require_indexed()
         assert self._resolved is not None
         m4 = self.config.m4
-        # CK-4: default deep ranking. Top-k bit-identity gate vs prior
-        # 15-deep ranking applies — RRF + expansion deterministic given
-        # the same first_stage_top_k.
-        k = k or RETRIEVAL_RANKING_DEPTH
+        # Natural top-K (m4.top_k_final=FINAL_CONTEXT_CHUNKS=15). M4
+        # baseline feeds the generator at its RAPTOR-paper-validated
+        # context size. The §4.4 expansion + RRF over first_stage_top_k
+        # are deterministic given the same first_stage inputs.
+        k = k or m4.top_k_final
         trace_on = m4.trace
 
         assert self._flat is not None and self._tree is not None

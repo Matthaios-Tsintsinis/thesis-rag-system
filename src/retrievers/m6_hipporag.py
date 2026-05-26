@@ -30,7 +30,7 @@ from .. import paths
 from ..cache import CacheDir, Manifest, compute_cache_key, corpus_content_hash, load_chunks, save_chunks
 from ..chunking import Chunk, chunk_corpus
 from ..components import ResolvedComponents, format_components_log, resolve_components
-from ..config import DEFAULT_CONFIG, HarnessConfig, RETRIEVAL_RANKING_DEPTH
+from ..config import DEFAULT_CONFIG, HarnessConfig
 from ..hipporag_graph import (
     HippoGraph,
     REQUIRED_FILES,
@@ -311,9 +311,11 @@ class HippoRAGSystem(BaseSystem):
         assert self._graph is not None
 
         m6 = self.config.m6
-        # CK-4: default to RETRIEVAL_RANKING_DEPTH (=50). Top-k from
-        # the PPR-ranked doc_prob; deeper ranking has identical head.
-        k = k or RETRIEVAL_RANKING_DEPTH
+        # Natural top-K (m6.top_k_final=FINAL_CONTEXT_CHUNKS=15). M6
+        # baseline feeds the generator at its HippoRAG-paper-validated
+        # context size. The PPR-ranked doc_prob is deterministic up to
+        # the empty-NER fallback already documented.
+        k = k or m6.top_k_final
         embedder_id = self._resolved.embedder_id
         openie_llm = self._resolved.index_llm_id
         assert openie_llm is not None

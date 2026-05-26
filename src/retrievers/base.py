@@ -38,7 +38,6 @@ from ..config import (
     DEFAULT_CONFIG,
     EVIDENCE_TOKEN_BUDGET_TOKENIZER,
     HarnessConfig,
-    RETRIEVAL_RANKING_DEPTH,
 )
 
 if TYPE_CHECKING:
@@ -127,25 +126,32 @@ class BaseSystem(ABC):
     def answer(self, query: str, k: int | None = None) -> AnswerResult:
         """Default retrieve -> pack -> generate -> AnswerResult.
 
-        CK-4 (shared context budget). Every system inherits this method
-        and goes through the uniform path UNLESS the system has a
-        materially different generation pipeline (M1 closed-book; M7
+        Each system inherits this default UNLESS its generation
+        pipeline is materially different (M1 closed-book; M7
         per-aspect structured prompt). Per-system overrides MUST also
         populate AnswerResult.packed and AnswerResult.n_input_tokens
-        so the analyser's --check-budget-equality assertion is
-        meaningful.
+        so the analyser's --check-budget-equality assertion (opt-in)
+        is meaningful.
 
         Flow:
-          1. retrieve(query, k=k or RETRIEVAL_RANKING_DEPTH) -> full
-             ranking (used by CK-2 scorer at the runner level).
-          2. pack_context(retrieved, token_budget=EVIDENCE_TOKEN_BUDGET)
-             -> packed subset that fits in budget when formatted as
-             `[N] {text}` separated by `\\n\\n`.
-          3. Assemble user prompt = `Evidence:\\n{evidence}\\n\\n
-             Question: {query}` and pass to generate() with the
-             shared BASE_ANSWER_SYSTEM_PROMPT.
+          1. retrieve(query, k=k) — passes through the caller's k if
+             given, OTHERWISE lets each system use its NATURAL top_k
+             default (M2/M3 self.config.retrieval.top_k, M4
+             m4.top_k_final, M6 m6.top_k_final — all
+             FINAL_CONTEXT_CHUNKS=15 by default; M7 retrieves up to
+             its un-capped quota ~50). This preserves baseline
+             natural strength under the no-budget default per
+             professor's directive — baselines feed exactly what
+             their papers fed.
+          2. pack_context(retrieved) — no enforcement when
+             src.config.EVIDENCE_TOKEN_BUDGET is None (the default);
+             with --evidence-budget opt-in it truncates by token
+             count. Either way returns (packed, evidence_tokens,
+             evidence_block).
+          3. Assemble `Evidence:\\n{evidence}\\n\\nQuestion: {query}`,
+             call generate() with BASE_ANSWER_SYSTEM_PROMPT.
           4. Return AnswerResult(retrieved=full, packed=packed,
-             n_input_tokens=tokens of full assembled prompt).
+             evidence_tokens, n_input_tokens=full assembled prompt).
         """
         # Late import to break the retrievers/base <-> prompt_packing
         # circular (prompt_packing's tiktoken init touches no retriever
@@ -155,8 +161,11 @@ class BaseSystem(ABC):
 
         self._require_indexed()
         t0 = self._now()
-        if k is None:
-            k = RETRIEVAL_RANKING_DEPTH
+        # Note: NO RETRIEVAL_RANKING_DEPTH override here. Calling
+        # retrieve(query, k=None) (or with an explicit caller-passed
+        # k) lets each system's NATURAL default top_k govern. This is
+        # the professor-aligned "don't expand baselines" guarantee —
+        # M2/M3/M4/M6 feed their original top-15 unchanged.
         retrieved = self.retrieve(query, k=k)
         # token_budget=None (default) -> packer reads
         # src.config.EVIDENCE_TOKEN_BUDGET at call time. None by

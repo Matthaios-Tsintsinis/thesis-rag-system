@@ -34,7 +34,6 @@ from ..components import (
 from ..config import (
     DEFAULT_CONFIG,
     HarnessConfig,
-    RETRIEVAL_RANKING_DEPTH,
 )
 from ..models import embed_texts, load_embedder
 from ..parsing import walk_corpus
@@ -117,12 +116,13 @@ class FlatDenseSystem(BaseSystem):
     def retrieve(self, query: str, k: int | None = None) -> list[RetrievedChunk]:
         self._require_indexed()
         assert self._resolved is not None
-        # CK-4: default to RETRIEVAL_RANKING_DEPTH (=50) so the shared
-        # packer at answer() time has a deep ranking to choose from.
-        # The top-15 prefix of this 50-deep ranking is bit-identical to
-        # the prior 15-deep ranking — FAISS top-K extends the tail
-        # without disturbing the head.
-        k = k or RETRIEVAL_RANKING_DEPTH
+        # Natural top-K (FINAL_CONTEXT_CHUNKS=15 default). M2 baseline
+        # feeds the generator what its paper would. The CK-4 packer
+        # at answer() time is a no-op pass-through when the opt-in
+        # --evidence-budget flag is OFF (the default). Callers who
+        # want a deeper menu (for opt-in budget ablations) pass an
+        # explicit k.
+        k = k or self.config.retrieval.top_k
         q_vec = embed_texts([query], model_name=self._resolved.embedder_id)
         scores, idxs = self._index.search(q_vec, k)
         out: list[RetrievedChunk] = []
