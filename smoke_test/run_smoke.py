@@ -1,24 +1,25 @@
 """Smoke test runner.
 
-Indexes M1/M2/M3/M4/M5/M7/M8 on the tiny smoke corpus and answers 5
+Indexes M1/M2/M3/M4/M7 on the tiny smoke corpus and answers 5
 questions with each. Writes a single combined JSONL to
     <OUTPUT_DIR>/smoke_results_<timestamp>.jsonl
 (via src.paths; OUTPUT_DIR is Drive when mounted, else /content/, else
 <repo>/local_runs/outputs).
 
 Per-system chunking: M1/M2/M3 use word-window with smoke-tuned params so
-behaviour stays identical to previous smoke runs. M4 and M8 use semantic
+behaviour stays identical to previous smoke runs. M4 uses semantic
 chunking with smoke-tuned min/max words because semantic chunking is
-part of what those systems are testing. M5 does not use the harness
-chunker at all — GraphRAG chunks the corpus itself; smoke shrinks M5's
-GraphRAG chunk size so the 8-doc corpus yields enough text units to
-build a graph.
+part of what M4/M7 are testing.
 
 M4 needs a non-trivial RAPTOR cluster tree to exercise the per-node-type
 expansion paths (PIPELINE_DESIGN.md section 4.4). On the smoke corpus
 this requires both a shrunken tree config (branching/min/depth smaller
 than production) and enough chunks to actually subdivide — see the
 expanded corpus in this directory.
+
+M5 (GraphRAG) and M8 (hierarchical cluster-tree port) are archived under
+`src/retrievers/deprecated/`; see the README there. They are no longer
+registered here and are not part of the active smoke roster.
 
 Run from repo root:
     python -m smoke_test.run_smoke                  # full: retrieval + generation
@@ -31,11 +32,6 @@ Sanity checks (exit code 2 on fail):
   * M4 tree has internal nodes; M4 flat index contains summary entries;
     M4 routing exercises at least one summary-expansion path across the
     5 questions (so the §4.4 logic isn't dead code on the corpus)
-  * M8 returns >0 chunks on at least one question (tree traversal isn't empty)
-  * M5 GraphRAG index completes (index_stats populated) and returns >0
-    units on at least one question. Community reports are a SOFT check —
-    the 8-doc corpus may be too small to form communities, which is a
-    corpus-scale artifact, not a bug (warn, never fail).
 """
 
 from __future__ import annotations
@@ -54,7 +50,6 @@ from src.config import (
     ExpansionParams,
     HarnessConfig,
     M4Config,
-    M5Config,
     M7Config,
     RaptorBuildParams,
 )
@@ -64,9 +59,7 @@ from src.retrievers.m1_closedbook import ClosedBookSystem
 from src.retrievers.m2_flat_dense import FlatDenseSystem
 from src.retrievers.m3_hybrid import HybridRRFSystem
 from src.retrievers.m4_raptor import RaptorSystem
-from src.retrievers.m5_graphrag import GraphRAGSystem
 from src.retrievers.m7_three_axis import ThreeAxisSystem
-from src.retrievers.m8_hierarchical import HierarchicalSystem
 
 
 SMOKE_DIR = Path(__file__).resolve().parent
@@ -79,9 +72,7 @@ SYSTEM_REGISTRY: dict[str, type[BaseSystem]] = {
     "M2": FlatDenseSystem,
     "M3": HybridRRFSystem,
     "M4": RaptorSystem,
-    "M5": GraphRAGSystem,
     "M7": ThreeAxisSystem,
-    "M8": HierarchicalSystem,
 }
 
 # The eight evaluation_plan.pdf §4 ablations, each disabling exactly one
@@ -159,32 +150,13 @@ _SMOKE_M7 = M7Config(
 )
 
 
-# M5 smoke config: GraphRAG chunks the corpus itself. The production
-# chunk size (1200 tokens) would put each short smoke doc in a single
-# text unit, leaving the graph too sparse for entity extraction. Shrink
-# the chunk size so the 8-doc corpus yields enough text units to build a
-# graph. community_level=0 reads the broadest community tier — the one
-# most likely to be non-empty on a corpus this small.
-_SMOKE_M5 = M5Config(
-    chunk_size=300,
-    chunk_overlap=50,
-    community_level=0,
-)
-
-
 def _config_for(sid: str, m7: M7Config | None = None) -> HarnessConfig:
     if sid == "M4":
         return replace(DEFAULT_CONFIG, chunking=_SMOKE_SEM, m4=_SMOKE_M4)
-    if sid == "M5":
-        # M5 ignores the harness chunker; chunking stays at default
-        # (only min_chars_per_doc matters, for the corpus walk).
-        return replace(DEFAULT_CONFIG, m5=_SMOKE_M5)
     if sid == "M7":
         return replace(
             DEFAULT_CONFIG, chunking=_SMOKE_SEM, m7=m7 or _SMOKE_M7
         )
-    if sid == "M8":
-        return replace(DEFAULT_CONFIG, chunking=_SMOKE_SEM)
     return replace(DEFAULT_CONFIG, chunking=_SMOKE_WW)
 
 
@@ -213,7 +185,7 @@ def _check_m2_m3_divergence(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--systems", nargs="*",
-                        default=["M1", "M2", "M3", "M4", "M5", "M7", "M8"])
+                        default=["M1", "M2", "M3", "M4", "M7"])
     parser.add_argument("--no-generate", action="store_true",
                         help="Skip LLM generation; report retrieval only.")
     parser.add_argument("--limit", type=int, default=None)
@@ -233,13 +205,10 @@ def main() -> None:
     m4_chunk_counts: list[int] = []
     m4_paths_union: set[str] = set()
     m4_index_stats: dict = {}
-    m5_chunk_counts: list[int] = []
-    m5_index_stats: dict = {}
     m7_chunk_counts: list[int] = []
     m7_index_stats: dict = {}
     m7_traces: list[dict] = []
     m7_abstained_any = False
-    m8_chunk_counts: list[int] = []
 
     with out_path.open("w", encoding="utf-8") as f:
         for sid in args.systems:
@@ -259,9 +228,6 @@ def main() -> None:
             if sid == "M4":
                 m4_index_stats = system.index_stats
                 print(f"  M4 index stats: {m4_index_stats}")
-            if sid == "M5":
-                m5_index_stats = system.index_stats
-                print(f"  M5 index stats: {m5_index_stats}")
             if sid == "M7":
                 m7_index_stats = system.index_stats
                 print(f"  M7 index stats: {m7_index_stats}")
@@ -287,15 +253,11 @@ def main() -> None:
                     m4_chunk_counts.append(len(ar.retrieved))
                     exercised_paths = system.last_trace.get("paths_exercised", [])
                     m4_paths_union.update(exercised_paths)
-                elif sid == "M5":
-                    m5_chunk_counts.append(len(ar.retrieved))
                 elif sid == "M7":
                     m7_chunk_counts.append(len(ar.retrieved))
                     m7_traces.append(dict(system.last_trace))
                     if ar.extra.get("abstained_aspects"):
                         m7_abstained_any = True
-                elif sid == "M8":
-                    m8_chunk_counts.append(len(ar.retrieved))
 
                 preview = ar.answer[:120].replace("\n", " ")
                 extras = ""
@@ -389,62 +351,6 @@ def main() -> None:
                     f"[smoke] OK: M4 returned chunks on "
                     f"{n_hits}/{len(m4_chunk_counts)} questions"
                 )
-
-    if "M8" in args.systems:
-        if not m8_chunk_counts or all(c == 0 for c in m8_chunk_counts):
-            print(
-                "[smoke] FAIL: M8 returned 0 chunks on every question — "
-                "tree traversal collapsed or rerank dropped all candidates."
-            )
-            fail = True
-        else:
-            n_hits = sum(c > 0 for c in m8_chunk_counts)
-            print(f"[smoke] OK: M8 returned chunks on {n_hits}/"
-                  f"{len(m8_chunk_counts)} questions")
-
-    if "M5" in args.systems:
-        if not m5_index_stats:
-            print(
-                "[smoke] FAIL: M5 produced no index_stats — the GraphRAG "
-                "index never completed."
-            )
-            fail = True
-        else:
-            print(
-                f"[smoke] OK: M5 GraphRAG index built — "
-                f"{m5_index_stats.get('n_entities')} entities, "
-                f"{m5_index_stats.get('n_relationships')} relationships, "
-                f"{m5_index_stats.get('n_text_units')} text units, "
-                f"{m5_index_stats.get('n_community_reports')} community reports"
-            )
-            # Community detection needs enough corpus to form communities.
-            # On the 8-doc smoke corpus GraphRAG may yield few or zero
-            # community reports — a corpus-scale artifact, not a code bug.
-            # Soft check: warn, never fail.
-            n_reports = int(m5_index_stats.get("n_community_reports", 0))
-            if n_reports > 0:
-                print(
-                    f"[smoke] OK: M5 community detection produced "
-                    f"{n_reports} report(s)"
-                )
-            else:
-                print(
-                    "[smoke] WARN: M5 produced 0 community reports — expected "
-                    "on a corpus this small (8 docs), not a failure. Community "
-                    "orientation stays thin until the real benchmark corpus."
-                )
-        if not m5_chunk_counts or all(c == 0 for c in m5_chunk_counts):
-            print(
-                "[smoke] FAIL: M5 returned 0 units on every question — "
-                "GraphRAG local search collapsed."
-            )
-            fail = True
-        else:
-            n_hits = sum(c > 0 for c in m5_chunk_counts)
-            print(
-                f"[smoke] OK: M5 returned units on {n_hits}/"
-                f"{len(m5_chunk_counts)} questions"
-            )
 
     if "M7" in args.systems:
         if not m7_index_stats:

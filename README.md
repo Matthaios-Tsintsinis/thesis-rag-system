@@ -31,10 +31,10 @@ Each system is implemented as a `BaseSystem` subclass in `src/retrievers/` and r
 | M2  | Flat dense retrieval                | Implemented, smoke-verified       |
 | M3  | Hybrid dense + BM25, RRF-fused      | Implemented, smoke-verified       |
 | M4  | RAPTOR, collapsed retrieval         | Implemented, smoke-verified       |
-| M5  | GraphRAG                            | Planned — not yet implemented     |
 | M6  | HippoRAG                            | Planned — not yet implemented     |
 | M7  | Three-axis hybrid (thesis contribution) | Implemented, smoke-verified, 8 ablations runnable |
-| M8  | Hierarchical cluster-tree           | Implemented (earlier prototype)   |
+
+GraphRAG (formerly M5) and the hierarchical cluster-tree port (formerly M8) are archived under `src/retrievers/deprecated/`; see the README there for the per-paper-component rationale. They are no longer part of the active evaluation roster.
 
 M4 and M7 share a RAPTOR substrate cache at `cache/RAPTOR/<substrate_hash>/`; the same tree and summaries are reused across the two systems and across the 8 M7 ablations.
 
@@ -139,10 +139,10 @@ thesis-rag-system/
 │   │   ├── base.py
 │   │   ├── m1_closedbook.py
 │   │   ├── m2_flat_dense.py
-│   │   ├── m3_hybrid_rrf.py
+│   │   ├── m3_hybrid.py
 │   │   ├── m4_raptor.py
 │   │   ├── m7_three_axis.py
-│   │   └── m8_hierarchical.py
+│   │   └── deprecated/          # archived: m5_graphrag, m8_hierarchical
 │   └── harness.py
 ├── smoke_test/
 │   ├── corpus/                   # 8-document smoke corpus
@@ -175,7 +175,7 @@ export OPENAI_API_KEY=sk-...
 python -m smoke_test.run_smoke --no-generate
 ```
 
-Expected output on a fresh run: cache miss on every system, RAPTOR substrate built into `cache/RAPTOR/<hash>/` (16 gpt-4o-mini summary calls, roughly $0.003), per-query retrieval traces for five questions across M2/M3/M4/M7/M8, 8 ablation runs each reporting `effect_observed=True`, and a final block of `[smoke] OK:` sanity check lines covering tree shape, routing coverage, view generation, multi-aspect decomposition, multi-branch exploration, deduplication, and quota preservation.
+Expected output on a fresh run: cache miss on every system, RAPTOR substrate built into `cache/RAPTOR/<hash>/` (16 gpt-4o-mini summary calls, roughly $0.003), per-query retrieval traces for five questions across M2/M3/M4/M7, 8 ablation runs each reporting `effect_observed=True`, and a final block of `[smoke] OK:` sanity check lines covering tree shape, routing coverage, view generation, multi-aspect decomposition, multi-branch exploration, deduplication, and quota preservation.
 
 A second invocation should report cache hits on all systems with zero new summary calls; query-time LLM calls (aspect extraction, paraphrase, HyDE) run on every invocation and are not cached.
 
@@ -190,9 +190,11 @@ These are local artifacts and are not committed; they are produced fresh on each
 
 ## Project status
 
-**Implemented and smoke-verified on Colab T4:** M1, M2, M3, M4, M7, M8. All 8 M7 ablations confirmed to disable their target component.
+**Implemented and smoke-verified on Colab T4:** M1, M2, M3, M4, M7. All 8 M7 ablations confirmed to disable their target component.
 
-**Pending:** M5 (GraphRAG wrapper), M6 (HippoRAG wrapper), benchmark loaders for the five datasets in the evaluation plan, RAGAS-based evaluation pipeline, full eval grid execution, analysis and write-up.
+**Archived:** M5 (GraphRAG) and M8 (hierarchical cluster-tree port), under `src/retrievers/deprecated/`. See that directory's README for the per-paper-component rationale.
+
+**Pending:** M6 (HippoRAG wrapper), benchmark loaders for the five datasets in the evaluation plan, RAGAS-based evaluation pipeline, full eval grid execution, analysis and write-up.
 
 The smoke-verified state confirms the systems are individually correct and integrated correctly. It does not yet provide benchmark-scale evidence for the thesis claim — that depends on the full eval grid, which is the next major phase of work.
 

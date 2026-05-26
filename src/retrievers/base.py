@@ -1,6 +1,7 @@
 """BaseSystem ABC.
 
-Every benchmarked system (M1-M8) implements this interface. The harness
+Every benchmarked system (M1-M4, M6, M7) implements this interface (M5
+and M8 are archived under src/retrievers/deprecated/). The harness
 treats each system as a black box: `index(corpus_path)` once, then
 `answer(query)` per question.
 

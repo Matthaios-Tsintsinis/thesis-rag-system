@@ -87,11 +87,11 @@ def hf_cache_dir() -> Path:
 def staging_dir() -> Path:
     """Local real-filesystem scratch root — never Drive.
 
-    lancedb (GraphRAG / M5, and likely M6) commits a table by an atomic
-    rename, which the Drive FUSE mount forbids (EPERM). Such systems must
-    build on a real local disk and copy the finished artifacts to the
-    Drive cache. On Colab that is /content; off-Colab a repo-local dir.
-    Override with THESIS_STAGING_DIR.
+    lancedb (M6 / HippoRAG likely; previously the archived GraphRAG M5)
+    commits a table by an atomic rename, which the Drive FUSE mount
+    forbids (EPERM). Such systems must build on a real local disk and
+    copy the finished artifacts to the Drive cache. On Colab that is
+    /content; off-Colab a repo-local dir. Override with THESIS_STAGING_DIR.
     """
     val = os.environ.get("THESIS_STAGING_DIR")
     if val:
