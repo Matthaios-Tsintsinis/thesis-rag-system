@@ -37,6 +37,27 @@ class Chunk:
     position: int                              # ordinal within doc
     metadata: dict = field(default_factory=dict)
 
+    # CK-2 retrieval-recall provenance for benchmark eval. Each pair is
+    # (parent_id, span_id) identifying a gold-passage atom this chunk
+    # touches — e.g. ("paper_1909.00694", "sec3.para0") for QASPER or
+    # ("https://example.com/article", "<whole>") for MultiHop-RAG. A
+    # chunk produced from one paragraph carries one pair; a semantic-
+    # chunker chunk spanning two paragraphs carries two. Empty tuple
+    # for smoke / non-eval indexing (default; preserves existing chunk
+    # behaviour byte-for-byte).
+    #
+    # CACHE DISCIPLINE: this field is eval-time metadata, NOT retrieval
+    # content. It is intentionally excluded from every cache key — the
+    # cache key (compute_cache_key) hashes chunking_config + embedder +
+    # parsing_identity + corpus_hash + extra, none of which read the
+    # Chunk dataclass itself. Adding this field therefore does NOT
+    # invalidate any existing substrate (RAPTOR 78fb239..., M4 mpnet
+    # bfc50c2..., M6 graph, etc.). save_chunks/load_chunks survives
+    # back-compat because the field has a default factory: old cached
+    # chunks lack the key in their on-disk JSON and Chunk(**d) falls
+    # back to the empty tuple.
+    gold_provenance: tuple = field(default_factory=tuple)
+
 
 # --- Word-window (cheap, embedder-free) -----------------------------------
 

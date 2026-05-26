@@ -78,6 +78,11 @@ def compute_cache_key(
     parsing.parsing_identity()) so that swapping PDF backends — e.g.
     PyMuPDF → Docling — invalidates every cached index across systems.
     Pass `parsing_identity={}` explicitly to opt out (tests only).
+
+    CACHE DISCIPLINE: this function reads only the four explicit inputs
+    plus parsing_identity. It does NOT read the Chunk dataclass shape.
+    Adding fields to Chunk (e.g. `gold_provenance` for CK-2 retrieval-
+    recall) therefore does NOT invalidate any existing substrate hash.
     """
     if parsing_identity is None:
         # Late import to avoid a chunking → parsing → cache cycle at module load.
