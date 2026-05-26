@@ -60,15 +60,27 @@ LOAD_GENERATOR_IN_4BIT = True
 
 # --- Prompts --------------------------------------------------------------
 
+# Canonical abstention response. The reader prompt instructs the model
+# to output exactly this string when the evidence does not contain the
+# answer. The eval-layer unanswerable scorer detects it deterministically
+# in addition to a fuzzy phrase-match fallback. Keep this string short,
+# distinctive (no leading article so it doesn't trip the QASPER token-F1
+# normaliser by accident), and stable: changing it invalidates the
+# scorer's exact-match branch.
+ABSTENTION_RESPONSE = "No answer available."
+
 BASE_ANSWER_SYSTEM_PROMPT = (
     "Answer the user's question using only the provided evidence. "
-    "If the evidence is insufficient, say so explicitly rather than fabricate. "
-    "Be concise and factual."
+    f"If the evidence does not contain the answer, respond with exactly: "
+    f"'{ABSTENTION_RESPONSE}'. "
+    "Do not fabricate; do not guess. Be concise and factual."
 )
 
 CLOSED_BOOK_SYSTEM_PROMPT = (
     "Answer the user's question from your own knowledge. "
-    "If you do not know the answer, say so explicitly rather than fabricate."
+    f"If you do not know the answer, respond with exactly: "
+    f"'{ABSTENTION_RESPONSE}'. "
+    "Do not fabricate; do not guess."
 )
 
 # --- Typed configs --------------------------------------------------------

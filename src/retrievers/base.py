@@ -1,10 +1,9 @@
 """BaseSystem ABC.
 
-The active benchmarked roster is M1, M2, M3, M4, M7 (and M6 once
-HippoRAG lands); M5 (GraphRAG) and M8 (hierarchical cluster-tree port)
-are archived under src/retrievers/deprecated/. The harness treats each
-system as a black box: `index(corpus_path)` once, then `answer(query)`
-per question.
+The active benchmarked roster is M1, M2, M3, M4, M6, M7; M5 (GraphRAG)
+and M8 (hierarchical cluster-tree port) are archived under
+src/retrievers/deprecated/. The harness treats each system as a black
+box: `index(corpus_path)` once, then `answer(query)` per question.
 
 `retrieve` is exposed separately so the harness can score retrieval
 quality (Recall@k, RAGAS context_precision) independently from answer
@@ -12,17 +11,32 @@ quality.
 
 M1 (closed-book) returns an empty list from `retrieve` — same interface,
 no chunks. This keeps the harness uniform.
+
+`index_items(items)` is an alternative entry point used by the
+benchmark eval layer to feed an in-memory list of CorpusItems rather
+than a filesystem path. The default implementation writes each item to
+a temp directory as a .txt file and calls self.index(temp_dir), then
+stamps each produced Chunk's gold_provenance from the per-item
+(parent_id, span_id) for CK-2 retrieval-recall scoring. Per-system
+overrides skip the disk roundtrip when it proves to be the bottleneck;
+do not pre-optimise all six.
 """
 
 from __future__ import annotations
 
+import re
+import tempfile
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Sequence, TYPE_CHECKING
 
 from ..chunking import Chunk
 from ..config import DEFAULT_CONFIG, HarnessConfig
+
+if TYPE_CHECKING:
+    from ..eval.types import CorpusItem
 
 
 @dataclass
@@ -44,6 +58,17 @@ class AnswerResult:
     extra: dict = field(default_factory=dict)
 
 
+_ITEM_ID_SANITISE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _safe_item_filename(item_id: str) -> str:
+    """Make an item_id filesystem-safe. Deterministic + collision-resistant for the
+    sanitised characters we see in QASPER + MultiHop ids.
+    """
+    safe = _ITEM_ID_SANITISE_RE.sub("_", item_id).strip("_")
+    return safe or "item"
+
+
 class BaseSystem(ABC):
     """Abstract benchmarked system."""
 
@@ -52,6 +77,10 @@ class BaseSystem(ABC):
     def __init__(self, config: HarnessConfig = DEFAULT_CONFIG) -> None:
         self.config = config
         self._indexed: bool = False
+        # All chunking systems (M2/M3/M4/M6/M7) populate this list during
+        # index(); M1 leaves it empty. Declared on the base so the eval
+        # layer's index_items provenance-stamping can find it uniformly.
+        self.chunks: list[Chunk] = []
 
     @abstractmethod
     def index(self, corpus_path: Path) -> None:
@@ -64,6 +93,59 @@ class BaseSystem(ABC):
     @abstractmethod
     def answer(self, query: str, k: int | None = None) -> AnswerResult:
         """Retrieve evidence then generate an answer. Records timing/usage."""
+
+    def index_items(self, items: Sequence["CorpusItem"]) -> None:
+        """Index an in-memory list of CorpusItems (benchmark-eval entry point).
+
+        Default fallback: write each item to a temp directory as a
+        `{safe_id}.txt` file, call self.index(temp_dir), then iterate
+        self.chunks and stamp gold_provenance from the per-item
+        (parent_id, span_id) pair using the doc_id->item mapping that
+        walk_corpus produces (doc_id = relative path under the temp
+        root). The temp directory is deleted when index() returns; the
+        in-memory chunks (and any system-specific cached artefacts on
+        disk) survive.
+
+        Per-system overrides can avoid the disk roundtrip if profiling
+        shows it is the bottleneck — but do not pre-optimise all six
+        systems; the temp-dir fallback is correct for all of them
+        today, and benchmark indexing is dominated by LLM calls (M4
+        summarisation, M6 OpenIE) not by chunk-text I/O.
+
+        Provenance stamping is a no-op for M1 (self.chunks stays
+        empty); for chunking systems it sets each chunk's
+        gold_provenance to a single-element tuple ((parent_id,
+        span_id),). A semantic chunker that fuses neighbouring
+        CorpusItems into one chunk would need a per-system override to
+        track multi-atom provenance — flagged as a Pass-2 concern
+        (Pass-1 uses 1:1 item-to-chunk granularity for QASPER paragraphs
+        and MultiHop articles).
+        """
+        item_by_doc_id: dict[str, "CorpusItem"] = {}
+        with tempfile.TemporaryDirectory(prefix=f"{self.system_id}_corpus_") as td:
+            td_path = Path(td)
+            for item in items:
+                safe = _safe_item_filename(item.item_id)
+                filename = f"{safe}.txt"
+                # On a collision (two items normalise to the same safe
+                # name), suffix with a counter so all items survive.
+                if filename in item_by_doc_id:
+                    n = 1
+                    while f"{safe}_{n}.txt" in item_by_doc_id:
+                        n += 1
+                    filename = f"{safe}_{n}.txt"
+                (td_path / filename).write_text(item.text, encoding="utf-8")
+                item_by_doc_id[filename] = item
+            self.index(td_path)
+        # walk_corpus produces ParsedDocument.doc_id = relative_path
+        # under the corpus root, which is just the filename for our
+        # flat temp dir. Stamp provenance for every chunk that came
+        # from a known item; unknown doc_ids (shouldn't happen but
+        # defensive) leave gold_provenance untouched (empty tuple).
+        for chunk in self.chunks:
+            item = item_by_doc_id.get(chunk.doc_id)
+            if item is not None:
+                chunk.gold_provenance = ((item.parent_id, item.span_id),)
 
     def _require_indexed(self) -> None:
         if not self._indexed:
