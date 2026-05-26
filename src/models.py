@@ -17,7 +17,6 @@ import numpy as np
 
 from .config import (
     EMBEDDER_MODEL,
-    EMBEDDING_DIM,
     GENERATOR_MODEL,
     GenerationConfig,
     RERANKER_MODEL,
@@ -35,10 +34,19 @@ def load_embedder(model_name: str = EMBEDDER_MODEL) -> Any:
 
 
 def embed_texts(texts: list[str], model_name: str = EMBEDDER_MODEL) -> np.ndarray:
-    """L2-normalised embeddings; inner product == cosine."""
-    if not texts:
-        return np.zeros((0, EMBEDDING_DIM), dtype=np.float32)
+    """L2-normalised embeddings; inner product == cosine.
+
+    The empty-input branch probes the loaded model for its sentence-
+    embedding dimension rather than reading a hardcoded constant, so the
+    function works correctly across embedders with different native dims
+    (e.g. bge-m3 at 1024, multi-qa-mpnet-base-cos-v1 at 768, Contriever
+    at 768). load_embedder is lru-cached, so the probe is free after the
+    first real call.
+    """
     model = load_embedder(model_name)
+    if not texts:
+        dim = int(model.get_sentence_embedding_dimension())
+        return np.zeros((0, dim), dtype=np.float32)
     vecs = model.encode(
         texts,
         normalize_embeddings=True,

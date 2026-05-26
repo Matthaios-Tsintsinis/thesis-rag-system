@@ -163,10 +163,25 @@ class M4Config:
     summary_model: str = JUDGE_MODEL  # gpt-4o-mini by project decision
     top_k_final: int = FINAL_CONTEXT_CHUNKS
 
-    # --- component overrides (None = shared default) ---
-    embedder: str | None = None
+    # --- component overrides (per-paper assignment) ---
+    # Per-paper rule (professor-approved): each system uses the
+    # components its own paper specifies. The RAPTOR paper uses
+    # multi-qa-mpnet-base-cos-v1 as its SBERT checkpoint (verified
+    # against the official repo's EmbeddingModels.py default and the
+    # ICLR 2024 paper text). multi-qa-mpnet-base-cos-v1 is 768-dim
+    # vs bge-m3's 1024-dim, so M4's substrate cache forks off the
+    # previously-shared M4/M7 RAPTOR substrate directory under a new
+    # hash. Chunker and reranker stay None (= shared default chunker,
+    # no reranker — RAPTOR has no cross-encoder rerank). The index-
+    # time summariser stays as `summary_model` (gpt-4o-mini,
+    # modernised from the paper's GPT-3.5-turbo per professor
+    # direction "preserve architecture, modernize deprecated model").
+    # English-centric mpnet vs multilingual bge-m3 means M4 retrieval
+    # degrades on Greek queries — documented as a paper-faithfulness
+    # limitation in the methods section.
+    embedder: str | None = "sentence-transformers/multi-qa-mpnet-base-cos-v1"
     chunker: ChunkingConfig | None = None
-    reranker: str | None = None  # M4 does not rerank; default stays None
+    reranker: str | None = None  # M4 does not rerank
 
     trace: bool = False
 
