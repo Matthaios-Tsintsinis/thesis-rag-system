@@ -11,22 +11,27 @@ Prompts are reproduced VERBATIM from the legacy source files:
 The legacy code wraps these via LangChain ChatPromptTemplate; we translate
 the same message content to the OpenAI Python client's message list shape
 (role + content), keeping every system / user / assistant message string
-unchanged. OpenAI client paths (model name + JSON response_format) match
-the legacy `init_langchain_model('openai', ...).invoke(..., response_
-format={"type":"json_object"})` path byte-for-byte at the request layer.
+unchanged. OpenAI client paths (model name + JSON response_format + the
+exact temperature / max_tokens / stop params per call site) match the
+legacy `init_langchain_model('openai', ...).invoke(...)` requests
+byte-for-byte at the wire level.
 
 Why a port and not a wrapper: the legacy repo pins numpy==1.26.4 /
 torch==1.13.1, which conflict ABI-hard with our harness (numpy>=2.1,
-torch>=2.2). See docs/PROJECT_BRIEF and the M6 design proposal.
-
-THIS FILE IS A C4a SKELETON — function bodies raise NotImplementedError.
-C4b lands the working extraction code.
+torch>=2.2). Same precedent as M4 (RAPTOR port in src/raptor.py rather
+than a wrapped repo).
 """
 
 from __future__ import annotations
 
+import json
+import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
+
+from .summarization import _resolve_openai_key
 
 
 # --- Prompt constants (verbatim from legacy openie_extraction_instructions.py) ---
@@ -105,12 +110,11 @@ Question: {question}
 
 # --- Prompt versioning -----------------------------------------------------
 
-# Bumped when ANY of the constants above changes. Folded into the M6 cache
-# key so a prompt revision invalidates the OpenIE artifacts cleanly.
 OPENIE_PROMPT_VERSION = "v1"
 
 
 # --- Phrase normalisation (verbatim from legacy processing.processing_phrases) ---
+
 
 def processing_phrases(phrase: str) -> str:
     """Lower-case + replace non-alphanumeric (except space) with space + strip.
@@ -118,33 +122,162 @@ def processing_phrases(phrase: str) -> str:
     Verbatim from `scratch_hipporag/src/processing.py:39`. The legacy
     pipeline applies this to every entity and triple element before
     indexing into the phrase dictionary; preserving it byte-for-byte is
-    required for entity-id stability vs. their published artifacts (if
-    we ever want to diff).
+    required for entity-id stability vs. their published artifacts.
 
-    Side note: this destroys non-ASCII characters (Greek included). It is
-    a paper-faithfulness cost, not a bug. Documented as a M6 limitation
-    in the methods section alongside the English-centric Contriever
-    embedder.
+    Side note: destroys non-ASCII characters (Greek included). It is a
+    paper-faithfulness cost, not a bug. Documented as an M6 limitation.
     """
-    import re
     return re.sub("[^A-Za-z0-9 ]", " ", phrase.lower()).strip()
 
 
-# --- Extraction API (C4b implementation) ----------------------------------
+# --- OpenAI client + low-level JSON-mode call ------------------------------
+
+
+_CLIENT: Any | None = None
+
+
+def _get_client() -> Any:
+    """Lazy OpenAI client. Cached for the process lifetime."""
+    global _CLIENT
+    if _CLIENT is not None:
+        return _CLIENT
+    try:
+        from openai import OpenAI
+    except ImportError as e:
+        raise RuntimeError(
+            "openai package not installed. `pip install openai` is "
+            "required for HippoRAG OpenIE."
+        ) from e
+    _CLIENT = OpenAI(api_key=_resolve_openai_key())
+    return _CLIENT
+
+
+def _invoke_json_chat(
+    messages: list[dict],
+    *,
+    model: str,
+    temperature: float = 0.0,
+    max_tokens: int | None = None,
+    stop: list[str] | None = None,
+    max_retries: int = 3,
+    retry_backoff_s: float = 2.0,
+    _label: str = "openie",
+) -> tuple[str, int]:
+    """Invoke chat.completions with JSON mode. Returns (content_str, n_tokens).
+
+    Mirrors the legacy LangChain calls:
+        client.invoke(messages, temperature=0, max_tokens=..., stop=...,
+                      response_format={"type":"json_object"})
+
+    Retries on transient errors (rate limit, timeout, transient API
+    errors). Non-transient errors propagate immediately so misconfig
+    surfaces during smoke instead of hiding in retry loops.
+    """
+    client = _get_client()
+    try:
+        from openai import APIError, APITimeoutError, RateLimitError
+        transient_excs: tuple[type[BaseException], ...] = (
+            RateLimitError,
+            APITimeoutError,
+            APIError,
+        )
+    except ImportError:
+        transient_excs = ()
+
+    kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "response_format": {"type": "json_object"},
+    }
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
+    if stop is not None:
+        kwargs["stop"] = stop
+
+    last_exc: BaseException | None = None
+    for attempt in range(max_retries):
+        try:
+            resp = client.chat.completions.create(**kwargs)
+            content = (resp.choices[0].message.content or "").strip()
+            n_tokens = int(resp.usage.total_tokens) if resp.usage else 0
+            return content, n_tokens
+        except transient_excs as e:
+            last_exc = e
+            if attempt == max_retries - 1:
+                break
+            time.sleep(retry_backoff_s * (2**attempt))
+
+    raise RuntimeError(
+        f"{_label}: exhausted {max_retries} retries against {model}"
+    ) from last_exc
+
+
+# --- Extraction API --------------------------------------------------------
 
 
 @dataclass
 class OpenIEResult:
     """One extracted passage's NER + triple output.
 
-    Mirrors the legacy on-disk shape `output/openie_{corpus}_results_ner_*.json`
+    Mirrors the legacy on-disk shape from `output/openie_*_results_*.json`
     so anyone reading both can cross-reference fields directly.
+
+    `extracted_entities` and `extracted_triples` hold the RAW LLM output
+    strings, not normalised. processing_phrases() is applied later at
+    graph-build time, matching the legacy two-stage pattern (OpenIE saves
+    raw, create_graph.py normalises).
+
+    `parse_ok` is False if either the NER or the OpenIE post-NER JSON
+    failed to parse. Failures are recorded but do not crash the
+    pipeline; the entry has empty entities/triples and contributes
+    nothing to the graph.
     """
     idx: int
     passage: str
     extracted_entities: list[str]
     extracted_triples: list[list[str]]
-    n_tokens: int  # for cost accounting + the manifest
+    n_tokens: int
+    parse_ok: bool
+
+
+def _build_passage_ner_messages(passage: str) -> list[dict]:
+    """Mirror legacy ner_prompts.format_prompt(user_input=passage).to_messages()."""
+    return [
+        {"role": "system", "content": NER_INSTRUCTION},
+        {"role": "user", "content": NER_INPUT_ONE_SHOT},
+        {"role": "assistant", "content": ONE_SHOT_PASSAGE_ENTITIES},
+        {"role": "user", "content": f"Paragraph:```\n{passage}\n```"},
+    ]
+
+
+def _build_openie_messages(passage: str, entities: list[str]) -> list[dict]:
+    """Mirror legacy openie_post_ner_prompts.format_prompt(...).to_messages()."""
+    named_entity_json = json.dumps({"named_entities": entities})
+    one_shot_input = OPENIE_POST_NER_FRAME.format(
+        passage=ONE_SHOT_PASSAGE,
+        named_entity_json=ONE_SHOT_PASSAGE_ENTITIES,
+    )
+    user_input = OPENIE_POST_NER_FRAME.format(
+        passage=passage,
+        named_entity_json=named_entity_json,
+    )
+    return [
+        {"role": "system", "content": OPENIE_POST_NER_INSTRUCTION},
+        {"role": "user", "content": one_shot_input},
+        {"role": "assistant", "content": ONE_SHOT_PASSAGE_TRIPLES},
+        {"role": "user", "content": user_input},
+    ]
+
+
+def _build_query_ner_messages(query: str) -> list[dict]:
+    """Mirror legacy query_ner_prompts.format_prompt(...).to_messages()."""
+    return [
+        {"role": "system", "content": QUERY_NER_SYSTEM},
+        {"role": "user", "content": QUERY_NER_ONE_SHOT_INPUT},
+        {"role": "assistant", "content": QUERY_NER_ONE_SHOT_OUTPUT},
+        {"role": "user", "content": QUERY_NER_USER_TEMPLATE.format(question=query)},
+    ]
 
 
 def extract_passage_entities_and_triples(
@@ -152,40 +285,149 @@ def extract_passage_entities_and_triples(
     *,
     idx: int,
     llm_model: str,
-    client: Any | None = None,
 ) -> OpenIEResult:
     """NER + post-NER OpenIE for a single passage. Two LLM calls.
 
-    Call 1 (NER): passage -> {"named_entities": [...]}.
-    Call 2 (OpenIE): passage + named-entity JSON -> {"triples": [[h,r,t], ...]}.
+    Call 1 (NER): passage -> {"named_entities": [...]}. Temp=0, JSON mode.
+    Call 2 (OpenIE): passage + named-entity JSON -> {"triples": [[h,r,t],...]}.
+    Temp=0, max_tokens=4096 (legacy openie_post_ner_extract line 72), JSON mode.
 
-    Both calls use OpenAI JSON mode (response_format={"type":"json_object"}).
-    Token counts are summed across the two calls for the returned
-    n_tokens. Malformed JSON is caught and logged; a degenerate
-    OpenIEResult with empty entities/triples is returned so the index
-    pipeline can continue.
-
-    NOT IMPLEMENTED in C4a — function signature only.
+    Token counts summed across both calls. Malformed JSON in either
+    call: parse_ok=False, empty fields for that level — index pipeline
+    continues, the failure is counted in the manifest.
     """
-    raise NotImplementedError("C4b: implement OpenIE extraction.")
+    total_tokens = 0
+    parse_ok = True
+
+    # --- Call 1: NER ---
+    entities: list[str] = []
+    try:
+        ner_content, ner_tokens = _invoke_json_chat(
+            _build_passage_ner_messages(passage),
+            model=llm_model,
+            temperature=0.0,
+            _label=f"passage_ner[{idx}]",
+        )
+        total_tokens += ner_tokens
+        ner_obj = json.loads(ner_content)
+        raw_entities = ner_obj.get("named_entities", [])
+        if isinstance(raw_entities, list):
+            entities = [str(e) for e in raw_entities]
+        else:
+            parse_ok = False
+    except (json.JSONDecodeError, RuntimeError, KeyError, TypeError):
+        parse_ok = False
+
+    # --- Call 2: OpenIE post-NER (skip if NER produced no entities — the
+    # legacy code still calls but with empty list; we replicate that exactly
+    # so the prompt/cache behaviour is identical) ---
+    triples: list[list[str]] = []
+    try:
+        openie_content, openie_tokens = _invoke_json_chat(
+            _build_openie_messages(passage, entities),
+            model=llm_model,
+            temperature=0.0,
+            max_tokens=4096,
+            _label=f"passage_openie[{idx}]",
+        )
+        total_tokens += openie_tokens
+        openie_obj = json.loads(openie_content)
+        raw_triples = openie_obj.get("triples", [])
+        if isinstance(raw_triples, list):
+            # Keep only well-formed length-3 triples; the legacy graph
+            # builder filters incorrectly-formatted ones at create_graph
+            # time anyway, but doing it here keeps the OpenIEResult shape
+            # tight and the failure visible.
+            for t in raw_triples:
+                if isinstance(t, list) and len(t) == 3 and all(isinstance(x, (str, int, float)) for x in t):
+                    triples.append([str(x) for x in t])
+                else:
+                    parse_ok = False
+        else:
+            parse_ok = False
+    except (json.JSONDecodeError, RuntimeError, KeyError, TypeError):
+        parse_ok = False
+
+    return OpenIEResult(
+        idx=idx,
+        passage=passage,
+        extracted_entities=entities,
+        extracted_triples=triples,
+        n_tokens=total_tokens,
+        parse_ok=parse_ok,
+    )
 
 
 def extract_query_entities(
     query: str,
     *,
     llm_model: str,
-    client: Any | None = None,
 ) -> tuple[list[str], int]:
     """Query-side NER. One LLM call, returns (entity_strings, n_tokens).
 
-    Empty-NER outcome (LLM returns no entities) is NOT an error — the
-    M6 retrieve path falls back to a uniform PPR reset per the paper,
-    and the empty-NER event is logged prominently for analysis. See
-    M6Config / m6_hipporag.HippoRAGSystem.retrieve.
+    Empty-NER outcome (model returns no entities or JSON parse fails) is
+    NOT an error — returns ([], n_tokens). The M6 retrieve path falls
+    back to a uniform PPR reset per the paper and logs the empty-NER
+    event prominently. See `hipporag_ppr.uniform_fallback` +
+    `m6_hipporag.HippoRAGSystem.retrieve`.
 
-    NOT IMPLEMENTED in C4a — function signature only.
+    Legacy call params (named_entity_extraction_parallel.py:48):
+    temperature=0, max_tokens=300, stop=['\\n\\n'], JSON mode.
     """
-    raise NotImplementedError("C4b: implement query-side NER.")
+    try:
+        content, n_tokens = _invoke_json_chat(
+            _build_query_ner_messages(query),
+            model=llm_model,
+            temperature=0.0,
+            max_tokens=300,
+            stop=["\n\n"],
+            _label="query_ner",
+        )
+        obj = json.loads(content)
+        raw = obj.get("named_entities", [])
+        if isinstance(raw, list):
+            return [str(e) for e in raw], n_tokens
+        return [], n_tokens
+    except (json.JSONDecodeError, RuntimeError, KeyError, TypeError):
+        return [], 0
+
+
+def extract_corpus_parallel(
+    passages: list[str],
+    *,
+    llm_model: str,
+    max_workers: int = 8,
+    on_progress: Callable[[int, int], None] | None = None,
+) -> list[OpenIEResult]:
+    """Run OpenIE over an entire passage list with thread parallelism.
+
+    Threads (not processes) — OpenIE is IO-bound on OpenAI HTTP calls,
+    not CPU-bound. Returns results in input order (idx-sorted). The
+    on_progress callback fires after each completed passage with
+    (n_done, n_total) so callers can attach a tqdm bar or smoke log.
+    """
+    results: list[OpenIEResult | None] = [None] * len(passages)
+    n_done = 0
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_to_idx = {
+            pool.submit(
+                extract_passage_entities_and_triples,
+                p,
+                idx=i,
+                llm_model=llm_model,
+            ): i
+            for i, p in enumerate(passages)
+        }
+        for fut in as_completed(future_to_idx):
+            i = future_to_idx[fut]
+            results[i] = fut.result()
+            n_done += 1
+            if on_progress is not None:
+                on_progress(n_done, len(passages))
+
+    # All slots filled (futures complete before exiting `with`).
+    return [r for r in results if r is not None]
 
 
 __all__ = [
@@ -205,7 +447,8 @@ __all__ = [
     # Helpers
     "processing_phrases",
     "OpenIEResult",
-    # Public API (C4b)
+    # Public API
     "extract_passage_entities_and_triples",
     "extract_query_entities",
+    "extract_corpus_parallel",
 ]

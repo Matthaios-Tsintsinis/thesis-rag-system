@@ -27,9 +27,6 @@ not from paper prose):
 
     M6Config.damping = 0.5 is therefore byte-for-byte faithful at the
     call site.
-
-THIS FILE IS A C4a SKELETON — function bodies raise NotImplementedError.
-C4b lands the working query path.
 """
 
 from __future__ import annotations
@@ -37,6 +34,9 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+
+from .hipporag_openie import processing_phrases
+from .models import embed_texts
 
 
 def link_query_entities_to_phrases(
@@ -48,17 +48,30 @@ def link_query_entities_to_phrases(
     """For each query NER string, argmax cosine vs the phrase-node embeddings.
 
     Faithful port of `scratch_hipporag/src/hipporag.py:596-632`
-    link_node_by_dpr. Returns list of (phrase_id, cosine_score) per NER
-    string, length == len(query_ner_strings).
+    link_node_by_dpr. Each NER string is normalised via
+    processing_phrases first (matches legacy hipporag.py:308), then
+    embedded via Contriever using the same `embed_texts(model_name=
+    embedder_id)` path used at index time — guarantees encoding parity.
 
-    NER strings are first embedded via Contriever using the same
-    `embed_texts(model_name=embedder_id)` path the rest of the harness
-    uses — guarantees query-side encoding matches index-side encoding
-    so cosine is meaningful.
-
-    NOT IMPLEMENTED in C4a.
+    Returns list of (phrase_id, cosine_score) per NER string in input
+    order. If query_ner_strings is empty, returns empty list (caller
+    handles the empty-NER fallback at the system level).
     """
-    raise NotImplementedError("C4b: implement query-entity -> phrase-node dense link.")
+    if not query_ner_strings or phrase_embeddings.shape[0] == 0:
+        return []
+
+    normalised = [processing_phrases(s) for s in query_ner_strings]
+    normalised = [s for s in normalised if s]  # drop strings that normalise to empty
+    if not normalised:
+        return []
+
+    query_embs = embed_texts(normalised, model_name=embedder_id)
+    # query_embs and phrase_embeddings are both L2-normalised, so
+    # dot = cosine.
+    sims = query_embs @ phrase_embeddings.T  # (n_query, n_phrases)
+    best_ids = sims.argmax(axis=1)
+    best_scores = sims[np.arange(len(normalised)), best_ids]
+    return [(int(i), float(s)) for i, s in zip(best_ids, best_scores)]
 
 
 def build_reset_vector(
@@ -71,13 +84,28 @@ def build_reset_vector(
     """Personalisation vector for PPR.
 
     Faithful port of `scratch_hipporag/src/hipporag.py:617-628`. For each
-    linked phrase_id: weight = 1/n_docs_containing_phrase if
-    node_specificity else 1.0. Phrases not seen in any doc get weight 1
-    (their fallback line 622).
+    linked phrase_id: weight = 1 / phrase_to_num_doc[phrase_id] if
+    node_specificity, else 1.0. The legacy code special-cases phrases
+    with num_doc == 0 (returns weight 1, line 622); we replicate exactly.
 
-    NOT IMPLEMENTED in C4a.
+    If `linked` is empty, returns a zero vector — the caller (M6 system)
+    detects empty-NER upstream and switches to the uniform fallback;
+    this function never silently substitutes a uniform vector itself.
     """
-    raise NotImplementedError("C4b: implement reset-vector construction.")
+    reset = np.zeros(n_phrases, dtype=np.float64)
+    for phrase_id, _score in linked:
+        if not (0 <= phrase_id < n_phrases):
+            continue
+        if node_specificity:
+            n_doc = int(phrase_to_num_doc[phrase_id])
+            if n_doc == 0:
+                weight = 1.0  # legacy line 622 fallback
+            else:
+                weight = 1.0 / n_doc
+        else:
+            weight = 1.0
+        reset[phrase_id] = weight
+    return reset
 
 
 def run_pagerank(
@@ -86,23 +114,42 @@ def run_pagerank(
     *,
     damping: float,
 ) -> np.ndarray:
-    """One PPR run. Matches `scratch_hipporag/src/hipporag.py:524-538` byte-for-byte.
+    """One PPR run. Matches `scratch_hipporag/src/hipporag.py:524-538`.
 
-    Call:
+    igraph call (continue-walk damping convention):
         g.personalized_pagerank(
             vertices=range(n_phrases),
-            damping=damping,                 # 0.5 per main_exps; see module docstring
+            damping=damping,                 # 0.5 per main_exps
             directed=False,
             weights='weight',
             reset=reset_vector,
             implementation='prpack',
         )
 
-    Returns np.ndarray (n_phrases,) of stationary probabilities.
-
-    NOT IMPLEMENTED in C4a.
+    Returns (n_phrases,) float64.
     """
-    raise NotImplementedError("C4b: implement igraph personalized_pagerank call.")
+    n_phrases = igraph_graph.vcount()
+    if n_phrases == 0:
+        return np.zeros(0, dtype=np.float64)
+    probs = igraph_graph.personalized_pagerank(
+        vertices=range(n_phrases),
+        damping=damping,
+        directed=False,
+        weights="weight",
+        reset=reset_vector.tolist(),
+        implementation="prpack",
+    )
+    return np.asarray(probs, dtype=np.float64)
+
+
+def _min_max_normalize(v: np.ndarray) -> np.ndarray:
+    """Verbatim port of legacy processing.min_max_normalize."""
+    if v.size == 0:
+        return v
+    lo, hi = float(v.min()), float(v.max())
+    if hi - lo <= 0.0:
+        return np.zeros_like(v)
+    return (v - lo) / (hi - lo)
 
 
 def propagate_phrase_to_doc(
@@ -110,14 +157,18 @@ def propagate_phrase_to_doc(
     docs_to_facts_mat: Any,
     facts_to_phrases_mat: Any,
 ) -> np.ndarray:
-    """phrase PPR -> fact prob -> doc prob, then min-max normalised.
+    """phrase PPR -> fact prob -> doc prob, min-max normalised.
 
-    Faithful port of `scratch_hipporag/src/hipporag.py:229-231` and
-    processing.min_max_normalize. Returns (n_chunks,) float32.
-
-    NOT IMPLEMENTED in C4a.
+    Faithful port of `scratch_hipporag/src/hipporag.py:229-231`:
+        fact_prob = facts_to_phrases_mat.dot(ppr_phrase_probs)
+        ppr_doc_prob = docs_to_facts_mat.dot(fact_prob)
+        ppr_doc_prob = min_max_normalize(ppr_doc_prob)
     """
-    raise NotImplementedError("C4b: implement phrase->fact->doc propagation.")
+    fact_prob = facts_to_phrases_mat @ ppr_phrase_probs
+    doc_prob = docs_to_facts_mat @ fact_prob
+    # csr_array @ vec returns ndarray-like; ensure ndarray for downstream.
+    doc_prob = np.asarray(doc_prob).ravel().astype(np.float64)
+    return _min_max_normalize(doc_prob)
 
 
 def uniform_fallback(n_chunks: int) -> np.ndarray:
@@ -127,14 +178,12 @@ def uniform_fallback(n_chunks: int) -> np.ndarray:
         ppr_doc_prob = np.ones(n_chunks) / n_chunks
 
     Effect: every chunk gets identical score, top-k is arbitrary order.
-    Faithful behaviour, even though it scores badly on benchmarks.
-    M6Config keeps this exact fallback (no silent fix); the M6 system
-    logs every empty-NER event prominently so the analysis phase can
-    quantify the impact.
-
-    NOT IMPLEMENTED in C4a.
+    Faithful behaviour preserved — M6 logs every empty-NER event
+    prominently so the analysis phase can quantify the impact.
     """
-    raise NotImplementedError("C4b: implement uniform fallback.")
+    if n_chunks <= 0:
+        return np.zeros(0, dtype=np.float64)
+    return np.ones(n_chunks, dtype=np.float64) / float(n_chunks)
 
 
 __all__ = [

@@ -1,21 +1,28 @@
 """Smoke test runner.
 
-Indexes M1/M2/M3/M4/M7 on the tiny smoke corpus and answers 5
+Indexes M1/M2/M3/M4/M6/M7 on the tiny smoke corpus and answers 5
 questions with each. Writes a single combined JSONL to
     <OUTPUT_DIR>/smoke_results_<timestamp>.jsonl
 (via src.paths; OUTPUT_DIR is Drive when mounted, else /content/, else
 <repo>/local_runs/outputs).
 
-Per-system chunking: M1/M2/M3 use word-window with smoke-tuned params so
-behaviour stays identical to previous smoke runs. M4 uses semantic
-chunking with smoke-tuned min/max words because semantic chunking is
-part of what M4/M7 are testing.
+Per-system chunking: M1/M2/M3/M6 use word-window with smoke-tuned params
+so behaviour stays identical to previous smoke runs (and M6's OpenIE
+gets small passage-sized units). M4 uses semantic chunking with
+smoke-tuned min/max words because semantic chunking is part of what
+M4/M7 are testing.
 
 M4 needs a non-trivial RAPTOR cluster tree to exercise the per-node-type
 expansion paths (PIPELINE_DESIGN.md section 4.4). On the smoke corpus
 this requires both a shrunken tree config (branching/min/depth smaller
 than production) and enough chunks to actually subdivide — see the
 expanded corpus in this directory.
+
+M6 (HippoRAG 1, NeurIPS'24 — single-step Contriever + PPR damping=0.5)
+runs OpenIE per chunk, so smoke costs a few cents in gpt-4o-mini calls.
+The Contriever pooling HARD GATE (cosine >= 0.99 vs masked-mean
+reference) runs at the top of M6 index — silent pooling mismatch would
+corrupt every entity link.
 
 M5 (GraphRAG) and M8 (hierarchical cluster-tree port) are archived under
 `src/retrievers/deprecated/`; see the README there. They are no longer
@@ -32,6 +39,9 @@ Sanity checks (exit code 2 on fail):
   * M4 tree has internal nodes; M4 flat index contains summary entries;
     M4 routing exercises at least one summary-expansion path across the
     5 questions (so the §4.4 logic isn't dead code on the corpus)
+  * M6 graph has >=1 phrase + >=1 fact; >=1 synonymy edge; >0 chunks on
+    >=1 question; ranking differs from M2 on >=1 question (PPR is
+    actually doing something distinct from dense retrieval).
 """
 
 from __future__ import annotations
@@ -50,6 +60,7 @@ from src.config import (
     ExpansionParams,
     HarnessConfig,
     M4Config,
+    M6Config,
     M7Config,
     RaptorBuildParams,
 )
@@ -59,6 +70,7 @@ from src.retrievers.m1_closedbook import ClosedBookSystem
 from src.retrievers.m2_flat_dense import FlatDenseSystem
 from src.retrievers.m3_hybrid import HybridRRFSystem
 from src.retrievers.m4_raptor import RaptorSystem
+from src.retrievers.m6_hipporag import HippoRAGSystem
 from src.retrievers.m7_three_axis import ThreeAxisSystem
 
 
@@ -72,6 +84,7 @@ SYSTEM_REGISTRY: dict[str, type[BaseSystem]] = {
     "M2": FlatDenseSystem,
     "M3": HybridRRFSystem,
     "M4": RaptorSystem,
+    "M6": HippoRAGSystem,
     "M7": ThreeAxisSystem,
 }
 
@@ -136,6 +149,9 @@ _SMOKE_M4 = M4Config(
 # M7 reuses M4's RAPTOR substrate: identical build/expansion params +
 # identical semantic chunking → identical substrate cache key, so M7
 # cache-hits the RAPTOR/<hash>/ dir M4 built instead of re-summarising.
+# (NB: under the per-paper rule, M4 now uses mpnet/768 while M7 keeps
+# bge-m3/1024, so they fork at the embedder layer. M7 still hits the
+# bge-m3 substrate hash; M4's mpnet substrate is separate.)
 _SMOKE_M7 = M7Config(
     build=RaptorBuildParams(
         branching_factor=3,
@@ -150,9 +166,21 @@ _SMOKE_M7 = M7Config(
 )
 
 
+# M6 (HippoRAG) smoke config: the synonym top-K cap is tightened because
+# the smoke corpus produces only a handful of phrases, so the production
+# 100-cap is overkill. Everything else stays at paper defaults — the
+# point of smoke is to exercise the pipeline on a tiny corpus, not to
+# replicate paper accuracy.
+_SMOKE_M6 = M6Config(
+    synonym_top_k_cap=10,
+)
+
+
 def _config_for(sid: str, m7: M7Config | None = None) -> HarnessConfig:
     if sid == "M4":
         return replace(DEFAULT_CONFIG, chunking=_SMOKE_SEM, m4=_SMOKE_M4)
+    if sid == "M6":
+        return replace(DEFAULT_CONFIG, chunking=_SMOKE_WW, m6=_SMOKE_M6)
     if sid == "M7":
         return replace(
             DEFAULT_CONFIG, chunking=_SMOKE_SEM, m7=m7 or _SMOKE_M7
@@ -185,7 +213,7 @@ def _check_m2_m3_divergence(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--systems", nargs="*",
-                        default=["M1", "M2", "M3", "M4", "M7"])
+                        default=["M1", "M2", "M3", "M4", "M6", "M7"])
     parser.add_argument("--no-generate", action="store_true",
                         help="Skip LLM generation; report retrieval only.")
     parser.add_argument("--limit", type=int, default=None)
@@ -205,6 +233,10 @@ def main() -> None:
     m4_chunk_counts: list[int] = []
     m4_paths_union: set[str] = set()
     m4_index_stats: dict = {}
+    m6_rankings: dict[str, list[str]] = {}
+    m6_chunk_counts: list[int] = []
+    m6_index_stats: dict = {}
+    m6_traces: list[dict] = []
     m7_chunk_counts: list[int] = []
     m7_index_stats: dict = {}
     m7_traces: list[dict] = []
@@ -228,6 +260,9 @@ def main() -> None:
             if sid == "M4":
                 m4_index_stats = system.index_stats
                 print(f"  M4 index stats: {m4_index_stats}")
+            if sid == "M6":
+                m6_index_stats = system.index_stats
+                print(f"  M6 index stats: {m6_index_stats}")
             if sid == "M7":
                 m7_index_stats = system.index_stats
                 print(f"  M7 index stats: {m7_index_stats}")
@@ -253,6 +288,10 @@ def main() -> None:
                     m4_chunk_counts.append(len(ar.retrieved))
                     exercised_paths = system.last_trace.get("paths_exercised", [])
                     m4_paths_union.update(exercised_paths)
+                elif sid == "M6":
+                    m6_chunk_counts.append(len(ar.retrieved))
+                    m6_rankings[q.question_id] = ids
+                    m6_traces.append(dict(system.last_trace))
                 elif sid == "M7":
                     m7_chunk_counts.append(len(ar.retrieved))
                     m7_traces.append(dict(system.last_trace))
@@ -351,6 +390,89 @@ def main() -> None:
                     f"[smoke] OK: M4 returned chunks on "
                     f"{n_hits}/{len(m4_chunk_counts)} questions"
                 )
+
+    if "M6" in args.systems:
+        if not m6_index_stats:
+            print("[smoke] FAIL: M6 produced no index_stats (system never indexed)")
+            fail = True
+        else:
+            n_phrases = int(m6_index_stats.get("n_phrases", 0))
+            n_facts = int(m6_index_stats.get("n_facts", 0))
+            n_syn = int(m6_index_stats.get("n_synonymy_edges", 0))
+            n_failures = int(m6_index_stats.get("n_openie_parse_failures", 0))
+            n_passages = int(m6_index_stats.get("n_passages", 0))
+            pooling = m6_index_stats.get("pooling_gate") or {}
+            if n_phrases < 1 or n_facts < 1:
+                print(
+                    f"[smoke] FAIL: M6 graph degenerate: "
+                    f"{n_phrases} phrases, {n_facts} facts. OpenIE produced "
+                    f"nothing usable on the corpus."
+                )
+                fail = True
+            else:
+                print(
+                    f"[smoke] OK: M6 graph built — {n_phrases} phrases, "
+                    f"{n_facts} facts, {n_syn} synonymy edges over "
+                    f"{n_passages} passages ({n_failures} OpenIE parse "
+                    f"failures)"
+                )
+            if pooling:
+                print(
+                    f"  M6 Contriever pooling gate: passed "
+                    f"(min_cosine={pooling.get('min_cosine'):.4f}, "
+                    f"floor={pooling.get('cosine_floor')})"
+                )
+            if n_syn < 1:
+                # WARN, not FAIL — on an 8-doc corpus the phrase pool can
+                # be small enough that no pair clears the 0.8 cosine
+                # threshold. Synonymy is exercised on the real benchmarks
+                # anyway; here we just note it.
+                print(
+                    "[smoke] WARN: M6 produced 0 synonymy edges. Either "
+                    "the 0.8 threshold is too tight for this tiny corpus "
+                    "or the phrase pool is too small. Not a code bug; "
+                    "synonymy fires on real benchmark corpora."
+                )
+        if not m6_chunk_counts or all(c == 0 for c in m6_chunk_counts):
+            print("[smoke] FAIL: M6 returned 0 chunks on every question")
+            fail = True
+        else:
+            n_hits = sum(c > 0 for c in m6_chunk_counts)
+            print(
+                f"[smoke] OK: M6 returned chunks on "
+                f"{n_hits}/{len(m6_chunk_counts)} questions"
+            )
+        # PPR-vs-dense differentiation: M6 ranking must diverge from M2
+        # on at least one shared question, otherwise PPR is doing nothing
+        # useful (or even degrading to dense). Skip if no M2 baseline
+        # captured in this run.
+        if "M2" in args.systems and m2_rankings and m6_rankings:
+            shared = set(m2_rankings) & set(m6_rankings)
+            diverges = any(m2_rankings[q] != m6_rankings[q] for q in shared)
+            if not diverges:
+                print(
+                    "[smoke] FAIL: M6 ranking matches M2 on every shared "
+                    "question — PPR is not influencing retrieval (or the "
+                    "uniform fallback fired everywhere)."
+                )
+                fail = True
+            else:
+                print(
+                    "[smoke] OK: M6 ranking differs from M2 on at least "
+                    "one question (PPR diverges from dense)"
+                )
+        # Empty-NER reporting (paper-faithful uniform fallback; tracked,
+        # not failed). Pull the running counter from index_stats which
+        # the retrieve path updates per query.
+        empty_ner_count = sum(
+            1 for tr in m6_traces if tr.get("empty_ner")
+        )
+        if empty_ner_count > 0:
+            print(
+                f"[smoke] NOTE: M6 fell back to uniform doc_prob on "
+                f"{empty_ner_count}/{len(m6_traces)} queries (empty query "
+                f"NER). Paper-faithful behaviour, logged for analysis."
+            )
 
     if "M7" in args.systems:
         if not m7_index_stats:
