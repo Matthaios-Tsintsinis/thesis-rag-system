@@ -51,7 +51,17 @@ from ..cache import (
     save_pickle,
 )
 from ..chunking import Chunk, chunk_corpus
-from ..config import BASE_ANSWER_SYSTEM_PROMPT, DEFAULT_CONFIG, EMBEDDER_MODEL, HarnessConfig
+from ..components import (
+    ResolvedComponents,
+    format_components_log,
+    resolve_components,
+)
+from ..config import (
+    BASE_ANSWER_SYSTEM_PROMPT,
+    DEFAULT_CONFIG,
+    RERANKER_MODEL,
+    HarnessConfig,
+)
 from ..intent import (
     GLOBAL_VIEW_NAME,
     AspectPlan,
@@ -133,6 +143,8 @@ class ThreeAxisSystem(BaseSystem):
         self._id_to_idx: dict[str, int] = {}
         self._index_stats: dict = {}
         self._last_trace: dict = {}
+        # Populated at the top of index(); reused at query time.
+        self._resolved: ResolvedComponents | None = None
 
     # --- index ------------------------------------------------------------
 
@@ -140,9 +152,28 @@ class ThreeAxisSystem(BaseSystem):
         from rank_bm25 import BM25Okapi
 
         m7 = self.config.m7
+        # M7 uses a cross-encoder reranker — its per-system default is
+        # RERANKER_MODEL (bge-reranker-v2-m3). default_reranker is the
+        # fallback when m7.reranker is None (the capability-only state
+        # today); when the per-paper audit assigns a paper-specific
+        # reranker on m7.reranker, this default is bypassed.
+        self._resolved = resolve_components(
+            m7, self.config, default_reranker=RERANKER_MODEL
+        )
+        print(f"[components] {format_components_log(self.system_id, self._resolved)}")
+        chunker_cfg = self._resolved.chunker_config
+        embedder_id = self._resolved.embedder_id
+
         corpus_path = Path(corpus_path)
         chash = corpus_content_hash(corpus_path)
 
+        # Shared RAPTOR substrate key. The substrate extras intentionally
+        # do NOT include embedder_id, chunker_id, or reranker_id:
+        # embedder + chunker are already in the cache key via
+        # compute_cache_key's top-level params, and reranker is
+        # query-time (the substrate does not depend on it). Keeping
+        # substrate_extra unchanged preserves the shared M4/M7 substrate
+        # hash under the default-resolved values.
         substrate_extra = raptor_substrate_extra(
             build=m7.build,
             summary_model=m7.summary_model,
@@ -151,8 +182,8 @@ class ThreeAxisSystem(BaseSystem):
             rrf_k=m7.rrf_k,
         )
         substrate_key = compute_cache_key(
-            chunking_config=self.config.chunking,
-            embedder_model=EMBEDDER_MODEL,
+            chunking_config=chunker_cfg,
+            embedder_model=embedder_id,
             corpus_hash=chash,
             extra=substrate_extra,
         )
@@ -177,32 +208,35 @@ class ThreeAxisSystem(BaseSystem):
         else:
             print(f"[{self.system_id}] substrate cache miss -> build {sdir.path}")
             parsed_docs = list(
-                walk_corpus(
-                    corpus_path, min_chars=self.config.chunking.min_chars_per_doc
-                )
+                walk_corpus(corpus_path, min_chars=chunker_cfg.min_chars_per_doc)
             )
             embedder = (
-                load_embedder()
-                if self.config.chunking.strategy == "semantic"
+                load_embedder(embedder_id)
+                if chunker_cfg.strategy == "semantic"
                 else None
             )
-            self.chunks = chunk_corpus(
-                parsed_docs, self.config.chunking, embedder=embedder
-            )
+            self.chunks = chunk_corpus(parsed_docs, chunker_cfg, embedder=embedder)
             if not self.chunks:
                 raise RuntimeError(f"No chunks produced from {corpus_path}")
-            self.chunk_embeddings = embed_texts([c.text for c in self.chunks])
+            self.chunk_embeddings = embed_texts(
+                [c.text for c in self.chunks], model_name=embedder_id
+            )
             self._bm25 = BM25Okapi([_tokenize(c.text) for c in self.chunks])
 
             def _summarize(passages: list[str]) -> str:
                 return summarize_passages(passages, model=m7.summary_model)
+
+            # embed_fn closed over resolved embedder so summary embeddings
+            # match chunk embeddings.
+            def _embed(texts: list[str]) -> np.ndarray:
+                return embed_texts(texts, model_name=embedder_id)
 
             self._tree = build_raptor_tree(
                 chunk_texts=[c.text for c in self.chunks],
                 chunk_embeddings=self.chunk_embeddings,
                 params=m7.build,
                 summarize_fn=_summarize,
-                embed_fn=embed_texts,
+                embed_fn=_embed,
             )
             self._flat = build_flat_collapsed_index(
                 self._tree,
@@ -226,8 +260,8 @@ class ThreeAxisSystem(BaseSystem):
             Manifest(
                 system_id=RAPTOR_SUBSTRATE_NAMESPACE,
                 cache_key=substrate_key,
-                chunking_config=asdict(self.config.chunking),
-                embedder_model=EMBEDDER_MODEL,
+                chunking_config=asdict(chunker_cfg),
+                embedder_model=embedder_id,
                 corpus_hash=chash,
                 n_chunks=len(self.chunks),
                 files=list(SUBSTRATE_FILES),
@@ -237,14 +271,21 @@ class ThreeAxisSystem(BaseSystem):
         self._id_to_idx = {c.chunk_id: i for i, c in enumerate(self.chunks)}
 
         # --- M7-only artifact: post-hoc chunk -> Docling section ---
+        # reranker_id lives in the M7 system-specific key (NOT in the
+        # shared substrate key) — the cache is rerank-independent at the
+        # substrate level but reflects rerank identity at the M7 level.
+        # Adding this field invalidates the M7 system key one time (the
+        # structural-attach blob rebuilds in seconds); the shared RAPTOR
+        # substrate hash is unaffected.
         m7_extra = {
             **substrate_extra,
             **summarization_identity(model=m7.summary_model),
             "structural_attach_version": STRUCTURAL_ATTACH_VERSION,
+            "reranker_id": self._resolved.reranker_id,
         }
         m7_key = compute_cache_key(
-            chunking_config=self.config.chunking,
-            embedder_model=EMBEDDER_MODEL,
+            chunking_config=chunker_cfg,
+            embedder_model=embedder_id,
             corpus_hash=chash,
             extra=m7_extra,
         )
@@ -257,7 +298,7 @@ class ThreeAxisSystem(BaseSystem):
                 parsed_docs = list(
                     walk_corpus(
                         corpus_path,
-                        min_chars=self.config.chunking.min_chars_per_doc,
+                        min_chars=chunker_cfg.min_chars_per_doc,
                     )
                 )
             self._sections = attach_sections(self.chunks, parsed_docs)
@@ -265,6 +306,10 @@ class ThreeAxisSystem(BaseSystem):
 
         self._index_stats = self._collect_index_stats()
         self._indexed = True
+
+    @property
+    def resolved_components(self) -> ResolvedComponents | None:
+        return self._resolved
 
     def _collect_index_stats(self) -> dict:
         assert self._tree is not None and self._flat is not None
@@ -345,8 +390,9 @@ class ThreeAxisSystem(BaseSystem):
         """Full per-view pipeline: Axis 1a + Axis 1b, RRF-merged, then
         Axis 2. Returns (chunk_id, score) descending."""
         assert self._tree is not None and self.chunk_embeddings is not None
+        assert self._resolved is not None
         m7 = self.config.m7
-        view_vec = embed_texts([view_str])[0]
+        view_vec = embed_texts([view_str], model_name=self._resolved.embedder_id)[0]
 
         collapsed = self._collapsed_ranking(
             view_vec, view_str, use_bm25=use_bm25
@@ -430,6 +476,14 @@ class ThreeAxisSystem(BaseSystem):
             return []
         ids = [c for c, _ in cand]
         passages = [self.chunks[self._id_to_idx[c]].text for c in ids]
+        # TODO(per-paper-audit): thread self._resolved.reranker_id through
+        # to rerank_scores once the per-paper audit assigns a reranker
+        # per system. Today rerank_scores defaults to RERANKER_MODEL
+        # (bge-reranker-v2-m3), which equals self._resolved.reranker_id
+        # under the M7 default, so behaviour is preserved. The reranker
+        # identity is already in the M7 cache key via m7_extra so the
+        # cache reflects any future swap; only this call site stays
+        # constant for now.
         logits = rerank_scores(query, passages)
         scored = [
             (cid, _sigmoid(float(l))) for cid, l in zip(ids, logits.tolist())
@@ -439,8 +493,9 @@ class ThreeAxisSystem(BaseSystem):
     def _preliminary_confidence(self, view_str: str) -> float:
         """§4.2: top-1 cross-encoder score over the first-stage top-K of
         the (paraphrase) view. Sigmoid applied by _rerank."""
+        assert self._resolved is not None
         m7 = self.config.m7
-        view_vec = embed_texts([view_str])[0]
+        view_vec = embed_texts([view_str], model_name=self._resolved.embedder_id)[0]
         ranked = self._collapsed_ranking(
             view_vec, view_str, use_bm25=m7.use_bm25
         )[: m7.scoring.preliminary_rerank_top_k]
@@ -607,7 +662,8 @@ class ThreeAxisSystem(BaseSystem):
             # Multi-branch subtree breadth on the raw query (diagnostic
             # only; one extra traverse, no LLM/rerank).
             assert self._tree is not None and self.chunk_embeddings is not None
-            qv = embed_texts([query])[0]
+            assert self._resolved is not None
+            qv = embed_texts([query], model_name=self._resolved.embedder_id)[0]
             qhits = multi_branch_traverse(
                 self._tree, qv, self.chunk_embeddings, m7.multi_branch
             )

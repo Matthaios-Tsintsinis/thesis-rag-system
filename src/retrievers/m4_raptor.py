@@ -49,10 +49,14 @@ from ..cache import (
     save_pickle,
 )
 from ..chunking import Chunk, chunk_corpus
+from ..components import (
+    ResolvedComponents,
+    format_components_log,
+    resolve_components,
+)
 from ..config import (
     BASE_ANSWER_SYSTEM_PROMPT,
     DEFAULT_CONFIG,
-    EMBEDDER_MODEL,
     HarnessConfig,
 )
 from ..models import embed_texts, generate, load_embedder
@@ -120,6 +124,9 @@ class RaptorSystem(BaseSystem):
         self._index_stats: dict = {}
         # Per-query trace. Populated only when self.config.m4.trace is True.
         self._last_trace: dict = {}
+        # Resolved components: populated at the top of index(); reused at
+        # query time so embedder identity stays consistent across passes.
+        self._resolved: ResolvedComponents | None = None
 
     # --- index ----------------------------------------------------------------
 
@@ -128,11 +135,23 @@ class RaptorSystem(BaseSystem):
         from rank_bm25 import BM25Okapi
 
         m4 = self.config.m4
+        # M4 does not rerank (matches the published RAPTOR paper); the
+        # resolver's default_reranker=None makes that visible in the
+        # resolved bundle and the audit log.
+        self._resolved = resolve_components(m4, self.config, default_reranker=None)
+        print(f"[components] {format_components_log(self.system_id, self._resolved)}")
+        chunker_cfg = self._resolved.chunker_config
+        embedder_id = self._resolved.embedder_id
+
         corpus_path = Path(corpus_path)
         chash = corpus_content_hash(corpus_path)
         # Shared RAPTOR substrate key: no system_id field, so M4 and M7
         # land on the same RAPTOR/<substrate_hash>/ directory and reuse
-        # one copy of chunks/embeddings/bm25/tree/flat index.
+        # one copy of chunks/embeddings/bm25/tree/flat index. The substrate
+        # extras intentionally do NOT include embedder_id, chunker_id, or
+        # reranker_id: embedder + chunker are already in the cache key
+        # via compute_cache_key's top-level params, and reranker is
+        # query-time (the substrate does not depend on it).
         substrate_extra = raptor_substrate_extra(
             build=m4.build,
             summary_model=m4.summary_model,
@@ -141,8 +160,8 @@ class RaptorSystem(BaseSystem):
             rrf_k=m4.rrf_k,
         )
         ckey = compute_cache_key(
-            chunking_config=self.config.chunking,
-            embedder_model=EMBEDDER_MODEL,
+            chunking_config=chunker_cfg,
+            embedder_model=embedder_id,
             corpus_hash=chash,
             extra=substrate_extra,
         )
@@ -166,17 +185,17 @@ class RaptorSystem(BaseSystem):
             return
 
         print(f"[{self.system_id}] cache miss -> building index at {cdir.path}")
-        docs = list(
-            walk_corpus(corpus_path, min_chars=self.config.chunking.min_chars_per_doc)
-        )
+        docs = list(walk_corpus(corpus_path, min_chars=chunker_cfg.min_chars_per_doc))
         embedder = (
-            load_embedder() if self.config.chunking.strategy == "semantic" else None
+            load_embedder(embedder_id) if chunker_cfg.strategy == "semantic" else None
         )
-        self.chunks = chunk_corpus(docs, self.config.chunking, embedder=embedder)
+        self.chunks = chunk_corpus(docs, chunker_cfg, embedder=embedder)
         if not self.chunks:
             raise RuntimeError(f"No chunks produced from {corpus_path}")
 
-        self.chunk_embeddings = embed_texts([c.text for c in self.chunks])
+        self.chunk_embeddings = embed_texts(
+            [c.text for c in self.chunks], model_name=embedder_id
+        )
 
         # BM25 over leaf chunks only — summary nodes are paraphrased text where
         # BM25 is unreliable (PIPELINE_DESIGN section 4.4).
@@ -191,12 +210,17 @@ class RaptorSystem(BaseSystem):
         def _summarize(passages: list[str]) -> str:
             return summarize_passages(passages, model=m4.summary_model)
 
+        # embed_fn is closed over the resolved embedder so summary
+        # embeddings use the same model as chunk embeddings.
+        def _embed(texts: list[str]) -> np.ndarray:
+            return embed_texts(texts, model_name=embedder_id)
+
         self._tree = build_raptor_tree(
             chunk_texts=[c.text for c in self.chunks],
             chunk_embeddings=self.chunk_embeddings,
             params=m4.build,
             summarize_fn=_summarize,
-            embed_fn=embed_texts,
+            embed_fn=_embed,
             on_summary=_on_summary,
         )
         print(
@@ -231,8 +255,8 @@ class RaptorSystem(BaseSystem):
         Manifest(
             system_id=RAPTOR_SUBSTRATE_NAMESPACE,
             cache_key=ckey,
-            chunking_config=asdict(self.config.chunking),
-            embedder_model=EMBEDDER_MODEL,
+            chunking_config=asdict(chunker_cfg),
+            embedder_model=embedder_id,
             corpus_hash=chash,
             n_chunks=len(self.chunks),
             files=list(REQUIRED_FILES),
@@ -243,6 +267,10 @@ class RaptorSystem(BaseSystem):
         ).save(cdir.manifest_path)
 
         self._indexed = True
+
+    @property
+    def resolved_components(self) -> ResolvedComponents | None:
+        return self._resolved
 
     def _collect_index_stats(self, *, summary_calls: int) -> dict:
         assert self._tree is not None and self._flat is not None
@@ -271,6 +299,7 @@ class RaptorSystem(BaseSystem):
 
     def retrieve(self, query: str, k: int | None = None) -> list[RetrievedChunk]:
         self._require_indexed()
+        assert self._resolved is not None
         m4 = self.config.m4
         k = k or m4.top_k_final
         trace_on = m4.trace
@@ -278,7 +307,7 @@ class RaptorSystem(BaseSystem):
         assert self._flat is not None and self._tree is not None
         assert self.chunk_embeddings is not None
 
-        q_vec = embed_texts([query])
+        q_vec = embed_texts([query], model_name=self._resolved.embedder_id)
         q_vec_1d = q_vec[0]
 
         # --- Dense top-K over flat collapsed index (chunks + non-root summaries) ---

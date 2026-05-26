@@ -145,6 +145,15 @@ class M4Config:
     cross-encoder rerank (matches the published paper; rerank is M7's
     contribution, not M4's). Trace is opt-in: smoke flips it on for
     routing-path sanity checks; production benchmarks leave it off.
+
+    The optional `embedder`, `chunker`, `reranker` fields are component
+    overrides resolved by `src.components.resolve_components`. None = use
+    the shared default (EMBEDDER_MODEL for embedder, HarnessConfig.chunking
+    for chunker, no reranker for M4). The index-time LLM is the existing
+    `summary_model` field; the resolver normalises that to its
+    index_llm_id slot. There is no `final_generator` field by design —
+    the answer generator is harness-level (HarnessConfig.generation),
+    held constant across systems.
     """
     build: RaptorBuildParams = field(default_factory=RaptorBuildParams)
     expansion: ExpansionParams = field(default_factory=ExpansionParams)
@@ -153,6 +162,12 @@ class M4Config:
     include_root_in_flat_index: bool = False
     summary_model: str = JUDGE_MODEL  # gpt-4o-mini by project decision
     top_k_final: int = FINAL_CONTEXT_CHUNKS
+
+    # --- component overrides (None = shared default) ---
+    embedder: str | None = None
+    chunker: ChunkingConfig | None = None
+    reranker: str | None = None  # M4 does not rerank; default stays None
+
     trace: bool = False
 
 
@@ -259,6 +274,18 @@ class M7Config:
     first_stage_top_k: int = FIRST_STAGE_TOP_K
     rrf_k: int = RRF_K
     include_root_in_flat_index: bool = False
+
+    # --- component overrides (None = shared default) ---
+    # Resolved by src.components.resolve_components. The reranker default
+    # for M7 is RERANKER_MODEL (bge-reranker-v2-m3), passed by the M7
+    # resolve_components(..., default_reranker=RERANKER_MODEL) call site;
+    # `reranker=None` here means "use that per-system default", not "no
+    # reranker". Embedder/chunker fall back to HarnessConfig defaults.
+    # No `final_generator` field — final generator is harness-level
+    # (HarnessConfig.generation), held constant across systems.
+    embedder: str | None = None
+    chunker: ChunkingConfig | None = None
+    reranker: str | None = None
 
     # --- M7 query-time sub-configs ---
     aspects: AspectParams = field(default_factory=AspectParams)

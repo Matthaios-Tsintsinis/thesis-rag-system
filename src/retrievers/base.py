@@ -1,9 +1,10 @@
 """BaseSystem ABC.
 
-Every benchmarked system (M1-M4, M6, M7) implements this interface (M5
-and M8 are archived under src/retrievers/deprecated/). The harness
-treats each system as a black box: `index(corpus_path)` once, then
-`answer(query)` per question.
+The active benchmarked roster is M1, M2, M3, M4, M7 (and M6 once
+HippoRAG lands); M5 (GraphRAG) and M8 (hierarchical cluster-tree port)
+are archived under src/retrievers/deprecated/. The harness treats each
+system as a black box: `index(corpus_path)` once, then `answer(query)`
+per question.
 
 `retrieve` is exposed separately so the harness can score retrieval
 quality (Recall@k, RAGAS context_precision) independently from answer

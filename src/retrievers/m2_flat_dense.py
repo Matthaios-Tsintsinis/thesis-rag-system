@@ -26,10 +26,14 @@ from ..cache import (
     save_embeddings,
 )
 from ..chunking import Chunk, chunk_corpus
+from ..components import (
+    ResolvedComponents,
+    format_components_log,
+    resolve_components,
+)
 from ..config import (
     BASE_ANSWER_SYSTEM_PROMPT,
     DEFAULT_CONFIG,
-    EMBEDDER_MODEL,
     HarnessConfig,
 )
 from ..models import embed_texts, generate, load_embedder
@@ -47,15 +51,25 @@ class FlatDenseSystem(BaseSystem):
         super().__init__(config)
         self.chunks: list[Chunk] = []
         self._index: Any | None = None  # faiss.IndexFlatIP
+        # Populated at the top of index(); used at query time by retrieve()
+        # so embedder identity is consistent across index and query.
+        self._resolved: ResolvedComponents | None = None
 
     def index(self, corpus_path: Path) -> None:
         import faiss
 
+        # M2 has no per-system Config namespace today (it does not override
+        # any component); the None path returns pure shared defaults.
+        self._resolved = resolve_components(None, self.config)
+        print(f"[components] {format_components_log(self.system_id, self._resolved)}")
+        chunker_cfg = self._resolved.chunker_config
+        embedder_id = self._resolved.embedder_id
+
         corpus_path = Path(corpus_path)
         chash = corpus_content_hash(corpus_path)
         ckey = compute_cache_key(
-            chunking_config=self.config.chunking,
-            embedder_model=EMBEDDER_MODEL,
+            chunking_config=chunker_cfg,
+            embedder_model=embedder_id,
             corpus_hash=chash,
         )
         cdir = CacheDir(paths.cache_dir(), self.system_id, ckey)
@@ -68,17 +82,15 @@ class FlatDenseSystem(BaseSystem):
             return
 
         print(f"[{self.system_id}] cache miss → building index at {cdir.path}")
-        docs = list(
-            walk_corpus(corpus_path, min_chars=self.config.chunking.min_chars_per_doc)
-        )
+        docs = list(walk_corpus(corpus_path, min_chars=chunker_cfg.min_chars_per_doc))
         embedder = (
-            load_embedder() if self.config.chunking.strategy == "semantic" else None
+            load_embedder(embedder_id) if chunker_cfg.strategy == "semantic" else None
         )
-        self.chunks = chunk_corpus(docs, self.config.chunking, embedder=embedder)
+        self.chunks = chunk_corpus(docs, chunker_cfg, embedder=embedder)
         if not self.chunks:
             raise RuntimeError(f"No chunks produced from {corpus_path}")
 
-        embeddings = embed_texts([c.text for c in self.chunks])
+        embeddings = embed_texts([c.text for c in self.chunks], model_name=embedder_id)
         index = faiss.IndexFlatIP(embeddings.shape[1])
         index.add(embeddings)
         self._index = index
@@ -89,8 +101,8 @@ class FlatDenseSystem(BaseSystem):
         Manifest(
             system_id=self.system_id,
             cache_key=ckey,
-            chunking_config=asdict(self.config.chunking),
-            embedder_model=EMBEDDER_MODEL,
+            chunking_config=asdict(chunker_cfg),
+            embedder_model=embedder_id,
             corpus_hash=chash,
             n_chunks=len(self.chunks),
             files=list(REQUIRED_FILES),
@@ -98,10 +110,15 @@ class FlatDenseSystem(BaseSystem):
 
         self._indexed = True
 
+    @property
+    def resolved_components(self) -> ResolvedComponents | None:
+        return self._resolved
+
     def retrieve(self, query: str, k: int | None = None) -> list[RetrievedChunk]:
         self._require_indexed()
+        assert self._resolved is not None
         k = k or self.config.retrieval.top_k
-        q_vec = embed_texts([query])
+        q_vec = embed_texts([query], model_name=self._resolved.embedder_id)
         scores, idxs = self._index.search(q_vec, k)
         out: list[RetrievedChunk] = []
         for rank, (i, s) in enumerate(zip(idxs[0].tolist(), scores[0].tolist())):

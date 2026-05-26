@@ -29,10 +29,14 @@ from ..cache import (
     save_pickle,
 )
 from ..chunking import Chunk, chunk_corpus
+from ..components import (
+    ResolvedComponents,
+    format_components_log,
+    resolve_components,
+)
 from ..config import (
     BASE_ANSWER_SYSTEM_PROMPT,
     DEFAULT_CONFIG,
-    EMBEDDER_MODEL,
     HarnessConfig,
 )
 from ..models import embed_texts, generate, load_embedder
@@ -68,16 +72,25 @@ class HybridRRFSystem(BaseSystem):
         self.chunks: list[Chunk] = []
         self._dense_index: Any | None = None
         self._bm25: Any | None = None
+        # Populated at the top of index(); reused at query time.
+        self._resolved: ResolvedComponents | None = None
 
     def index(self, corpus_path: Path) -> None:
         import faiss
         from rank_bm25 import BM25Okapi
 
+        # M3 has no per-system Config namespace today; None-path returns
+        # pure shared defaults.
+        self._resolved = resolve_components(None, self.config)
+        print(f"[components] {format_components_log(self.system_id, self._resolved)}")
+        chunker_cfg = self._resolved.chunker_config
+        embedder_id = self._resolved.embedder_id
+
         corpus_path = Path(corpus_path)
         chash = corpus_content_hash(corpus_path)
         ckey = compute_cache_key(
-            chunking_config=self.config.chunking,
-            embedder_model=EMBEDDER_MODEL,
+            chunking_config=chunker_cfg,
+            embedder_model=embedder_id,
             corpus_hash=chash,
             extra={"sparse": "bm25okapi", "fusion": "rrf", "rrf_k": self.config.retrieval.rrf_k},
         )
@@ -92,17 +105,15 @@ class HybridRRFSystem(BaseSystem):
             return
 
         print(f"[{self.system_id}] cache miss → building index at {cdir.path}")
-        docs = list(
-            walk_corpus(corpus_path, min_chars=self.config.chunking.min_chars_per_doc)
-        )
+        docs = list(walk_corpus(corpus_path, min_chars=chunker_cfg.min_chars_per_doc))
         embedder = (
-            load_embedder() if self.config.chunking.strategy == "semantic" else None
+            load_embedder(embedder_id) if chunker_cfg.strategy == "semantic" else None
         )
-        self.chunks = chunk_corpus(docs, self.config.chunking, embedder=embedder)
+        self.chunks = chunk_corpus(docs, chunker_cfg, embedder=embedder)
         if not self.chunks:
             raise RuntimeError(f"No chunks produced from {corpus_path}")
 
-        embeddings = embed_texts([c.text for c in self.chunks])
+        embeddings = embed_texts([c.text for c in self.chunks], model_name=embedder_id)
         dense_index = faiss.IndexFlatIP(embeddings.shape[1])
         dense_index.add(embeddings)
         self._dense_index = dense_index
@@ -116,8 +127,8 @@ class HybridRRFSystem(BaseSystem):
         Manifest(
             system_id=self.system_id,
             cache_key=ckey,
-            chunking_config=asdict(self.config.chunking),
-            embedder_model=EMBEDDER_MODEL,
+            chunking_config=asdict(chunker_cfg),
+            embedder_model=embedder_id,
             corpus_hash=chash,
             n_chunks=len(self.chunks),
             files=list(REQUIRED_FILES),
@@ -126,12 +137,17 @@ class HybridRRFSystem(BaseSystem):
 
         self._indexed = True
 
+    @property
+    def resolved_components(self) -> ResolvedComponents | None:
+        return self._resolved
+
     def retrieve(self, query: str, k: int | None = None) -> list[RetrievedChunk]:
         self._require_indexed()
+        assert self._resolved is not None
         cfg = self.config.retrieval
         k = k or cfg.top_k
 
-        q_vec = embed_texts([query])
+        q_vec = embed_texts([query], model_name=self._resolved.embedder_id)
         _, dense_idx = self._dense_index.search(q_vec, cfg.first_stage_top_k)
         dense_ranking = [i for i in dense_idx[0].tolist() if i >= 0]
 
