@@ -55,11 +55,11 @@ from ..components import (
     resolve_components,
 )
 from ..config import (
-    BASE_ANSWER_SYSTEM_PROMPT,
     DEFAULT_CONFIG,
     HarnessConfig,
+    RETRIEVAL_RANKING_DEPTH,
 )
-from ..models import embed_texts, generate, load_embedder
+from ..models import embed_texts, load_embedder
 from ..parsing import walk_corpus
 from ..raptor import (
     RAPTOR_SUBSTRATE_NAMESPACE,
@@ -301,7 +301,10 @@ class RaptorSystem(BaseSystem):
         self._require_indexed()
         assert self._resolved is not None
         m4 = self.config.m4
-        k = k or m4.top_k_final
+        # CK-4: default deep ranking. Top-k bit-identity gate vs prior
+        # 15-deep ranking applies — RRF + expansion deterministic given
+        # the same first_stage_top_k.
+        k = k or RETRIEVAL_RANKING_DEPTH
         trace_on = m4.trace
 
         assert self._flat is not None and self._tree is not None
@@ -332,6 +335,12 @@ class RaptorSystem(BaseSystem):
 
         # --- Per-node-type expansion: walk fused, expand summaries to chunks ---
         chunk_idx_score: dict[int, float] = {}
+        # CK-4: track source unit type per chunk_idx so RetrievedChunk
+        # can carry it through to the analyser. When the same chunk
+        # appears via both a direct chunk-hit and a summary-expanded
+        # hit, the max-score branch wins for the unit type too —
+        # consistent with the score tie-break logic.
+        chunk_idx_unit_type: dict[int, str] = {}
         type_counter: Counter[str] = Counter()
         paths_exercised: set[str] = set()
 
@@ -345,6 +354,7 @@ class RaptorSystem(BaseSystem):
                 ci = int(ref["chunk_idx"])
                 if rrf_score > chunk_idx_score.get(ci, -1.0):
                     chunk_idx_score[ci] = rrf_score
+                    chunk_idx_unit_type[ci] = "chunk"
                 continue
 
             # summary node -> route via §4.4 expansion rules
@@ -373,6 +383,7 @@ class RaptorSystem(BaseSystem):
             for ci in expanded_chunks:
                 if rrf_score > chunk_idx_score.get(ci, -1.0):
                     chunk_idx_score[ci] = rrf_score
+                    chunk_idx_unit_type[ci] = node_type  # summary_low/mid/high
 
         # --- Rank chunks, dedupe by chunk_id, trim to k ---
         ranked = sorted(chunk_idx_score.items(), key=lambda kv: kv[1], reverse=True)
@@ -384,7 +395,14 @@ class RaptorSystem(BaseSystem):
             if chunk.chunk_id in seen_ids:
                 continue
             seen_ids.add(chunk.chunk_id)
-            out.append(RetrievedChunk(chunk=chunk, score=float(score), rank=len(out)))
+            out.append(
+                RetrievedChunk(
+                    chunk=chunk,
+                    score=float(score),
+                    rank=len(out),
+                    source_unit_type=chunk_idx_unit_type.get(ci, "chunk"),
+                )
+            )
             if len(out) >= k:
                 break
 
@@ -399,27 +417,6 @@ class RaptorSystem(BaseSystem):
 
         return out
 
-    # --- answer ---------------------------------------------------------------
-
-    def answer(self, query: str, k: int | None = None) -> AnswerResult:
-        self._require_indexed()
-        t0 = self._now()
-        retrieved = self.retrieve(query, k)
-        context = "\n\n".join(f"[{r.rank + 1}] {r.chunk.text}" for r in retrieved)
-        user_prompt = f"Evidence:\n{context}\n\nQuestion: {query}"
-        ans = generate(
-            system_prompt=BASE_ANSWER_SYSTEM_PROMPT,
-            user_prompt=user_prompt,
-            cfg=self.config.generation,
-        )
-        extra: dict = {}
-        if self.config.m4.trace:
-            extra["trace"] = self.last_trace
-        return AnswerResult(
-            query=query,
-            answer=ans,
-            retrieved=retrieved,
-            latency_s=self._now() - t0,
-            n_retrieval_calls=2,
-            extra=extra,
-        )
+    # answer() inherits BaseSystem default (CK-4 shared packer).
+    # M4's trace is available via the last_trace property; the runner
+    # surfaces it through the existing benchmark stats path.

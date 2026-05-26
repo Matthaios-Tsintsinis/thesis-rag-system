@@ -35,11 +35,11 @@ from ..components import (
     resolve_components,
 )
 from ..config import (
-    BASE_ANSWER_SYSTEM_PROMPT,
     DEFAULT_CONFIG,
     HarnessConfig,
+    RETRIEVAL_RANKING_DEPTH,
 )
-from ..models import embed_texts, generate, load_embedder
+from ..models import embed_texts, load_embedder
 from ..parsing import walk_corpus
 from .base import AnswerResult, BaseSystem, RetrievedChunk
 
@@ -145,7 +145,11 @@ class HybridRRFSystem(BaseSystem):
         self._require_indexed()
         assert self._resolved is not None
         cfg = self.config.retrieval
-        k = k or cfg.top_k
+        # CK-4: default to RETRIEVAL_RANKING_DEPTH (=50). RRF over the
+        # first_stage_top_k dense + sparse rankings is unaffected; the
+        # `[:k]` tail is what changes. Top-15 bit-identity gate
+        # applies — top of RRF-fused 50-deep == top of prior 15-deep.
+        k = k or RETRIEVAL_RANKING_DEPTH
 
         q_vec = embed_texts([query], model_name=self._resolved.embedder_id)
         _, dense_idx = self._dense_index.search(q_vec, cfg.first_stage_top_k)
@@ -161,21 +165,4 @@ class HybridRRFSystem(BaseSystem):
             for rank, (i, s) in enumerate(fused)
         ]
 
-    def answer(self, query: str, k: int | None = None) -> AnswerResult:
-        self._require_indexed()
-        t0 = self._now()
-        retrieved = self.retrieve(query, k)
-        context = "\n\n".join(f"[{r.rank + 1}] {r.chunk.text}" for r in retrieved)
-        user_prompt = f"Evidence:\n{context}\n\nQuestion: {query}"
-        ans = generate(
-            system_prompt=BASE_ANSWER_SYSTEM_PROMPT,
-            user_prompt=user_prompt,
-            cfg=self.config.generation,
-        )
-        return AnswerResult(
-            query=query,
-            answer=ans,
-            retrieved=retrieved,
-            latency_s=self._now() - t0,
-            n_retrieval_calls=2,
-        )
+    # answer() inherits BaseSystem default (CK-4 shared packer).

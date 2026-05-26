@@ -30,7 +30,7 @@ from .. import paths
 from ..cache import CacheDir, Manifest, compute_cache_key, corpus_content_hash, load_chunks, save_chunks
 from ..chunking import Chunk, chunk_corpus
 from ..components import ResolvedComponents, format_components_log, resolve_components
-from ..config import BASE_ANSWER_SYSTEM_PROMPT, DEFAULT_CONFIG, HarnessConfig
+from ..config import DEFAULT_CONFIG, HarnessConfig, RETRIEVAL_RANKING_DEPTH
 from ..hipporag_graph import (
     HippoGraph,
     REQUIRED_FILES,
@@ -56,7 +56,7 @@ from ..hipporag_ppr import (
     run_pagerank,
     uniform_fallback,
 )
-from ..models import embed_texts, generate, load_embedder
+from ..models import embed_texts, load_embedder
 from ..parsing import walk_corpus
 from .base import AnswerResult, BaseSystem, RetrievedChunk
 
@@ -311,7 +311,9 @@ class HippoRAGSystem(BaseSystem):
         assert self._graph is not None
 
         m6 = self.config.m6
-        k = k or m6.top_k_final
+        # CK-4: default to RETRIEVAL_RANKING_DEPTH (=50). Top-k from
+        # the PPR-ranked doc_prob; deeper ranking has identical head.
+        k = k or RETRIEVAL_RANKING_DEPTH
         embedder_id = self._resolved.embedder_id
         openie_llm = self._resolved.index_llm_id
         assert openie_llm is not None
@@ -387,27 +389,10 @@ class HippoRAGSystem(BaseSystem):
             )
         return out
 
-    # --- answer -----------------------------------------------------------
-
-    def answer(self, query: str, k: int | None = None) -> AnswerResult:
-        self._require_indexed()
-        t0 = self._now()
-        retrieved = self.retrieve(query, k)
-        context = "\n\n".join(f"[{r.rank + 1}] {r.chunk.text}" for r in retrieved)
-        user_prompt = f"Evidence:\n{context}\n\nQuestion: {query}"
-        ans = generate(
-            system_prompt=BASE_ANSWER_SYSTEM_PROMPT,
-            user_prompt=user_prompt,
-            cfg=self.config.generation,
-        )
-        return AnswerResult(
-            query=query,
-            answer=ans,
-            retrieved=retrieved,
-            latency_s=self._now() - t0,
-            n_retrieval_calls=1,
-            extra={"trace": dict(self._last_trace)},
-        )
+    # answer() inherits BaseSystem default (CK-4 shared packer).
+    # M6 surfaces its last_trace (empty-NER, n_linked, mode) via the
+    # property; the runner stores trace separately, no need to wrap
+    # it through AnswerResult.extra.
 
 
 __all__ = ["HippoRAGSystem"]

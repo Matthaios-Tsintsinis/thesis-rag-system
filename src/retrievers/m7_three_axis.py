@@ -59,7 +59,10 @@ from ..components import (
 from ..config import (
     BASE_ANSWER_SYSTEM_PROMPT,
     DEFAULT_CONFIG,
+    EVIDENCE_TOKEN_BUDGET,
+    EVIDENCE_TOKEN_BUDGET_TOKENIZER,
     RERANKER_MODEL,
+    RETRIEVAL_RANKING_DEPTH,
     HarnessConfig,
 )
 from ..intent import (
@@ -508,6 +511,11 @@ class ThreeAxisSystem(BaseSystem):
     # --- retrieve ---------------------------------------------------------
 
     def retrieve(self, query: str, k: int | None = None) -> list[RetrievedChunk]:
+        # CK-4: M7's pipeline already returns the quota-allocated set
+        # (bounded by m7.budget.final_context_chunks, which defaults to
+        # RETRIEVAL_RANKING_DEPTH=50 post-CK-4). External callers can
+        # still pass an explicit `k` to clamp; default returns the full
+        # quota-allocated ranking, on which CK-4 pack_context operates.
         sel, _ = self._run_pipeline(query)
         out: list[RetrievedChunk] = []
         for cid, sc in sel:
@@ -516,7 +524,8 @@ class ThreeAxisSystem(BaseSystem):
                 continue
             out.append(
                 RetrievedChunk(
-                    chunk=self.chunks[idx], score=float(sc), rank=len(out)
+                    chunk=self.chunks[idx], score=float(sc), rank=len(out),
+                    source_unit_type="chunk",
                 )
             )
         if k is not None:
@@ -722,7 +731,47 @@ class ThreeAxisSystem(BaseSystem):
         selected, state = self._run_pipeline(query)
         m7 = self.config.m7
         plans: list[AspectPlan] = state["plans"]
-        sel_set = {c for c, _ in selected}
+
+        # --- CK-4: shared context-budget packing ---
+        # Build the full retrieved ranking (used by CK-2 + as input to
+        # pack_context). M7's quota machinery already produced
+        # `selected` in aspect-grouped, score-ordered form; pack_context
+        # preserves that order so the budget cutoff drops the lowest-
+        # quota-priority chunks first. Quota-preserving guarantees hold
+        # for the prefix that fits in budget.
+        from ..prompt_packing import count_tokens, pack_context
+
+        full_retrieved: list[RetrievedChunk] = []
+        for cid, sc in selected:
+            idx = self._id_to_idx.get(cid)
+            if idx is None:
+                continue
+            full_retrieved.append(
+                RetrievedChunk(
+                    chunk=self.chunks[idx],
+                    score=float(sc),
+                    rank=len(full_retrieved),
+                    # M7 expands summary-node hits into chunk-level
+                    # results before the prompt is built, so every
+                    # RetrievedChunk M7 emits is "chunk" at the unit
+                    # level. Finer axis-level attribution (which axis
+                    # produced each chunk) is a separate analysis;
+                    # not part of CK-4 instrumentation.
+                    source_unit_type="chunk",
+                )
+            )
+        packed, evidence_tokens, _evidence_block = pack_context(
+            full_retrieved,
+            token_budget=EVIDENCE_TOKEN_BUDGET,
+            tokenizer_name=EVIDENCE_TOKEN_BUDGET_TOKENIZER,
+        )
+        # sel_set is the set of chunk_ids the downstream block-builders
+        # use to decide which chunks survive into the prompt. Restrict
+        # to the packed subset so the M7-structured prompt naturally
+        # honours the shared budget — aspect headers + orientations
+        # still render, but only over chunks that fit.
+        packed_cids = {p.chunk.chunk_id for p in packed}
+        sel_set = packed_cids
 
         thr = m7.abstention.retrieval_confidence_threshold
         abstained: list[str] = []
@@ -834,20 +883,22 @@ class ThreeAxisSystem(BaseSystem):
             system_prompt = BASE_ANSWER_SYSTEM_PROMPT
 
         user_prompt = f"Evidence:\n{context}\n\nQuestion: {query}"
+        # CK-4: measure the FULL assembled prompt tokens (system +
+        # user) — includes M7's per-aspect structural overhead
+        # (headers, orientation lines, retrieval-confidence markers).
+        # This is the analytic n_input_tokens; evidence_tokens above
+        # is the chunks-only budget that --check-budget-equality
+        # asserts ±5% on.
+        n_input_tokens = count_tokens(
+            system_prompt + "\n" + user_prompt,
+            tokenizer_name=EVIDENCE_TOKEN_BUDGET_TOKENIZER,
+        )
         ans = generate(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             cfg=self.config.generation,
         )
 
-        retrieved = [
-            RetrievedChunk(
-                chunk=self.chunks[self._id_to_idx[c]], score=float(s),
-                rank=i,
-            )
-            for i, (c, s) in enumerate(selected)
-            if c in self._id_to_idx
-        ]
         extra: dict = {
             "abstained_aspects": abstained,
             "n_aspects": len(plans),
@@ -858,11 +909,14 @@ class ThreeAxisSystem(BaseSystem):
         return AnswerResult(
             query=query,
             answer=ans,
-            retrieved=retrieved,
+            retrieved=full_retrieved,
+            packed=packed,
             latency_s=self._now() - t0,
             n_retrieval_calls=state.get(
                 "n_retrieval_calls", sum(len(p.views) for p in plans) + 1
             ),
+            n_input_tokens=n_input_tokens,
+            evidence_tokens=evidence_tokens,
             extra=extra,
         )
 

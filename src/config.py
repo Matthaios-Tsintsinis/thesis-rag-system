@@ -36,6 +36,25 @@ FINAL_CONTEXT_CHUNKS = 15
 FIRST_STAGE_TOP_K = 50
 RRF_K = 60                       # Cormack et al. (2009)
 
+# CK-4 (shared context-budget). Every active system's BaseSystem.answer()
+# retrieves a deep ranking up to RETRIEVAL_RANKING_DEPTH, then a shared
+# packer (src.prompt_packing.pack_context) selects the top-by-rank
+# chunks that fit in EVIDENCE_TOKEN_BUDGET tokens (measured via tiktoken
+# on the gpt-4o-mini encoding). This equalises generator-context volume
+# across systems so M7's per-aspect quota and other systems' static
+# top-k stop being a confound for answer-quality scoring. See
+# docs/PROJECT_BRIEF.md "CK-4" for the rationale.
+#
+# 3000 tokens ≈ baselines' current behaviour (15 chunks × ~200 tok
+# QASPER paragraphs). Chosen to MINIMISE baseline disturbance — M7
+# rises to meet them rather than the floor rising for everyone. The
+# round 3000 is for QASPER; CK-3 will assign per-benchmark budgets
+# (MultiHop articles are ~1000 tok so 3000 = ~3 articles; will need
+# a higher budget there).
+EVIDENCE_TOKEN_BUDGET = 3000
+EVIDENCE_TOKEN_BUDGET_TOKENIZER = "gpt-4o-mini"
+RETRIEVAL_RANKING_DEPTH = 50
+
 
 # --- Chunking -------------------------------------------------------------
 # Two strategies, selected per HarnessConfig.chunking.strategy:
@@ -288,11 +307,23 @@ class AspectScoringParams:
 
 @dataclass(frozen=True)
 class BudgetParams:
-    """§4.3 final-context budget allocation."""
-    final_context_chunks: int = FINAL_CONTEXT_CHUNKS  # 15 = 13 aspect + 2 global
+    """§4.3 final-context budget allocation.
+
+    CK-4 update: defaults bumped from {final_context_chunks=15,
+    max_chunks_per_aspect=8} to {50, 25} so M7's quota machinery
+    distributes over the shared RETRIEVAL_RANKING_DEPTH=50 budget the
+    rest of the systems also retrieve. The shared packer
+    (src.prompt_packing.pack_context) then enforces the token-level
+    EVIDENCE_TOKEN_BUDGET=3000 at prompt-build time uniformly across
+    all systems. The quota algorithm itself is unchanged — same
+    proportional split, same per-aspect clamps, just sized to the
+    deeper budget so M7 doesn't self-handicap to 8-12 chunks while
+    baselines feed 15.
+    """
+    final_context_chunks: int = RETRIEVAL_RANKING_DEPTH  # 50 post-CK-4
     global_view_quota: int = 2
     min_chunks_per_aspect: int = 2
-    max_chunks_per_aspect: int = 8
+    max_chunks_per_aspect: int = 25
 
 
 @dataclass(frozen=True)

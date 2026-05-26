@@ -174,6 +174,15 @@ class ScoredQuery:
     Carries everything a downstream analysis script needs: the
     benchmark + system identity, the predicted answer text, both
     score blocks, and per-query metadata for slicing.
+
+    CK-4 fields (n_packed, evidence_tokens, n_input_tokens,
+    retrieved_unit_types, packed_unit_types) are populated by the
+    runner from the AnswerResult. evidence_tokens IS the quantity
+    --check-budget-equality measures (chunks-only, budget-controlled).
+    n_input_tokens is the full prompt for analysis visibility. The
+    unit-type dicts let the analyser slice by retrieval-unit class —
+    "chunk" for raw-chunk systems, "summary_low" / "_mid" / "_high"
+    for M4 summary-expanded hits.
     """
 
     system_id: str
@@ -188,6 +197,12 @@ class ScoredQuery:
     question_type: str
     latency_s: float
     n_retrieved: int
+    # CK-4 instrumentation
+    n_packed: int = 0
+    evidence_tokens: int = 0
+    n_input_tokens: int = 0
+    retrieved_unit_types: dict[str, int] = field(default_factory=dict)
+    packed_unit_types: dict[str, int] = field(default_factory=dict)
     metadata: dict = field(default_factory=dict)
 
 

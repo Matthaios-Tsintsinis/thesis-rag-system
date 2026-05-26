@@ -7,6 +7,8 @@ numpy>=2.1,<3                    # Floored at 2.1 to stay on the numpy 2.x ABI
 sentence-transformers>=3.0      # bge-m3 embedder + bge-reranker-v2-m3 cross-encoder
 faiss-cpu>=1.8                  # swap to faiss-gpu on CUDA hosts
 rank-bm25>=0.2.2
+tiktoken>=0.7                   # CK-4 shared token-budget context packer
+                                # (encoding_for_model("gpt-4o-mini"))
 
 # --- Parsing (single PDF backend across all systems; M7 will use the
 #     structural-metadata payload Docling produces) ---

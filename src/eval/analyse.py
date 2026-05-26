@@ -77,6 +77,9 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
     by_system: dict[str, dict[str, list]] = defaultdict(
         lambda: {
             "chunk_counts": [],
+            "packed_counts": [],
+            "evidence_tokens": [],
+            "input_tokens": [],
             "retr_f1": [],
             "retr_recall": [],
             "retr_precision": [],
@@ -84,6 +87,8 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
             "ans_score": [],
             "abstained": 0,
             "latency": [],
+            "retrieved_unit_types_agg": defaultdict(int),
+            "packed_unit_types_agg": defaultdict(int),
             "by_type_chunk_counts": defaultdict(list),
             "by_type_retr_f1": defaultdict(list),
             "by_type_ans_score": defaultdict(list),
@@ -98,7 +103,15 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
         bucket = by_system[sid]
 
         bucket["chunk_counts"].append(int(r.get("n_retrieved", 0)))
+        bucket["packed_counts"].append(int(r.get("n_packed", 0)))
+        bucket["evidence_tokens"].append(int(r.get("evidence_tokens", 0)))
+        bucket["input_tokens"].append(int(r.get("n_input_tokens", 0)))
         bucket["latency"].append(float(r.get("latency_s", 0.0)))
+
+        for ut, n in (r.get("retrieved_unit_types") or {}).items():
+            bucket["retrieved_unit_types_agg"][ut] += int(n)
+        for ut, n in (r.get("packed_unit_types") or {}).items():
+            bucket["packed_unit_types_agg"][ut] += int(n)
 
         retr = r.get("retrieval") or {}
         if retr.get("skipped"):
@@ -129,6 +142,11 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
         out["systems"][sid] = {
             "n_queries": n_q,
             "chunk_count": _safe_stats(b["chunk_counts"]),
+            "packed_count": _safe_stats(b["packed_counts"]),
+            "evidence_tokens": _safe_stats(b["evidence_tokens"]),
+            "input_tokens": _safe_stats(b["input_tokens"]),
+            "retrieved_unit_types": dict(b["retrieved_unit_types_agg"]),
+            "packed_unit_types": dict(b["packed_unit_types_agg"]),
             "retr_f1_mean": (statistics.mean(b["retr_f1"]) if b["retr_f1"] else None),
             "retr_recall_mean": (
                 statistics.mean(b["retr_recall"]) if b["retr_recall"] else None
@@ -184,14 +202,14 @@ def _print_text(rollup: dict[str, Any], *, by_type: bool) -> None:
     cols = [
         ("system", 8),
         ("n_q", 5),
-        ("chunks_mean", 11),
-        ("chunks_min", 10),
-        ("chunks_max", 10),
+        ("chunks", 8),
+        ("packed", 8),
+        ("ev_tok", 8),
+        ("in_tok", 8),
         ("retr_f1", 8),
-        ("retr_rec", 9),
         ("ans", 7),
         ("abstain%", 9),
-        ("retr_skip", 9),
+        ("skip", 5),
         ("lat_s", 7),
     ]
     header = "  ".join(name.ljust(w) for name, w in cols)
@@ -202,17 +220,31 @@ def _print_text(rollup: dict[str, Any], *, by_type: bool) -> None:
         row = [
             (sid, 8),
             (str(s["n_queries"]), 5),
-            (_fmt(s["chunk_count"].get("mean")), 11),
-            (str(s["chunk_count"].get("min", "n/a")), 10),
-            (str(s["chunk_count"].get("max", "n/a")), 10),
+            (_fmt(s["chunk_count"].get("mean"), places=1), 8),
+            (_fmt(s["packed_count"].get("mean"), places=1), 8),
+            (_fmt(s["evidence_tokens"].get("mean"), places=0), 8),
+            (_fmt(s["input_tokens"].get("mean"), places=0), 8),
             (_fmt(s["retr_f1_mean"]), 8),
-            (_fmt(s["retr_recall_mean"]), 9),
             (_fmt(s["ans_score_mean"]), 7),
             (_fmt(s["abstention_rate"] * 100, places=1) + "%", 9),
-            (str(s["retr_n_skipped"]), 9),
+            (str(s["retr_n_skipped"]), 5),
             (_fmt(s["latency_s_mean"], places=2), 7),
         ]
         print("  ".join(val.ljust(w) for val, w in row))
+
+    # Unit-type distribution (per-system).
+    print("\n  --- retrieved unit-type distribution ---")
+    for sid in rollup["systems"]:
+        ut = rollup["systems"][sid].get("retrieved_unit_types") or {}
+        if ut:
+            parts = ", ".join(f"{k}={v}" for k, v in sorted(ut.items()))
+            print(f"  {sid}: {parts}")
+    print("  --- packed unit-type distribution ---")
+    for sid in rollup["systems"]:
+        ut = rollup["systems"][sid].get("packed_unit_types") or {}
+        if ut:
+            parts = ", ".join(f"{k}={v}" for k, v in sorted(ut.items()))
+            print(f"  {sid}: {parts}")
 
     if not by_type:
         return
@@ -271,6 +303,19 @@ def main() -> None:
         action="store_true",
         help="Also print per-question-type rows under each system.",
     )
+    parser.add_argument(
+        "--check-budget-equality",
+        action="store_true",
+        help="Assert all systems' mean evidence_tokens fall within "
+        "±5%% of the cross-system mean. CK-4 invariant check — the "
+        "point of the whole change. Exits non-zero on violation.",
+    )
+    parser.add_argument(
+        "--budget-equality-tolerance",
+        type=float,
+        default=0.05,
+        help="Fractional tolerance for --check-budget-equality. Default 0.05 (±5%%).",
+    )
     args = parser.parse_args()
 
     raw_inputs = (args.inputs or []) + (args.inputs_named or [])
@@ -295,6 +340,39 @@ def main() -> None:
             encoding="utf-8",
         )
         print(f"\n[analyse] rollup -> {args.output}")
+
+    if args.check_budget_equality:
+        # Compare mean evidence_tokens across systems; flag outliers.
+        # Skip systems with 0 mean (M1 closed-book legitimately has 0
+        # evidence). Assertion: every non-zero system's mean falls
+        # within (1 ± tol) × cross-system mean.
+        means = []
+        for sid, s in rollup["systems"].items():
+            m = s["evidence_tokens"].get("mean")
+            if m and m > 0:
+                means.append((sid, float(m)))
+        if not means:
+            print("\n[analyse] --check-budget-equality: no system reported "
+                  "non-zero evidence_tokens (CK-4 not applied?).")
+            raise SystemExit(2)
+        avg = sum(m for _, m in means) / len(means)
+        tol = args.budget_equality_tolerance
+        lo, hi = avg * (1.0 - tol), avg * (1.0 + tol)
+        print(f"\n[analyse] --check-budget-equality (tol ±{tol*100:.1f}%):")
+        print(f"  cross-system mean evidence_tokens = {avg:.0f}")
+        print(f"  acceptable band: [{lo:.0f}, {hi:.0f}]")
+        violations = []
+        for sid, m in means:
+            ok = lo <= m <= hi
+            marker = "OK" if ok else "VIOLATION"
+            print(f"    {sid}: {m:.0f}  [{marker}]")
+            if not ok:
+                violations.append((sid, m))
+        if violations:
+            print(f"\n[analyse] FAIL: {len(violations)} system(s) outside "
+                  f"±{tol*100:.1f}% band.")
+            raise SystemExit(2)
+        print("\n[analyse] PASS: all systems within budget-equality band.")
 
 
 if __name__ == "__main__":

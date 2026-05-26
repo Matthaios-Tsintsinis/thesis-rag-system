@@ -33,7 +33,14 @@ from pathlib import Path
 from typing import Sequence, TYPE_CHECKING
 
 from ..chunking import Chunk
-from ..config import DEFAULT_CONFIG, HarnessConfig
+from ..config import (
+    BASE_ANSWER_SYSTEM_PROMPT,
+    DEFAULT_CONFIG,
+    EVIDENCE_TOKEN_BUDGET,
+    EVIDENCE_TOKEN_BUDGET_TOKENIZER,
+    HarnessConfig,
+    RETRIEVAL_RANKING_DEPTH,
+)
 
 if TYPE_CHECKING:
     from ..eval.types import CorpusItem
@@ -44,16 +51,44 @@ class RetrievedChunk:
     chunk: Chunk
     score: float
     rank: int
+    # CK-4: classification of the retrieval unit this RetrievedChunk
+    # came from. "chunk" for raw chunk hits (M2/M3/M6 always; M4/M7
+    # for direct chunk-position flat-index hits). "summary_low" /
+    # "summary_mid" / "summary_high" for M4/M7 flat-index summary-node
+    # hits per `FlatCollapsedIndex.node_types`. "multibranch" for M7
+    # tree-traversal hits whose origin lies outside the flat index.
+    # Default "chunk" preserves back-compat with cached chunks that
+    # pre-date CK-4.
+    source_unit_type: str = "chunk"
 
 
 @dataclass
 class AnswerResult:
     query: str
     answer: str
+    # FULL ranking returned by system.retrieve(). CK-2 retrieval-recall
+    # scores against this — the CK-4 packer does not narrow it.
     retrieved: list[RetrievedChunk] = field(default_factory=list)
+    # CK-4: the subset of `retrieved` that actually fed the generator
+    # after `src.prompt_packing.pack_context` enforced the shared
+    # EVIDENCE_TOKEN_BUDGET. Equal to `retrieved` for M1 (no retrieval)
+    # and for any system whose retrieved set already fits in budget.
+    packed: list[RetrievedChunk] = field(default_factory=list)
     latency_s: float = 0.0
     n_retrieval_calls: int = 0
+    # CK-4: full prompt tokens fed to the generator (system + question
+    # + assembled evidence + any per-system structural overhead like
+    # M7's aspect headers / orientation lines). Captured via tiktoken
+    # on the actual prompt text. ANALYSIS visibility — see how much
+    # each system's prompt actually weighs.
     n_input_tokens: int = 0
+    # CK-4: chunks-only token count of the evidence block AFTER the
+    # shared packer enforced EVIDENCE_TOKEN_BUDGET. THIS is the
+    # quantity --check-budget-equality measures — the experimental
+    # control. For M7 (or any future system) with heavier structural
+    # overhead, n_input_tokens will exceed evidence_tokens; the
+    # difference IS the per-system structural overhead.
+    evidence_tokens: int = 0
     n_output_tokens: int = 0
     extra: dict = field(default_factory=dict)
 
@@ -90,9 +125,65 @@ class BaseSystem(ABC):
     def retrieve(self, query: str, k: int | None = None) -> list[RetrievedChunk]:
         """Return up to k retrieved chunks, ordered by descending score."""
 
-    @abstractmethod
     def answer(self, query: str, k: int | None = None) -> AnswerResult:
-        """Retrieve evidence then generate an answer. Records timing/usage."""
+        """Default retrieve -> pack -> generate -> AnswerResult.
+
+        CK-4 (shared context budget). Every system inherits this method
+        and goes through the uniform path UNLESS the system has a
+        materially different generation pipeline (M1 closed-book; M7
+        per-aspect structured prompt). Per-system overrides MUST also
+        populate AnswerResult.packed and AnswerResult.n_input_tokens
+        so the analyser's --check-budget-equality assertion is
+        meaningful.
+
+        Flow:
+          1. retrieve(query, k=k or RETRIEVAL_RANKING_DEPTH) -> full
+             ranking (used by CK-2 scorer at the runner level).
+          2. pack_context(retrieved, token_budget=EVIDENCE_TOKEN_BUDGET)
+             -> packed subset that fits in budget when formatted as
+             `[N] {text}` separated by `\\n\\n`.
+          3. Assemble user prompt = `Evidence:\\n{evidence}\\n\\n
+             Question: {query}` and pass to generate() with the
+             shared BASE_ANSWER_SYSTEM_PROMPT.
+          4. Return AnswerResult(retrieved=full, packed=packed,
+             n_input_tokens=tokens of full assembled prompt).
+        """
+        # Late import to break the retrievers/base <-> prompt_packing
+        # circular (prompt_packing's tiktoken init touches no retriever
+        # state, so this is safe).
+        from ..models import generate
+        from ..prompt_packing import count_tokens, pack_context
+
+        self._require_indexed()
+        t0 = self._now()
+        if k is None:
+            k = RETRIEVAL_RANKING_DEPTH
+        retrieved = self.retrieve(query, k=k)
+        packed, evidence_tokens, evidence_block = pack_context(
+            retrieved,
+            token_budget=EVIDENCE_TOKEN_BUDGET,
+            tokenizer_name=EVIDENCE_TOKEN_BUDGET_TOKENIZER,
+        )
+        user_prompt = f"Evidence:\n{evidence_block}\n\nQuestion: {query}"
+        n_input_tokens = count_tokens(
+            BASE_ANSWER_SYSTEM_PROMPT + "\n" + user_prompt,
+            tokenizer_name=EVIDENCE_TOKEN_BUDGET_TOKENIZER,
+        )
+        ans = generate(
+            system_prompt=BASE_ANSWER_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
+            cfg=self.config.generation,
+        )
+        return AnswerResult(
+            query=query,
+            answer=ans,
+            retrieved=retrieved,
+            packed=packed,
+            latency_s=self._now() - t0,
+            n_retrieval_calls=1,
+            n_input_tokens=n_input_tokens,
+            evidence_tokens=evidence_tokens,
+        )
 
     def index_items(self, items: Sequence["CorpusItem"]) -> None:
         """Index an in-memory list of CorpusItems (benchmark-eval entry point).

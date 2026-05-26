@@ -114,8 +114,20 @@ class BenchmarkRunner:
                     ar = system.answer(q.question_text)
                     latency_s = time.perf_counter() - t_q
 
+                    # CK-2: score retrieval against the FULL ranking
+                    # (ar.retrieved), independent of CK-4 packing.
                     retr = score_retrieval_ck2(ar.retrieved, q.gold_passage_sets)
                     ans = benchmark.score_answer(ar.answer, q)
+
+                    # CK-4: collect unit-type distributions for analysis.
+                    retrieved_unit_types: dict[str, int] = {}
+                    for r in ar.retrieved:
+                        ut = getattr(r, "source_unit_type", "chunk")
+                        retrieved_unit_types[ut] = retrieved_unit_types.get(ut, 0) + 1
+                    packed_unit_types: dict[str, int] = {}
+                    for r in ar.packed:
+                        ut = getattr(r, "source_unit_type", "chunk")
+                        packed_unit_types[ut] = packed_unit_types.get(ut, 0) + 1
 
                     scored = ScoredQuery(
                         system_id=system.system_id,
@@ -130,6 +142,11 @@ class BenchmarkRunner:
                         question_type=q.question_type,
                         latency_s=latency_s,
                         n_retrieved=len(ar.retrieved),
+                        n_packed=len(ar.packed),
+                        evidence_tokens=int(ar.evidence_tokens),
+                        n_input_tokens=int(ar.n_input_tokens),
+                        retrieved_unit_types=retrieved_unit_types,
+                        packed_unit_types=packed_unit_types,
                         metadata=q.metadata,
                     )
                     fout.write(
