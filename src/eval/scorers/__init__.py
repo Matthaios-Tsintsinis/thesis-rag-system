@@ -16,6 +16,9 @@ from .extractive import (
     token_f1,
     extractive_max_f1,
 )
+from .free_form import (
+    substring_match,
+)
 from .unanswerable import (
     ABSTENTION_PHRASES,
     is_abstention,
@@ -31,6 +34,7 @@ __all__ = [
     "normalize_qasper_answer",
     "token_f1",
     "extractive_max_f1",
+    "substring_match",
     "ABSTENTION_PHRASES",
     "is_abstention",
     "score_abstention",

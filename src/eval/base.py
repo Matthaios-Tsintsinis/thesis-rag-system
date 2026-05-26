@@ -32,9 +32,9 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Iterable, Iterator, Protocol
 
-from ..retrievers.base import BaseSystem
+from ..retrievers.base import BaseSystem, RetrievedChunk
 from .alignment import score_retrieval_ck2
-from .types import AnswerScore, EvalQuery, EvalUnit, ScoredQuery
+from .types import AnswerScore, EvalQuery, EvalUnit, RetrievalScore, ScoredQuery
 
 
 class Benchmark(Protocol):
@@ -54,6 +54,12 @@ class Benchmark(Protocol):
         predicted: str,
         query: EvalQuery,
     ) -> AnswerScore: ...
+
+    def score_retrieval(
+        self,
+        retrieved: list[RetrievedChunk],
+        query: EvalQuery,
+    ) -> RetrievalScore: ...
 
 
 class BenchmarkRunner:
@@ -86,16 +92,29 @@ class BenchmarkRunner:
         *,
         split: str,
         max_units: int | None = None,
+        max_queries: int | None = None,
     ) -> Iterator[ScoredQuery]:
+        """Drive one (system, benchmark, split) pass to JSONL.
+
+        `max_units` caps the EvalUnits processed (one per paper for
+        QASPER; MultiHop has one shared-corpus EvalUnit so max_units<=1
+        is meaningful there). `max_queries` caps TOTAL queries across
+        units — useful for MultiHop where the natural EvalUnit holds
+        2556 queries; pass `--max-queries 50` for a small-sample
+        shared-corpus validation before the full run.
+        """
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         n_units = 0
         n_queries = 0
         t_start = time.perf_counter()
 
         with self.output_path.open("w", encoding="utf-8") as fout:
+            stopped = False
             for unit_idx, unit in enumerate(
                 benchmark.iter_eval_units(split=split, max_units=max_units)
             ):
+                if stopped:
+                    break
                 if self.verbose:
                     print(
                         f"[eval] unit {unit_idx + 1}: corpus_id={unit.corpus_id!r}  "
@@ -110,13 +129,20 @@ class BenchmarkRunner:
                     print(f"  index_s={index_s:.2f}")
 
                 for q in unit.queries:
+                    if max_queries is not None and n_queries >= max_queries:
+                        stopped = True
+                        break
                     t_q = time.perf_counter()
                     ar = system.answer(q.question_text)
                     latency_s = time.perf_counter() - t_q
 
-                    # CK-2: score retrieval against the FULL ranking
-                    # (ar.retrieved), independent of CK-4 packing.
-                    retr = score_retrieval_ck2(ar.retrieved, q.gold_passage_sets)
+                    # Retrieval scoring is benchmark-specific: each
+                    # benchmark implements score_retrieval to combine
+                    # set-F1 (CK-2) with any rank-aware metrics it
+                    # cares about (MultiHop adds Hit@K / MAP@K / MRR).
+                    # Independent of CK-4 packing — reads ar.retrieved
+                    # (full ranking).
+                    retr = benchmark.score_retrieval(ar.retrieved, q)
                     ans = benchmark.score_answer(ar.answer, q)
 
                     # CK-4: collect unit-type distributions for analysis.

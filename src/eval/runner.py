@@ -90,6 +90,15 @@ def main() -> None:
         "meaningful (the dataset is one EvalUnit).",
     )
     parser.add_argument(
+        "--max-queries",
+        type=int,
+        default=None,
+        help="Cap TOTAL queries across units. Useful for MultiHop-RAG "
+        "where the single EvalUnit holds 2556 queries — pass "
+        "`--max-queries 50` for a small-sample shared-corpus "
+        "validation run before the full 2556.",
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Suppress per-unit progress logs (still writes JSONL).",
@@ -149,7 +158,11 @@ def main() -> None:
     sum_retr_skipped = 0
     sum_ans = 0.0
     for scored in runner.run(
-        system, benchmark, split=args.split, max_units=args.max_units
+        system,
+        benchmark,
+        split=args.split,
+        max_units=args.max_units,
+        max_queries=args.max_queries,
     ):
         n_scored += 1
         if scored.retrieval.skipped:

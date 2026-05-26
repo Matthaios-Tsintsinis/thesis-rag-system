@@ -46,6 +46,8 @@ from __future__ import annotations
 import re
 from typing import Any, Iterable
 
+from ..retrievers.base import RetrievedChunk
+from .alignment import score_retrieval_ck2
 from .scorers import (
     extractive_max_f1,
     is_abstention,
@@ -63,6 +65,7 @@ from .types import (
     EvalQuery,
     EvalUnit,
     GoldAnswer,
+    RetrievalScore,
 )
 
 
@@ -367,6 +370,23 @@ class QasperBenchmark:
             return token_f1(predicted, gold.free_form), "abstractive_f1"
         # Unknown type — treat as 0.
         return 0.0, "unknown"
+
+    def score_retrieval(
+        self,
+        retrieved: list[RetrievedChunk],
+        query: EvalQuery,
+    ) -> RetrievalScore:
+        """QASPER: paragraph-level CK-2 set-F1, max over annotators.
+
+        Rank-aware metrics intentionally NOT computed for QASPER:
+          - Gold is paragraph-level not document-level.
+          - Multi-annotator; rank-aware over union vs per-annotator
+            is ambiguous; the MultiHop paper's K-values don't
+            translate cleanly.
+        Leaves hit_at_k / map_at_k / mrr at their RetrievalScore
+        defaults (empty dicts / 0.0).
+        """
+        return score_retrieval_ck2(retrieved, query.gold_passage_sets)
 
     def score_answer(self, predicted: str, query: EvalQuery) -> AnswerScore:
         """Max-over-annotators answer score per QASPER convention."""

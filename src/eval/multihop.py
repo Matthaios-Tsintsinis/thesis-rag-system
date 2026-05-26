@@ -33,7 +33,14 @@ from __future__ import annotations
 import json
 from typing import Any, Iterable
 
-from .scorers import is_abstention, score_abstention, token_f1
+from ..retrievers.base import RetrievedChunk
+from .alignment import score_retrieval_ck2, score_retrieval_rank_aware
+from .scorers import (
+    is_abstention,
+    score_abstention,
+    substring_match,
+    token_f1,
+)
 from .types import (
     ANSWER_TYPE_FREE_FORM,
     ANSWER_TYPE_UNANSWERABLE,
@@ -42,6 +49,7 @@ from .types import (
     EvalQuery,
     EvalUnit,
     GoldAnswer,
+    RetrievalScore,
 )
 
 
@@ -182,32 +190,108 @@ class MultiHopBenchmark:
             return
         yield unit
 
-    def score_answer(self, predicted: str, query: EvalQuery) -> AnswerScore:
-        """Pass-1 skeleton scorer.
+    def score_retrieval(
+        self,
+        retrieved: list[RetrievedChunk],
+        query: EvalQuery,
+    ) -> RetrievalScore:
+        """MultiHop: CK-2 set-F1 + rank-aware (Hit@K, MAP@K, MRR).
 
-        null_query (unanswerable): abstention detection.
-        Other queries: token-F1 vs gold answer as PLACEHOLDER for the
-          paper's LLM-judge metric. Pass-2 swaps in the judge.
+        Merges:
+          - score_retrieval_ck2 over (url, "<whole>") atoms — gives F1
+            consistent with QASPER's scoring shape.
+          - score_retrieval_rank_aware at K=(1, 5, 10) — paper-aligned
+            (MultiHop paper uses MAP@10 + Hit + MRR over supporting
+            docs). Single gold annotator means we read the first
+            (and only) gold_passage_set.
+
+        null_query (empty gold) skips rank-aware (per the helper
+        contract); CK-2 also returns skipped=True. Answer-side
+        abstention scorer handles those queries.
+        """
+        ck2 = score_retrieval_ck2(retrieved, query.gold_passage_sets)
+        gold = query.gold_passage_sets[0] if query.gold_passage_sets else frozenset()
+        rank = score_retrieval_rank_aware(retrieved, gold, k_values=(1, 5, 10))
+        if rank.get("skipped"):
+            return ck2
+        # Merge — extend CK-2 score with rank-aware fields.
+        return RetrievalScore(
+            skipped=ck2.skipped,
+            recall=ck2.recall,
+            precision=ck2.precision,
+            f1=ck2.f1,
+            n_gold=ck2.n_gold,
+            n_covered=ck2.n_covered,
+            n_retrieved_atoms=ck2.n_retrieved_atoms,
+            per_annotator=ck2.per_annotator,
+            hit_at_k=rank["hit_at_k"],
+            map_at_k=rank["map_at_k"],
+            mrr=rank["mrr"],
+        )
+
+    def score_answer(self, predicted: str, query: EvalQuery) -> AnswerScore:
+        """MultiHop answer scorer (Pass-1).
+
+        Primary value:
+          - null_query: score_abstention (1.0 if abstained, else 0.0).
+          - Other queries: token_F1 vs gold.free_form (the
+            QASPER-consistent default; less false-positive-prone than
+            substring). Pass-2 swaps the primary to an LLM judge.
+
+        Metadata always records both `token_f1` AND `substring_match`
+        for analysis — substring's leniency (e.g. boundary-match of a
+        short factual answer inside a longer prediction) catches
+        verbose-but-correct outputs that token-F1 underestimates, but
+        as ruled it stays out of the primary value to avoid inflating
+        Pass-1 accuracy via false positives like "not Apple, it's
+        Samsung" matching gold "Apple". The `max(token_f1, substring)`
+        value is also recorded in metadata for downstream comparison.
         """
         gold = query.gold_answers[0]
         if gold.answer_type == ANSWER_TYPE_UNANSWERABLE:
+            absc = score_abstention(predicted)
+            # Even on null_query, record substring + token_f1 against
+            # the gold string for analytic visibility (how often does
+            # the system fabricate a "factual" answer to a null query).
+            tf1 = token_f1(predicted, gold.free_form) if gold.free_form else 0.0
+            ssm = substring_match(predicted, gold.free_form) if gold.free_form else 0.0
             return AnswerScore(
-                value=score_abstention(predicted),
+                value=absc,
                 method="abstention",
-                per_annotator=(score_abstention(predicted),),
+                per_annotator=(absc,),
+                metadata={
+                    "token_f1": tf1,
+                    "substring_match": ssm,
+                    "max_lenient": max(tf1, ssm),
+                    "pass1_placeholder": True,
+                },
             )
         if is_abstention(predicted):
+            # Answerable question; predicted abstained -> 0.0 primary.
+            # Record substring too for symmetry (will be 0.0).
             return AnswerScore(
                 value=0.0,
                 method="free_form_abstained",
                 per_annotator=(0.0,),
+                metadata={
+                    "token_f1": 0.0,
+                    "substring_match": 0.0,
+                    "max_lenient": 0.0,
+                    "pass1_placeholder": True,
+                },
             )
-        score = token_f1(predicted, gold.free_form)
+        tf1 = token_f1(predicted, gold.free_form)
+        ssm = substring_match(predicted, gold.free_form)
         return AnswerScore(
-            value=score,
-            method="multihop_token_f1_placeholder",
-            per_annotator=(score,),
-            metadata={"pass1_placeholder": True},
+            value=tf1,
+            method="multihop_token_f1",
+            per_annotator=(tf1,),
+            metadata={
+                "token_f1": tf1,
+                "substring_match": ssm,
+                "max_lenient": max(tf1, ssm),
+                "pass1_placeholder": True,
+            },
         )
 
 

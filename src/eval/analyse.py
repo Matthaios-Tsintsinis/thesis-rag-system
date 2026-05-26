@@ -84,6 +84,11 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
             "retr_recall": [],
             "retr_precision": [],
             "retr_skipped": 0,
+            # Rank-aware (MultiHop). hit_at_k / map_at_k are per-K lists
+            # accumulated when present; mrr is a flat list of values.
+            "hit_at_k": defaultdict(list),
+            "map_at_k": defaultdict(list),
+            "mrr": [],
             "ans_score": [],
             "abstained": 0,
             "latency": [],
@@ -121,6 +126,29 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
             bucket["retr_recall"].append(float(retr.get("recall", 0.0)))
             bucket["retr_precision"].append(float(retr.get("precision", 0.0)))
 
+            # Rank-aware metrics (MultiHop): collect when present.
+            # hit_at_k / map_at_k are dicts keyed by K (stringified
+            # after JSON round-trip); mrr is a scalar.
+            for k_str, v in (retr.get("hit_at_k") or {}).items():
+                try:
+                    bucket["hit_at_k"][int(k_str)].append(float(v))
+                except (TypeError, ValueError):
+                    continue
+            for k_str, v in (retr.get("map_at_k") or {}).items():
+                try:
+                    bucket["map_at_k"][int(k_str)].append(float(v))
+                except (TypeError, ValueError):
+                    continue
+            mrr_val = retr.get("mrr")
+            if mrr_val is not None and float(mrr_val) > 0:
+                # Only collect non-zero MRR to avoid flooding queries
+                # where rank-aware was applied but no relevant chunk
+                # was found (legitimate 0); keep the 0s too via the
+                # separate counter.
+                pass
+            if "mrr" in retr:
+                bucket["mrr"].append(float(retr.get("mrr") or 0.0))
+
         ans = r.get("answer") or {}
         bucket["ans_score"].append(float(ans.get("value", 0.0)))
 
@@ -156,6 +184,18 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
             ),
             "retr_n_scored": len(b["retr_f1"]),
             "retr_n_skipped": b["retr_skipped"],
+            # Rank-aware aggregates (empty when only QASPER-style
+            # records were aggregated; populated when MultiHop is in
+            # the input set).
+            "hit_at_k_mean": {
+                k: (statistics.mean(vs) if vs else None)
+                for k, vs in sorted(b["hit_at_k"].items())
+            },
+            "map_at_k_mean": {
+                k: (statistics.mean(vs) if vs else None)
+                for k, vs in sorted(b["map_at_k"].items())
+            },
+            "mrr_mean": (statistics.mean(b["mrr"]) if b["mrr"] else None),
             "ans_score_mean": (statistics.mean(b["ans_score"]) if b["ans_score"] else None),
             "abstention_rate": b["abstained"] / max(1, n_q),
             "latency_s_mean": (statistics.mean(b["latency"]) if b["latency"] else None),
@@ -231,6 +271,37 @@ def _print_text(rollup: dict[str, Any], *, by_type: bool) -> None:
             (_fmt(s["latency_s_mean"], places=2), 7),
         ]
         print("  ".join(val.ljust(w) for val, w in row))
+
+    # Rank-aware retrieval metrics (when present — MultiHop-only).
+    any_rank_aware = any(
+        rollup["systems"][sid].get("mrr_mean") is not None
+        for sid in rollup["systems"]
+    )
+    if any_rank_aware:
+        print("\n  --- rank-aware retrieval (MultiHop) ---")
+        rank_cols = [("system", 8), ("mrr", 7), ("hit@1", 7), ("hit@5", 7),
+                     ("hit@10", 8), ("map@1", 7), ("map@5", 7), ("map@10", 8)]
+        rank_header = "  ".join(name.ljust(w) for name, w in rank_cols)
+        print(rank_header)
+        print("-" * len(rank_header))
+        for sid in rollup["systems"]:
+            s = rollup["systems"][sid]
+            mrr_m = s.get("mrr_mean")
+            if mrr_m is None:
+                continue
+            hits = s.get("hit_at_k_mean") or {}
+            maps = s.get("map_at_k_mean") or {}
+            row = [
+                (sid, 8),
+                (_fmt(mrr_m), 7),
+                (_fmt(hits.get(1)), 7),
+                (_fmt(hits.get(5)), 7),
+                (_fmt(hits.get(10)), 8),
+                (_fmt(maps.get(1)), 7),
+                (_fmt(maps.get(5)), 7),
+                (_fmt(maps.get(10)), 8),
+            ]
+            print("  ".join(val.ljust(w) for val, w in row))
 
     # Unit-type distribution (per-system).
     print("\n  --- retrieved unit-type distribution ---")

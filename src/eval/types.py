@@ -126,15 +126,27 @@ class EvalQuery:
 
 @dataclass(frozen=True)
 class RetrievalScore:
-    """CK-2 retrieval-recall result for one (system, query).
+    """Retrieval-recall result for one (system, query).
 
-    Max-over-annotators per QASPER convention; for MultiHop the single
-    annotator's score is just the max trivially.
+    Two metric families, both optional:
+
+    SET-BASED (CK-2 alignment, `score_retrieval_ck2`):
+      Max-over-annotators set-F1 / recall / precision over the gold
+      atom set. QASPER scoring; back-compat for any benchmark with
+      paragraph-level gold passages. Fields:
+        skipped, recall, precision, f1, n_gold, n_covered,
+        n_retrieved_atoms, per_annotator
+
+    RANK-AWARE (`score_retrieval_rank_aware`):
+      Hit@K / MAP@K / MRR over a single gold atom set. MultiHop-RAG
+      scoring; matches the paper's retrieval metrics. Fields:
+        hit_at_k, map_at_k, mrr
+      Empty dicts / 0.0 mrr when not applicable (e.g. QASPER).
 
     `skipped` is True when all annotators have empty gold sets (every
     annotator either flagged unanswerable OR every piece of evidence
     was table-grounded). Per ruling 5, retrieval recall is not scored
-    in that case — the answer-side abstention scorer handles it instead.
+    in that case — the answer-side abstention scorer handles it.
     """
 
     skipped: bool
@@ -149,6 +161,10 @@ class RetrievalScore:
     # annotator whose gold set was empty (skipped at the annotator
     # level).
     per_annotator: tuple[dict | None, ...] = ()
+    # Rank-aware metrics (MultiHop-RAG; empty for QASPER).
+    hit_at_k: dict[int, float] = field(default_factory=dict)
+    map_at_k: dict[int, float] = field(default_factory=dict)
+    mrr: float = 0.0
 
 
 @dataclass(frozen=True)

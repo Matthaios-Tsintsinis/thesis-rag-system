@@ -129,4 +129,90 @@ def score_retrieval_ck2(
     )
 
 
-__all__ = ["score_retrieval_ck2"]
+def score_retrieval_rank_aware(
+    retrieved: Sequence[RetrievedChunk],
+    gold_atoms: frozenset[tuple[str, str]],
+    *,
+    k_values: tuple[int, ...] = (1, 5, 10),
+) -> dict:
+    """Rank-aware retrieval metrics over a single gold atom set.
+
+    Returns a dict with keys {skipped, hit_at_k, map_at_k, mrr,
+    n_relevant_retrieved, n_gold}. The caller (MultiHopBenchmark.
+    score_retrieval) merges these into a RetrievalScore alongside the
+    CK-2 set-F1 numbers.
+
+    For each retrieved chunk in rank order, mark it relevant iff ANY
+    of its gold_provenance atoms is in `gold_atoms`. Then:
+
+      Hit@K  — 1.0 if any relevant chunk appears within the top-K
+               retrieved, else 0.0.
+      MAP@K  — mean of precision-at-each-relevant-rank within top-K.
+               Standard mean Average Precision over a single query.
+      MRR    — 1 / (rank of first relevant retrieved), 0 if none.
+               1-indexed rank per the standard definition.
+
+    Skip when `gold_atoms` is empty (null_query / unanswerable): the
+    answer-side abstention scorer handles those queries. Returns
+    {"skipped": True} so the caller treats the score as absent
+    rather than 0-everywhere (which would skew the aggregate).
+
+    Used by MultiHop-RAG; QASPER skips this scorer (its gold is
+    paragraph-level multi-annotator, set-F1 via score_retrieval_ck2
+    is the right metric there).
+    """
+    if not gold_atoms:
+        return {"skipped": True}
+
+    # Per-chunk relevance in rank order. A chunk is relevant iff any
+    # of its gold_provenance atoms hits the gold set.
+    relevance: list[bool] = []
+    for r in retrieved:
+        is_rel = False
+        for atom in (r.chunk.gold_provenance or ()):
+            try:
+                parent, span = atom
+                if (str(parent), str(span)) in gold_atoms:
+                    is_rel = True
+                    break
+            except (TypeError, ValueError):
+                continue
+        relevance.append(is_rel)
+
+    n_gold = len(gold_atoms)
+    n_relevant_retrieved = sum(relevance)
+
+    # MRR: 1-indexed rank of first relevant.
+    mrr = 0.0
+    for i, rel in enumerate(relevance):
+        if rel:
+            mrr = 1.0 / (i + 1)
+            break
+
+    hit_at_k: dict[int, float] = {}
+    map_at_k: dict[int, float] = {}
+    for k in k_values:
+        top_k = relevance[:k]
+        hit_at_k[k] = 1.0 if any(top_k) else 0.0
+        # MAP@K: mean precision at each relevant-rank position within
+        # top-K, normalised by min(K, n_gold). Standard.
+        n_relevant_so_far = 0
+        precisions: list[float] = []
+        for i, rel in enumerate(top_k):
+            if rel:
+                n_relevant_so_far += 1
+                precisions.append(n_relevant_so_far / (i + 1))
+        denom = max(1, min(k, n_gold))
+        map_at_k[k] = sum(precisions) / denom
+
+    return {
+        "skipped": False,
+        "hit_at_k": hit_at_k,
+        "map_at_k": map_at_k,
+        "mrr": mrr,
+        "n_relevant_retrieved": n_relevant_retrieved,
+        "n_gold": n_gold,
+    }
+
+
+__all__ = ["score_retrieval_ck2", "score_retrieval_rank_aware"]
