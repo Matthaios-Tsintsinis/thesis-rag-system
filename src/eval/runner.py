@@ -94,14 +94,41 @@ def main() -> None:
         action="store_true",
         help="Suppress per-unit progress logs (still writes JSONL).",
     )
+    parser.add_argument(
+        "--evidence-budget",
+        type=int,
+        default=None,
+        help="OPT-IN CK-4 context-volume ablation: cap the evidence "
+        "block fed to the generator at this many tokens (measured via "
+        "tiktoken gpt-4o-mini). Default OFF — baselines feed their "
+        "natural full retrieval per professor's directive. Pass e.g. "
+        "--evidence-budget 3000 to run an ablation that equalises "
+        "the chunks-only context size across systems for diagnostic "
+        "comparison. Monkey-patches src.config.EVIDENCE_TOKEN_BUDGET "
+        "for the process lifetime.",
+    )
     args = parser.parse_args()
+
+    # Opt-in CK-4 budget. Runs before any system instantiation so the
+    # config constant is in place before pack_context resolves it.
+    if args.evidence_budget is not None and args.evidence_budget > 0:
+        from .. import config as _cfg
+        _cfg.EVIDENCE_TOKEN_BUDGET = int(args.evidence_budget)
+        print(
+            f"[eval] CK-4 ABLATION ENABLED: evidence_budget="
+            f"{args.evidence_budget} tokens (monkey-patched). "
+            f"Default is no-budget; this is an opt-in comparison."
+        )
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
     if args.output is None:
         out_root = paths.output_dir() / "eval"
         out_root.mkdir(parents=True, exist_ok=True)
+        suffix = ""
+        if args.evidence_budget:
+            suffix = f"_budget{args.evidence_budget}"
         args.output = out_root / (
-            f"{args.benchmark}_{args.system}_{args.split}_{stamp}.jsonl"
+            f"{args.benchmark}_{args.system}_{args.split}{suffix}_{stamp}.jsonl"
         )
 
     print(

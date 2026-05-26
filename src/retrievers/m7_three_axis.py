@@ -59,7 +59,6 @@ from ..components import (
 from ..config import (
     BASE_ANSWER_SYSTEM_PROMPT,
     DEFAULT_CONFIG,
-    EVIDENCE_TOKEN_BUDGET,
     EVIDENCE_TOKEN_BUDGET_TOKENIZER,
     RERANKER_MODEL,
     RETRIEVAL_RANKING_DEPTH,
@@ -760,9 +759,12 @@ class ThreeAxisSystem(BaseSystem):
                     source_unit_type="chunk",
                 )
             )
+        # CK-4 opt-in budget — pack_context reads
+        # src.config.EVIDENCE_TOKEN_BUDGET at call time. Default None
+        # means no budget; M7's natural full ranking (un-capped quota)
+        # flows through unchanged. Opt-in ablation via runner CLI.
         packed, evidence_tokens, _evidence_block = pack_context(
             full_retrieved,
-            token_budget=EVIDENCE_TOKEN_BUDGET,
             tokenizer_name=EVIDENCE_TOKEN_BUDGET_TOKENIZER,
         )
         # sel_set is the set of chunk_ids the downstream block-builders

@@ -36,7 +36,6 @@ from ..chunking import Chunk
 from ..config import (
     BASE_ANSWER_SYSTEM_PROMPT,
     DEFAULT_CONFIG,
-    EVIDENCE_TOKEN_BUDGET,
     EVIDENCE_TOKEN_BUDGET_TOKENIZER,
     HarnessConfig,
     RETRIEVAL_RANKING_DEPTH,
@@ -159,9 +158,14 @@ class BaseSystem(ABC):
         if k is None:
             k = RETRIEVAL_RANKING_DEPTH
         retrieved = self.retrieve(query, k=k)
+        # token_budget=None (default) -> packer reads
+        # src.config.EVIDENCE_TOKEN_BUDGET at call time. None by
+        # default = no enforcement (baselines unconstrained, per
+        # professor's directive). Opt-in for ablation via
+        # `python -m src.eval.runner --evidence-budget 3000` which
+        # monkey-patches the config constant before answer() runs.
         packed, evidence_tokens, evidence_block = pack_context(
             retrieved,
-            token_budget=EVIDENCE_TOKEN_BUDGET,
             tokenizer_name=EVIDENCE_TOKEN_BUDGET_TOKENIZER,
         )
         user_prompt = f"Evidence:\n{evidence_block}\n\nQuestion: {query}"

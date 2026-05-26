@@ -36,23 +36,30 @@ FINAL_CONTEXT_CHUNKS = 15
 FIRST_STAGE_TOP_K = 50
 RRF_K = 60                       # Cormack et al. (2009)
 
-# CK-4 (shared context-budget). Every active system's BaseSystem.answer()
-# retrieves a deep ranking up to RETRIEVAL_RANKING_DEPTH, then a shared
-# packer (src.prompt_packing.pack_context) selects the top-by-rank
-# chunks that fit in EVIDENCE_TOKEN_BUDGET tokens (measured via tiktoken
-# on the gpt-4o-mini encoding). This equalises generator-context volume
-# across systems so M7's per-aspect quota and other systems' static
-# top-k stop being a confound for answer-quality scoring. See
-# docs/PROJECT_BRIEF.md "CK-4" for the rationale.
+# CK-4 (shared context-budget machinery, OPT-IN). The packer
+# (src.prompt_packing.pack_context) supports a token budget over the
+# evidence block, but the DEFAULT IS OFF per professor's directive:
+# baselines must run at their natural strength, unconstrained. The
+# budget exists as an ABLATION tool for post-hoc context-volume
+# studies, NOT as an imposed control on the main eval.
 #
-# 3000 tokens ≈ baselines' current behaviour (15 chunks × ~200 tok
-# QASPER paragraphs). Chosen to MINIMISE baseline disturbance — M7
-# rises to meet them rather than the floor rising for everyone. The
-# round 3000 is for QASPER; CK-3 will assign per-benchmark budgets
-# (MultiHop articles are ~1000 tok so 3000 = ~3 articles; will need
-# a higher budget there).
-EVIDENCE_TOKEN_BUDGET = 3000
+# EVIDENCE_TOKEN_BUDGET = None — no budget enforcement by default; each
+# system's natural full retrieval (post-RETRIEVAL_RANKING_DEPTH deep
+# pull and M7's quota un-cap) flows into the generator unchanged.
+#
+# To opt-in for an ablation run, set this constant at runtime via the
+# CLI flag `python -m src.eval.runner --evidence-budget 3000`, which
+# monkey-patches `src.config.EVIDENCE_TOKEN_BUDGET` for the duration
+# of the process. The packer then enforces; the analyser's
+# --check-budget-equality assertion becomes meaningful.
+EVIDENCE_TOKEN_BUDGET: int | None = None
 EVIDENCE_TOKEN_BUDGET_TOKENIZER = "gpt-4o-mini"
+
+# RETRIEVAL_RANKING_DEPTH: deeper candidate pool from retrieve(). NOT a
+# constraint — it gives the packer (when opt-in) a larger menu, and
+# under the no-budget default it lets M7's un-cap quota fill freely.
+# Doesn't limit any system's natural strength: bumping FAISS top-K
+# extends the tail; the head of the ranking is unchanged.
 RETRIEVAL_RANKING_DEPTH = 50
 
 
