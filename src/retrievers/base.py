@@ -24,7 +24,7 @@ do not pre-optimise all six.
 
 from __future__ import annotations
 
-import re
+import hashlib
 import tempfile
 import time
 from abc import ABC, abstractmethod
@@ -91,15 +91,14 @@ class AnswerResult:
     extra: dict = field(default_factory=dict)
 
 
-_ITEM_ID_SANITISE_RE = re.compile(r"[^A-Za-z0-9._-]+")
-
-
 def _safe_item_filename(item_id: str) -> str:
-    """Make an item_id filesystem-safe. Deterministic + collision-resistant for the
-    sanitised characters we see in QASPER + MultiHop ids.
+    """Deterministic 16-hex-char tag for use as a temp filename. The real
+    item_id stays on CorpusItem; this only needs to be filesystem-safe
+    and unique within one tempdir, NOT human-readable or invertible.
+    Bounds length so URL-keyed ids (MultiHop) don't blow Linux's 255-byte
+    filename limit.
     """
-    safe = _ITEM_ID_SANITISE_RE.sub("_", item_id).strip("_")
-    return safe or "item"
+    return hashlib.sha1(item_id.encode("utf-8")).hexdigest()[:16]
 
 
 class BaseSystem(ABC):

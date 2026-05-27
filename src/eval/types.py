@@ -24,10 +24,10 @@ class CorpusItem:
 
     Fields:
       item_id   — globally unique stable id. Convention: f"{parent_id}::{span_id}".
-                  Used by the harness to name temp files when the default
-                  index_items fallback writes to disk before calling
-                  index(corpus_path). MUST be filesystem-safe under the
-                  sanitiser in `BaseSystem._safe_item_filename`.
+                  When the default index_items fallback writes to disk
+                  before calling index(corpus_path), the on-disk filename
+                  is a hash of item_id (see `BaseSystem._safe_item_filename`),
+                  so item_id itself need not be filesystem-safe.
       parent_id — paper_id (QASPER) | article_url (MultiHop). Carried
                   into every produced Chunk's gold_provenance via the
                   default index_items fallback.
