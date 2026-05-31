@@ -26,7 +26,20 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 EMBEDDER_MODEL = "BAAI/bge-m3"
 EMBEDDING_DIM = 1024
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
-GENERATOR_MODEL = "Qwen/Qwen2.5-3B-Instruct"
+# Final-answer generator, shared across ALL systems (M1-M7) by professor
+# decision. Held constant so per-system answer-quality deltas attribute to
+# retrieval, not to generator capacity. Routed by `src.models.generate` to
+# the OpenAI API (any "gpt-*" / "o*" prefix). A local-HF causal LM (e.g.
+# "Qwen/Qwen2.5-3B-Instruct") remains reachable by explicit cfg.model
+# override -- preserved for a future local-vs-API generator ablation, NOT
+# used by the default eval grid.
+GENERATOR_MODEL = "gpt-4o-mini"
+# Index-time LLM (RAPTOR tree summaries, HippoRAG OpenIE). Intentionally
+# the SAME model id as GENERATOR_MODEL today -- distinct semantic roles
+# (answer-time vs index-time judge) but the project decision is to use one
+# OpenAI model across both phases. Kept as a separate constant so the two
+# roles can diverge later (e.g. cheaper judge at index time) without
+# touching every call site.
 JUDGE_MODEL = "gpt-4o-mini"
 
 

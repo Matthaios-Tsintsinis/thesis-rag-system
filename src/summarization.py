@@ -170,22 +170,30 @@ def _get_client() -> Any:
 # Core call ----------------------------------------------------------------
 
 
-def _chat(
-    prompt: str,
+def chat_messages(
+    messages: list[dict[str, str]],
     *,
     model: str,
     max_tokens: int,
     temperature: float,
+    top_p: float = 1.0,
     max_retries: int = 3,
     retry_backoff_s: float = 2.0,
     _label: str = "chat",
 ) -> str:
-    """One single-user-message completion. Returns stripped content.
+    """Multi-message chat completion. Returns stripped content.
 
-    Retries on transient errors (rate limits, timeouts). Non-transient
-    errors (auth, bad request) propagate immediately so misconfiguration
-    surfaces loudly during smoke instead of hiding in retry loops. Shared
-    by the RAPTOR tree summariser and every M7 query-time prompt.
+    Shared OpenAI helper for every API caller in the harness: RAPTOR
+    tree summariser, M7 query-time prompts (via `_chat` below), and the
+    eval-layer answer generator (`models.generate` → `_generate_openai`).
+    All paths share one cached client (`_get_client`) and one retry
+    policy here, so prompt-cache behaviour, rate-limit handling, and
+    transient-error semantics stay consistent across the harness.
+
+    Retries on transient errors (rate limits, timeouts, generic API
+    errors). Non-transient errors (auth, bad request) propagate
+    immediately so misconfiguration surfaces loudly during smoke instead
+    of hiding in retry loops.
     """
     client = _get_client()
 
@@ -205,8 +213,9 @@ def _chat(
         try:
             resp = client.chat.completions.create(
                 model=model,
-                messages=[{"role": "user", "content": prompt}],
+                messages=messages,
                 temperature=temperature,
+                top_p=top_p,
                 max_tokens=max_tokens,
             )
             return (resp.choices[0].message.content or "").strip()
@@ -219,6 +228,33 @@ def _chat(
     raise RuntimeError(
         f"{_label}: exhausted {max_retries} retries against {model}"
     ) from last_exc
+
+
+def _chat(
+    prompt: str,
+    *,
+    model: str,
+    max_tokens: int,
+    temperature: float,
+    max_retries: int = 3,
+    retry_backoff_s: float = 2.0,
+    _label: str = "chat",
+) -> str:
+    """One single-user-message completion. Returns stripped content.
+
+    Thin back-compat wrapper around `chat_messages` for callers that
+    only need a single user-role prompt (summarize_passages,
+    extract_aspects, paraphrase_view, hyde_view).
+    """
+    return chat_messages(
+        [{"role": "user", "content": prompt}],
+        model=model,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        max_retries=max_retries,
+        retry_backoff_s=retry_backoff_s,
+        _label=_label,
+    )
 
 
 def summarize_passages(
@@ -434,4 +470,5 @@ __all__ = [
     "extract_aspects",
     "paraphrase_view",
     "hyde_view",
+    "chat_messages",
 ]
