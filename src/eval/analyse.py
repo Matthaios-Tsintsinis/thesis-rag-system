@@ -106,6 +106,14 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
             "m9_max_conf": [],
             "m9_strips_kept": 0,
             "m9_strips_total": 0,
+            # Multiple-choice extraction stats (QuALITY; answer.metadata
+            # "extraction" key). Per SYSTEM: one system landing
+            # disproportionately in token_f1/unparseable means its
+            # output format fights the extractor — that must be
+            # immediately visible, not buried in zero answer scores.
+            "mc_extraction_counts": defaultdict(int),
+            "mc_abstained": 0,
+            "mc_unparseable": 0,
         }
     )
 
@@ -159,6 +167,16 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
 
         ans = r.get("answer") or {}
         bucket["ans_score"].append(float(ans.get("value", 0.0)))
+
+        # Multiple-choice extraction stats (present on QuALITY rows).
+        ans_md = ans.get("metadata") or {}
+        extraction = ans_md.get("extraction")
+        if extraction:
+            bucket["mc_extraction_counts"][extraction] += 1
+            if ans_md.get("abstained"):
+                bucket["mc_abstained"] += 1
+            if ans_md.get("unparseable"):
+                bucket["mc_unparseable"] += 1
 
         predicted = r.get("predicted_answer", "") or ""
         if is_abstention(predicted):
@@ -250,6 +268,31 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
                     ),
                 }
                 if b["m9_action_counts"]
+                else None
+            ),
+            # Multiple-choice extraction rollup; None when no MC rows.
+            "mc_extraction": (
+                {
+                    "n": sum(b["mc_extraction_counts"].values()),
+                    "methods": {
+                        m: {
+                            "count": c,
+                            "frac": round(
+                                c / max(1, sum(b["mc_extraction_counts"].values())), 4
+                            ),
+                        }
+                        for m, c in sorted(b["mc_extraction_counts"].items())
+                    },
+                    "abstained_rate": (
+                        b["mc_abstained"]
+                        / max(1, sum(b["mc_extraction_counts"].values()))
+                    ),
+                    "unparseable_rate": (
+                        b["mc_unparseable"]
+                        / max(1, sum(b["mc_extraction_counts"].values()))
+                    ),
+                }
+                if b["mc_extraction_counts"]
                 else None
             ),
             "abstention_rate": b["abstained"] / max(1, n_q),
@@ -377,6 +420,28 @@ def _print_text(rollup: dict[str, Any], *, by_type: bool) -> None:
                 f"overlap_jaccard={_fmt(m9.get('overlap_jaccard_mean'))}  "
                 f"max_conf={_fmt(m9.get('max_conf_mean'))}  "
                 f"strips_kept={_fmt(m9.get('strips_kept_frac'))}"
+            )
+
+    # Multiple-choice extraction-method distribution (QuALITY rows),
+    # PER SYSTEM: a system landing disproportionately in
+    # token_f1/unparseable has an output format that fights the
+    # extractor — a prompt/format problem, not a retrieval signal.
+    any_mc = any(
+        rollup["systems"][sid].get("mc_extraction") for sid in rollup["systems"]
+    )
+    if any_mc:
+        print("\n  --- multiple-choice extraction (per system) ---")
+        for sid in rollup["systems"]:
+            mc = rollup["systems"][sid].get("mc_extraction")
+            if not mc:
+                continue
+            dist = ", ".join(
+                f"{m}={v['frac']:.1%}" for m, v in mc["methods"].items()
+            )
+            print(f"  {sid}: n={mc['n']}  {dist}")
+            print(
+                f"  {sid}: abstained={mc['abstained_rate']:.1%}  "
+                f"unparseable={mc['unparseable_rate']:.1%}"
             )
 
     # Unit-type distribution (per-system).

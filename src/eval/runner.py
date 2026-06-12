@@ -35,6 +35,7 @@ from ..retrievers.m9_corrective import CorrectiveRAGSystem
 from .base import BenchmarkRunner
 from .multihop import MultiHopBenchmark
 from .qasper import QasperBenchmark
+from .quality import QualityBenchmark
 
 
 SYSTEM_REGISTRY: dict[str, type[BaseSystem]] = {
@@ -50,6 +51,7 @@ SYSTEM_REGISTRY: dict[str, type[BaseSystem]] = {
 BENCHMARK_REGISTRY: dict[str, type] = {
     "qasper": QasperBenchmark,
     "multihop_rag": MultiHopBenchmark,
+    "quality": QualityBenchmark,
 }
 
 
@@ -67,7 +69,7 @@ def main() -> None:
         "--benchmark",
         required=True,
         choices=sorted(BENCHMARK_REGISTRY),
-        help="Benchmark id (qasper, multihop_rag).",
+        help="Benchmark id (qasper, multihop_rag, quality).",
     )
     parser.add_argument(
         "--split",
