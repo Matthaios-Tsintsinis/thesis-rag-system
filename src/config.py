@@ -459,16 +459,32 @@ class CorrectiveConfig:
     enter any cache key. Deviations from the paper are documented in
     the module comment block (src/retrievers/m9_corrective.py).
 
-    tau_high / tau_low are PROVISIONAL placeholders pending empirical
-    derivation on QASPER validation
-    (scripts/derive_corrective_thresholds.py, follow-up commit). Do not
-    interpret these values; they exist so the system runs end-to-end
-    before calibration. The paper's published thresholds (0.59 / -0.99)
-    live on its fine-tuned-T5 score scale and do not transfer.
+    THRESHOLD PROVENANCE (baked 2026-06-12). Derived empirically by
+    scripts/derive_corrective_thresholds.py on the QASPER VALIDATION
+    20-paper small sample (55 queries; 72 gold / 708 non-gold chunks,
+    base rate 0.0923), artifact
+    derivation_validation_20260612-014811.json. Criterion v2
+    (non-gold percentile / FPR control):
+      tau_high = 0.6395 — 90th percentile of the NON-GOLD confidence
+        distribution (a chunk above it scores higher than ~all
+        known-irrelevant chunks; FPR 0.100 by construction; precision
+        0.193, lift 2.09x over base rate at the cut).
+      tau_low  = 0.5001 — 5th percentile of the GOLD confidence
+        distribution (discarding below it loses ~5% of gold).
+    Derivation-time action mix: 49.1% correct / 50.9% ambiguous /
+    0.0% incorrect; strip survival at tau_strip(=tau_low): 57.2%.
+    The realized mix of every M9 run must roughly match (analyse.py
+    prints it); large drift = miscalibration. Derived ONCE — no
+    per-benchmark tuning; MultiHop transfer is checked via the
+    action-mix logging, not re-derivation. The paper's published
+    thresholds (0.59 / -0.99) live on its fine-tuned-T5 score scale
+    and do not transfer; an absolute-precision criterion (v1) was
+    retired after measuring a 0.50 precision ceiling at every cut —
+    see the CALIBRATION FINDINGS block in m9_corrective.py.
     """
 
-    tau_high: float = 0.7   # max conf >= tau_high -> CORRECT
-    tau_low: float = 0.3    # max conf <  tau_low  -> INCORRECT
+    tau_high: float = 0.6395  # max conf >= tau_high -> CORRECT (non-gold p90)
+    tau_low: float = 0.5001   # max conf <  tau_low  -> INCORRECT (gold p5)
     # Strip-refinement threshold; None -> use tau_low (one fewer free
     # parameter — revisit only if refinement degenerates).
     tau_strip: float | None = None

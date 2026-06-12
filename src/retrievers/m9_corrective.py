@@ -70,6 +70,38 @@ m9_n_strips_kept / m9_n_strips_total.
 #
 # 3. Generator. Shared gpt-4o-mini final generator (professor-locked,
 #    harness-level), not the paper's generators.
+#
+# === CALIBRATION FINDINGS (QASPER validation derivation, 2026-06-12;
+#     artifact derivation_validation_20260612-014811.json) ===
+#
+# WEAK-EVALUATOR FINDING (limitations text). The off-the-shelf
+# cross-encoder's confidence cannot replicate the separation the
+# paper's fine-tuned evaluator implies. Concretely: an absolute
+# precision target (v1 criterion, 0.8) was unreachable — measured
+# precision-against-gold capped at ~0.50 at EVERY cut (gold base rate
+# 0.0923 in the retrieved pools; topically-relevant-but-unannotated
+# chunks count as false positives) — and at the baked tau_high the
+# enrichment is only 2.09x over the base rate. The gold and non-gold
+# confidence distributions are heavily entangled (both confined to
+# [0.5, 0.73]; separation only in the thin upper tail), and the
+# entanglement is partly STRUCTURAL to corpus-internal CRAG: the
+# evaluator only ever sees M3's top-15, i.e. chunks pre-filtered to
+# topical plausibility, so it judges "more vs less plausible among
+# already-plausible," not "relevant vs irrelevant." This is precisely
+# why the paper fine-tuned a dedicated evaluator; reproducing CRAG
+# without that supervision inherits a weaker action signal.
+#
+# PER-BENCHMARK BRANCH BEHAVIOUR. On QASPER the INCORRECT branch is
+# dead at the derived thresholds: it requires ALL 15 chunks below
+# tau_low=0.5001, which never occurs — hybrid retrieval always
+# surfaces something the reranker scores >= 0.5. On QASPER the
+# corrective path therefore operates through the AMBIGUOUS branch
+# only (~51% of queries at derivation time). This is a per-benchmark
+# property, not a code path defect: the per-benchmark action mix is
+# reported for each dataset (analyse.py M9 section), and MultiHop's
+# distribution may differ. Strip refinement is ALIVE at the derived
+# tau_strip (57.2% strip survival; the early smoke's 100% survival
+# was an artifact of the provisional thresholds).
 
 from __future__ import annotations
 
