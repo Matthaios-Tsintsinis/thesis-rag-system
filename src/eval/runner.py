@@ -55,6 +55,25 @@ BENCHMARK_REGISTRY: dict[str, type] = {
 }
 
 
+def _git_commit_short() -> str:
+    """Short HEAD hash for run provenance in summary.json. Never fatal —
+    a clone without git metadata (or no git binary) degrades to
+    "unknown" rather than killing an eval run."""
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+        return out.stdout.strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run one system x one benchmark x one split to JSONL."
@@ -188,6 +207,14 @@ def main() -> None:
         "mean_retrieval_f1": sum_retr_f1 / n_retr_scored,
         "mean_answer_score": sum_ans / max(1, n_scored),
         "benchmark_stats": getattr(benchmark, "stats", {}),
+        # Run-condition provenance (the aggregator's conditions columns;
+        # every matrix row must be self-describing from birth). The
+        # generator field is what keeps Qwen-era and gpt-4o-mini-era
+        # numbers from ever conflating in one table.
+        "generator": system.config.generation.model,
+        "chunking_strategy": system.config.chunking.strategy,
+        "evidence_budget": args.evidence_budget,
+        "git_commit": _git_commit_short(),
         "output_path": str(args.output),
         "timestamp": stamp,
     }
