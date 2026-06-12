@@ -58,6 +58,7 @@ ANSWER_TYPE_ABSTRACTIVE = "abstractive"
 ANSWER_TYPE_YES_NO = "yes_no"
 ANSWER_TYPE_UNANSWERABLE = "unanswerable"
 ANSWER_TYPE_FREE_FORM = "free_form"  # MultiHop-RAG single-string answers
+ANSWER_TYPE_MULTIPLE_CHOICE = "multiple_choice"  # QuALITY 4-option questions
 
 
 @dataclass(frozen=True)
@@ -249,4 +250,5 @@ __all__ = [
     "ANSWER_TYPE_YES_NO",
     "ANSWER_TYPE_UNANSWERABLE",
     "ANSWER_TYPE_FREE_FORM",
+    "ANSWER_TYPE_MULTIPLE_CHOICE",
 ]
