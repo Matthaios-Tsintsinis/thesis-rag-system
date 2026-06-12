@@ -98,6 +98,14 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
             "by_type_retr_f1": defaultdict(list),
             "by_type_ans_score": defaultdict(list),
             "by_type_n": defaultdict(int),
+            # M9 corrective diagnostics (metadata m9_* keys, merged into
+            # ScoredQuery.metadata from AnswerResult.extra by the runner).
+            "m9_action_counts": defaultdict(int),
+            "m9_rewrite_fired": 0,
+            "m9_overlap": [],
+            "m9_max_conf": [],
+            "m9_strips_kept": 0,
+            "m9_strips_total": 0,
         }
     )
 
@@ -156,6 +164,22 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
         if is_abstention(predicted):
             bucket["abstained"] += 1
 
+        # M9 corrective action logging (present only on M9 rows).
+        md = r.get("metadata") or {}
+        m9_action = md.get("m9_action")
+        if m9_action:
+            bucket["m9_action_counts"][m9_action] += 1
+            if md.get("m9_rewrite_fired"):
+                bucket["m9_rewrite_fired"] += 1
+            overlap = md.get("m9_overlap_jaccard")
+            if overlap is not None:
+                bucket["m9_overlap"].append(float(overlap))
+            max_conf = md.get("m9_max_conf")
+            if max_conf is not None:
+                bucket["m9_max_conf"].append(float(max_conf))
+            bucket["m9_strips_kept"] += int(md.get("m9_n_strips_kept") or 0)
+            bucket["m9_strips_total"] += int(md.get("m9_n_strips_total") or 0)
+
         qtype = r.get("question_type", "?")
         bucket["by_type_n"][qtype] += 1
         bucket["by_type_chunk_counts"][qtype].append(int(r.get("n_retrieved", 0)))
@@ -197,6 +221,37 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
             },
             "mrr_mean": (statistics.mean(b["mrr"]) if b["mrr"] else None),
             "ans_score_mean": (statistics.mean(b["ans_score"]) if b["ans_score"] else None),
+            # M9 corrective rollup; None for non-M9 systems. The realized
+            # action mix must roughly match the derivation-time mix from
+            # scripts/derive_corrective_thresholds.py — large drift means
+            # the thresholds are miscalibrated for this corpus; flag
+            # BEFORE trusting the system's answer numbers.
+            "m9_corrective": (
+                {
+                    "n": sum(b["m9_action_counts"].values()),
+                    "action_mix": {
+                        a: round(c / max(1, sum(b["m9_action_counts"].values())), 4)
+                        for a, c in sorted(b["m9_action_counts"].items())
+                    },
+                    "rewrite_fired_rate": (
+                        b["m9_rewrite_fired"]
+                        / max(1, sum(b["m9_action_counts"].values()))
+                    ),
+                    "overlap_jaccard_mean": (
+                        statistics.mean(b["m9_overlap"]) if b["m9_overlap"] else None
+                    ),
+                    "max_conf_mean": (
+                        statistics.mean(b["m9_max_conf"]) if b["m9_max_conf"] else None
+                    ),
+                    "strips_kept_frac": (
+                        b["m9_strips_kept"] / b["m9_strips_total"]
+                        if b["m9_strips_total"]
+                        else None
+                    ),
+                }
+                if b["m9_action_counts"]
+                else None
+            ),
             "abstention_rate": b["abstained"] / max(1, n_q),
             "latency_s_mean": (statistics.mean(b["latency"]) if b["latency"] else None),
             "by_question_type": {
@@ -302,6 +357,27 @@ def _print_text(rollup: dict[str, Any], *, by_type: bool) -> None:
                 (_fmt(maps.get(10)), 8),
             ]
             print("  ".join(val.ljust(w) for val, w in row))
+
+    # M9 corrective action mix (when present). Compare against the
+    # derivation-time mix from scripts/derive_corrective_thresholds.py:
+    # large drift = threshold miscalibration on this corpus.
+    any_m9 = any(
+        rollup["systems"][sid].get("m9_corrective") for sid in rollup["systems"]
+    )
+    if any_m9:
+        print("\n  --- M9 corrective action mix ---")
+        for sid in rollup["systems"]:
+            m9 = rollup["systems"][sid].get("m9_corrective")
+            if not m9:
+                continue
+            mix = ", ".join(f"{a}={frac:.1%}" for a, frac in m9["action_mix"].items())
+            print(f"  {sid}: n={m9['n']}  {mix}")
+            print(
+                f"  {sid}: rewrite_fired={m9['rewrite_fired_rate']:.1%}  "
+                f"overlap_jaccard={_fmt(m9.get('overlap_jaccard_mean'))}  "
+                f"max_conf={_fmt(m9.get('max_conf_mean'))}  "
+                f"strips_kept={_fmt(m9.get('strips_kept_frac'))}"
+            )
 
     # Unit-type distribution (per-system).
     print("\n  --- retrieved unit-type distribution ---")
