@@ -173,7 +173,12 @@ class BenchmarkRunner:
                         n_input_tokens=int(ar.n_input_tokens),
                         retrieved_unit_types=retrieved_unit_types,
                         packed_unit_types=packed_unit_types,
-                        metadata=q.metadata,
+                        # Loader-provided query metadata merged with any
+                        # per-query system diagnostics the AnswerResult
+                        # carried (e.g. M9's corrective-action logging).
+                        # System keys are namespaced by convention
+                        # ("m9_*") so loader metadata can't collide.
+                        metadata={**q.metadata, **(ar.extra or {})},
                     )
                     fout.write(
                         json.dumps(asdict(scored), ensure_ascii=False) + "\n"

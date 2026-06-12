@@ -31,6 +31,7 @@ from ..retrievers.m3_hybrid import HybridRRFSystem
 from ..retrievers.m4_raptor import RaptorSystem
 from ..retrievers.m6_hipporag import HippoRAGSystem
 from ..retrievers.m7_three_axis import ThreeAxisSystem
+from ..retrievers.m9_corrective import CorrectiveRAGSystem
 from .base import BenchmarkRunner
 from .multihop import MultiHopBenchmark
 from .qasper import QasperBenchmark
@@ -43,6 +44,7 @@ SYSTEM_REGISTRY: dict[str, type[BaseSystem]] = {
     "M4": RaptorSystem,
     "M6": HippoRAGSystem,
     "M7": ThreeAxisSystem,
+    "M9": CorrectiveRAGSystem,
 }
 
 BENCHMARK_REGISTRY: dict[str, type] = {
@@ -59,7 +61,7 @@ def main() -> None:
         "--system",
         required=True,
         choices=sorted(SYSTEM_REGISTRY),
-        help="Retrieval system id (M1/M2/M3/M4/M6/M7).",
+        help="Retrieval system id (M1/M2/M3/M4/M6/M7/M9).",
     )
     parser.add_argument(
         "--benchmark",

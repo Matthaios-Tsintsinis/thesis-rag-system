@@ -448,6 +448,50 @@ class M7Config:
 
 
 @dataclass(frozen=True)
+class CorrectiveConfig:
+    """M9 — CorrectiveRAG (Yan et al., 2024), corpus-internal variant.
+
+    M9 composes over the M3 hybrid substrate (no index-time artifacts
+    of its own, no substrate cache namespace) and adds a query-time
+    corrective loop: bge-reranker evaluator -> two-threshold action
+    decision -> optional gpt-4o-mini query rewrite + re-retrieval ->
+    strip refinement. All fields here are query-time parameters; none
+    enter any cache key. Deviations from the paper are documented in
+    the module comment block (src/retrievers/m9_corrective.py).
+
+    tau_high / tau_low are PROVISIONAL placeholders pending empirical
+    derivation on QASPER validation
+    (scripts/derive_corrective_thresholds.py, follow-up commit). Do not
+    interpret these values; they exist so the system runs end-to-end
+    before calibration. The paper's published thresholds (0.59 / -0.99)
+    live on its fine-tuned-T5 score scale and do not transfer.
+    """
+
+    tau_high: float = 0.7   # max conf >= tau_high -> CORRECT
+    tau_low: float = 0.3    # max conf <  tau_low  -> INCORRECT
+    # Strip-refinement threshold; None -> use tau_low (one fewer free
+    # parameter — revisit only if refinement degenerates).
+    tau_strip: float | None = None
+    refine: bool = True             # strip refinement; flag kept for ablation
+    strip_sentences: int = 2        # sentences per refinement strip
+    rewrite_prompt_version: str = "v1"  # names REWRITE_PROMPT_V{n} in the module
+
+    # --- component overrides (per-paper assignment) ---
+    # Embedder/chunker stay None = shared defaults (the substrate IS
+    # M3's: bge-m3 + harness chunker; overriding either here would
+    # fork the inner M3 cache key and rebuild). The reranker default
+    # for M9 is RERANKER_MODEL, passed by the M9
+    # resolve_components(..., default_reranker=RERANKER_MODEL) call
+    # site — reranker=None here means "use that per-system default".
+    # No final_generator field — harness-level, held constant.
+    embedder: str | None = None
+    chunker: ChunkingConfig | None = None
+    reranker: str | None = None
+
+    trace: bool = False
+
+
+@dataclass(frozen=True)
 class HarnessConfig:
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
     chunking: ChunkingConfig = field(default_factory=ChunkingConfig)
@@ -455,6 +499,7 @@ class HarnessConfig:
     m4: M4Config = field(default_factory=M4Config)
     m6: M6Config = field(default_factory=M6Config)
     m7: M7Config = field(default_factory=M7Config)
+    corrective: CorrectiveConfig = field(default_factory=CorrectiveConfig)
 
 
 DEFAULT_CONFIG = HarnessConfig()
