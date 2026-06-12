@@ -34,6 +34,7 @@ from ..retrievers.m7_three_axis import ThreeAxisSystem
 from ..retrievers.m9_corrective import CorrectiveRAGSystem
 from .base import BenchmarkRunner
 from .multihop import MultiHopBenchmark
+from .narrativeqa import NarrativeQABenchmark
 from .qasper import QasperBenchmark
 from .quality import QualityBenchmark
 
@@ -52,6 +53,7 @@ BENCHMARK_REGISTRY: dict[str, type] = {
     "qasper": QasperBenchmark,
     "multihop_rag": MultiHopBenchmark,
     "quality": QualityBenchmark,
+    "narrativeqa": NarrativeQABenchmark,
 }
 
 
@@ -88,7 +90,7 @@ def main() -> None:
         "--benchmark",
         required=True,
         choices=sorted(BENCHMARK_REGISTRY),
-        help="Benchmark id (qasper, multihop_rag, quality).",
+        help="Benchmark id (qasper, multihop_rag, quality, narrativeqa).",
     )
     parser.add_argument(
         "--split",
