@@ -113,8 +113,6 @@ class BenchmarkRunner:
             for unit_idx, unit in enumerate(
                 benchmark.iter_eval_units(split=split, max_units=max_units)
             ):
-                if stopped:
-                    break
                 if self.verbose:
                     print(
                         f"[eval] unit {unit_idx + 1}: corpus_id={unit.corpus_id!r}  "
@@ -188,6 +186,17 @@ class BenchmarkRunner:
                     yield scored
 
                 n_units += 1
+                # Stop check at the BOTTOM of the body: breaking here
+                # (not at the top) means the max-queries stop never
+                # pulls another unit from the loader's generator. A
+                # top-of-loop check advances the generator first, so
+                # the loader builds one extra unit that is immediately
+                # discarded — inflating loader-side benchmark_stats
+                # (n_stories / n_queries) past what was actually
+                # processed. The runner summary's n_queries_scored is
+                # authoritative either way.
+                if stopped:
+                    break
 
         if self.verbose:
             elapsed = time.perf_counter() - t_start
