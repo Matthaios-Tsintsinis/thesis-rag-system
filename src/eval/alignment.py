@@ -142,15 +142,31 @@ def score_retrieval_rank_aware(
     score_retrieval) merges these into a RetrievalScore alongside the
     CK-2 set-F1 numbers.
 
-    For each retrieved chunk in rank order, mark it relevant iff ANY
-    of its gold_provenance atoms is in `gold_atoms`. Then:
+    UNIT OF ANALYSIS — DOCUMENT (atom) level, not chunk level. The
+    metrics collapse the retrieved-chunk ranking to a DEDUPLICATED
+    ranking of gold-provenance atoms by FIRST occurrence, then score
+    that document ranking. This is mandatory, not cosmetic: MultiHop
+    gold is document-level (atom = (url, "<whole>")) and our chunker
+    emits MANY chunks per article, each stamped (index_items) with its
+    article's atom. Ranking raw chunks lets one gold article occupy
+    several "relevant" positions, which drives MAP ABOVE its [0,1]
+    bound — the AP numerator counts relevant CHUNKS (can exceed n_gold)
+    while the denominator normalises by DISTINCT gold atoms. Collapsing
+    to a document ranking credits each gold atom at most once and keeps
+    all three metrics on one consistent K (document positions). NOTE:
+    this also makes Hit@K / MRR document-rank rather than chunk-rank —
+    they stayed in [0,1] under the old chunk-level code so the bug was
+    invisible there, but the unit was still wrong for document gold.
 
-      Hit@K  — 1.0 if any relevant chunk appears within the top-K
-               retrieved, else 0.0.
-      MAP@K  — mean of precision-at-each-relevant-rank within top-K.
-               Standard mean Average Precision over a single query.
-      MRR    — 1 / (rank of first relevant retrieved), 0 if none.
-               1-indexed rank per the standard definition.
+    Over the deduplicated document ranking:
+
+      Hit@K  — 1.0 if any relevant document appears within the top-K
+               documents, else 0.0.
+      MAP@K  — Average Precision at K: sum of precision-at-each-
+               relevant-document-rank within the top-K documents,
+               normalised by min(K, n_gold). Bounded [0, 1].
+      MRR    — 1 / (rank of first relevant document), 0 if none.
+               1-indexed.
 
     Skip when `gold_atoms` is empty (null_query / unanswerable): the
     answer-side abstention scorer handles those queries. Returns
@@ -164,25 +180,30 @@ def score_retrieval_rank_aware(
     if not gold_atoms:
         return {"skipped": True}
 
-    # Per-chunk relevance in rank order. A chunk is relevant iff any
-    # of its gold_provenance atoms hits the gold set.
-    relevance: list[bool] = []
+    # Collapse the chunk ranking to a deduplicated document ranking by
+    # first occurrence. Every chunk carries its article's atom in
+    # gold_provenance (gold AND non-gold articles alike), so this is
+    # the order in which DISTINCT documents first surface in the
+    # retrieval. relevance[j] marks whether document j is a gold atom.
+    doc_ranking: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
     for r in retrieved:
-        is_rel = False
         for atom in (r.chunk.gold_provenance or ()):
             try:
                 parent, span = atom
-                if (str(parent), str(span)) in gold_atoms:
-                    is_rel = True
-                    break
             except (TypeError, ValueError):
                 continue
-        relevance.append(is_rel)
+            key = (str(parent), str(span))
+            if key not in seen:
+                seen.add(key)
+                doc_ranking.append(key)
+
+    relevance: list[bool] = [doc in gold_atoms for doc in doc_ranking]
 
     n_gold = len(gold_atoms)
     n_relevant_retrieved = sum(relevance)
 
-    # MRR: 1-indexed rank of first relevant.
+    # MRR: 1-indexed rank of the first relevant DOCUMENT.
     mrr = 0.0
     for i, rel in enumerate(relevance):
         if rel:
@@ -194,16 +215,18 @@ def score_retrieval_rank_aware(
     for k in k_values:
         top_k = relevance[:k]
         hit_at_k[k] = 1.0 if any(top_k) else 0.0
-        # MAP@K: mean precision at each relevant-rank position within
-        # top-K, normalised by min(K, n_gold). Standard.
+        # AP@K over the document ranking. Each gold doc is credited at
+        # most once (dedup above), so n_relevant_so_far <= n_gold and
+        # the relevant-position count in top_k <= min(k, n_gold); every
+        # precision term <= 1, hence sum <= denom and MAP@K in [0, 1].
         n_relevant_so_far = 0
-        precisions: list[float] = []
+        precision_sum = 0.0
         for i, rel in enumerate(top_k):
             if rel:
                 n_relevant_so_far += 1
-                precisions.append(n_relevant_so_far / (i + 1))
+                precision_sum += n_relevant_so_far / (i + 1)
         denom = max(1, min(k, n_gold))
-        map_at_k[k] = sum(precisions) / denom
+        map_at_k[k] = precision_sum / denom
 
     return {
         "skipped": False,
@@ -212,6 +235,7 @@ def score_retrieval_rank_aware(
         "mrr": mrr,
         "n_relevant_retrieved": n_relevant_retrieved,
         "n_gold": n_gold,
+        "n_docs_ranked": len(doc_ranking),
     }
 
 
