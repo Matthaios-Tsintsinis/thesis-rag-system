@@ -13,6 +13,24 @@ Used by QASPER's unanswerable answer-type scorer:
 
 Also used by the MultiHop-RAG `null_query` scoring path (Pass-1
 skeleton: same abstention detection; full free-form scoring in Pass-2).
+
+DEVIATION FROM THE OFFICIAL QASPER METRIC (answer side, unanswerable
+type). The official QASPER evaluator (Dasigi et al. 2021,
+qasper-led-baseline scripts/evaluator.py) derives the reference string
+"Unanswerable" and scores token_f1_score(prediction, "Unanswerable") —
+the model earns credit only via token overlap with the literal word
+"unanswerable". This harness instead scores score_abstention(predicted):
+1.0 iff the prediction is detected as an abstention (exact match to the
+canonical ABSTENTION_RESPONSE "No answer available." OR fuzzy substring
+match against ABSTENTION_PHRASES), else 0.0. Rationale: the shared reader
+prompt instructs every system to emit the canonical abstention string
+"No answer available.", NOT the word "Unanswerable", so token-F1 vs
+"Unanswerable" would score ~0.0 on every correct abstention under our
+prompt; the detector is the prompt-appropriate equivalent. Consequence:
+unanswerable answer-F1 here measures abstention-detection accuracy under
+the shared prompt and is NOT directly comparable to published QASPER
+"Unanswerable-F1". Applied identically to all systems (internally
+consistent). Note for the thesis limitations/methodology section.
 """
 
 from __future__ import annotations

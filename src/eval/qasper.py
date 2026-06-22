@@ -49,7 +49,6 @@ from typing import Any, Iterable
 from ..retrievers.base import RetrievedChunk
 from .alignment import score_retrieval_ck2
 from .scorers import (
-    extractive_max_f1,
     is_abstention,
     score_abstention,
     score_yes_no,
@@ -363,7 +362,15 @@ class QasperBenchmark:
         if gold.answer_type == ANSWER_TYPE_EXTRACTIVE:
             if is_abstention(predicted):
                 return 0.0, "extractive_abstained"
-            return extractive_max_f1(predicted, gold.extractive_spans), "extractive_f1"
+            # Official QASPER metric: join the annotator's extractive spans
+            # into ONE reference string (", ".join), then a single token-F1
+            # (allenai/qasper-led-baseline scripts/evaluator.py). Extractive
+            # spans are co-required parts of one answer, NOT alternatives, so
+            # this is NOT a max-over-spans (which would over-credit matching
+            # one span while ignoring the rest). extractive_max_f1 remains for
+            # genuine alternative references (e.g. NarrativeQA's two refs).
+            joined_gold = ", ".join(gold.extractive_spans)
+            return token_f1(predicted, joined_gold), "extractive_f1"
         if gold.answer_type == ANSWER_TYPE_ABSTRACTIVE:
             if is_abstention(predicted):
                 return 0.0, "abstractive_abstained"

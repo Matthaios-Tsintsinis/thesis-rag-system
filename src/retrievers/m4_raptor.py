@@ -2,18 +2,52 @@
 
 The eval plan's primary headline baseline (Section 3, system M4). The
 RAPTOR paper [R3] reports collapsed retrieval as the stronger variant
-of RAPTOR over single-path tree traversal; this implementation matches
+of RAPTOR over single-path tree traversal; this implementation follows
 that variant and PIPELINE_DESIGN.md sections 3.4, 3.5, and 4.4 Axis-1
-Part A.
+Part A. See the DEVIATIONS block below for where M4 diverges from the
+published paper and why.
 
 NO cross-encoder rerank in M4 — the published collapsed-RAPTOR pipeline
 has none, and reranking is M7's contribution to attribute, not M4's.
-The flat collapsed index returns chunks (after summary-node expansion)
-ranked by RRF of dense and BM25 first-stage retrieval.
+By default M4's first stage is DENSE-ONLY cosine ranking over the flat
+collapsed index (paper-faithful); the flat index returns chunks after
+summary-node expansion.
 
 Index-time substrate (chunks, embeddings, tree with LLM summaries,
 flat collapsed index, BM25 over leaf chunks) is shared with M7 via
 src/raptor.py. M7 layers Axes 2/3 on top of this exact substrate.
+
+# === DEVIATIONS FROM THE RAPTOR PAPER (Sarthi et al., ICLR 2024) — thesis footnote ===
+# 1. First-stage retrieval (FIDELITY-RESTORED). The paper's collapsed
+#    retrieval ranks the flattened node set by DENSE cosine similarity
+#    only. M4 runs dense-only by default (M4Config.hybrid_first_stage=
+#    False) to match the paper. The shared RAPTOR substrate also builds
+#    a BM25 index (M7 needs it); M4 simply does not use it at query
+#    time. hybrid_first_stage=True restores a dense+BM25 RRF first stage
+#    as an OPT-IN ablation — that is a strengthening over dense-only
+#    (CLAUDE.md rule #8) and is off by default. The flag is query-time
+#    only, NOT in raptor_substrate_extra, so toggling it never changes
+#    the substrate cache key.
+# 2. Clustering (SIMPLIFICATION). The paper builds the tree with UMAP
+#    dimensionality reduction + Gaussian Mixture Model SOFT clustering
+#    (a node may belong to multiple parents), global-then-local, BIC for
+#    component count. The shared substrate (src/raptor.py) instead uses
+#    recursive MiniBatchKMeans (HARD assignment, fixed per-node count
+#    bounded by branching_factor). Hard k-means is strictly LESS
+#    expressive than soft GMM — a simplification that cannot make M4
+#    stronger than its paper version, so it needs no rule-#8 sign-off,
+#    only this note.
+# 3. Summary-node expansion (SIMPLIFICATION). Published collapsed-RAPTOR
+#    can return summary nodes DIRECTLY into context. M4 reuses the shared
+#    §4.4 per-node-type expansion (built for M7): every retrieved summary
+#    hit is expanded to query-scored descendant leaf chunks (tagged
+#    source_unit_type=summary_low/mid/high). M4 therefore feeds the
+#    generator chunk text, not summary text; the summary_* tags are
+#    provenance labels, not summary nodes in context. Changes granularity
+#    (chunks vs summaries), not a capability upgrade.
+# 4. gpt-4o-mini summariser replaces the paper's deprecated GPT-3.5-turbo,
+#    and the shared gpt-4o-mini final-answer generator (both harness-wide
+#    documented deviations, CLAUDE.md).
 
 Cache key folds in:
   * shared: chunking + embedder + parsing + corpus content hash
@@ -316,22 +350,33 @@ class RaptorSystem(BaseSystem):
         # --- Dense top-K over flat collapsed index (chunks + non-root summaries) ---
         n_flat = len(self._flat.refs)
         ks = min(m4.first_stage_top_k, n_flat)
-        _, dense_idx = self._flat.faiss_index.search(q_vec, ks)
+        dense_scores, dense_idx = self._flat.faiss_index.search(q_vec, ks)
         dense_flat_positions = [i for i in dense_idx[0].tolist() if i >= 0]
 
-        # --- BM25 top-K over leaf chunks only ---
-        # Chunk indices == flat positions for the chunk-typed prefix of the
-        # flat index, so RRF can fuse the two rankings in flat-position space.
-        bm25_scores = self._bm25.get_scores(_tokenize(query))
-        bm25_order = bm25_scores.argsort()[::-1][: m4.first_stage_top_k]
-        sparse_flat_positions = [
-            int(i) for i in bm25_order.tolist() if bm25_scores[i] > 0
-        ]
-
-        # --- RRF fuse the two rankings ---
-        fused = _rrf_fuse(
-            [dense_flat_positions, sparse_flat_positions], k=m4.rrf_k
-        )[: m4.first_stage_top_k]
+        if m4.hybrid_first_stage:
+            # OPT-IN ablation (NON-paper): fuse dense with BM25-over-leaves
+            # via RRF. A strengthening over dense-only (CLAUDE.md rule #8);
+            # off by default. See m4_raptor.py DEVIATIONS block #1.
+            # Chunk indices == flat positions for the chunk-typed prefix of
+            # the flat index, so RRF fuses both rankings in flat-position space.
+            bm25_scores = self._bm25.get_scores(_tokenize(query))
+            bm25_order = bm25_scores.argsort()[::-1][: m4.first_stage_top_k]
+            sparse_flat_positions = [
+                int(i) for i in bm25_order.tolist() if bm25_scores[i] > 0
+            ]
+            fused = _rrf_fuse(
+                [dense_flat_positions, sparse_flat_positions], k=m4.rrf_k
+            )[: m4.first_stage_top_k]
+        else:
+            # PAPER-FAITHFUL default: collapsed retrieval = dense cosine
+            # ranking over the flattened node set (IndexFlatIP over
+            # normalised vectors == cosine). faiss returns scores already
+            # sorted descending; pair them with flat positions.
+            fused = [
+                (int(p), float(s))
+                for s, p in zip(dense_scores[0].tolist(), dense_idx[0].tolist())
+                if p >= 0
+            ][: m4.first_stage_top_k]
 
         # --- Per-node-type expansion: walk fused, expand summaries to chunks ---
         chunk_idx_score: dict[int, float] = {}

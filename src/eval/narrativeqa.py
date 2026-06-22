@@ -135,7 +135,10 @@ class NarrativeQABenchmark:
                     "text": doc.get("text") or "",
                     "kind": doc.get("kind") or "?",
                     "url": doc.get("url") or "",
-                    "title": (row.get("summary") or {}).get("title") or "",
+                    # summary is nested under document in the HF schema
+                    # (top-level row has only document/question/answers),
+                    # so the title lives at document.summary.title.
+                    "title": (doc.get("summary") or {}).get("title") or "",
                     "qa": [],
                 }
                 order.append(did)

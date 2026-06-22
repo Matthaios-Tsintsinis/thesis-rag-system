@@ -5,12 +5,21 @@ F1 computation (Dasigi et al., 2021; their qasper_eval.py). Lower-case,
 strip articles (a/an/the), drop punctuation, collapse whitespace. Then
 SQuAD-style token F1 between predicted and gold token sets.
 
-For extractive answers with multiple gold spans, the official metric is
-the MAX token-F1 over each gold span. We replicate that exactly via
-`extractive_max_f1`.
+IMPORTANT — what the official QASPER scorer actually does with multiple
+extractive spans: it JOINS an annotator's spans into ONE reference
+string (", ".join(spans)) and computes a SINGLE token-F1 against it,
+taking the max only ACROSS annotators/references — never a per-span
+max. The QASPER extractive path therefore joins-then-scores (see
+qasper.py _score_one_annotator) to match the official evaluator.
 
-Used unchanged for QASPER abstractive answers in Pass-1 (token F1 vs
-`free_form`). Pass-2 adds an LLM-judge for abstractive semantic
+`extractive_max_f1` below returns the MAX token-F1 over a tuple of
+reference strings. That is the right metric only when the references
+are genuine ALTERNATIVES (e.g. NarrativeQA's two independent reference
+answers, narrativeqa.py), NOT when they are co-required spans of one
+answer. Do NOT use it for QASPER extractive scoring.
+
+token_f1 is also used for QASPER abstractive answers in Pass-1 (token
+F1 vs `free_form`). Pass-2 adds an LLM-judge for abstractive semantic
 equivalence on top.
 """
 

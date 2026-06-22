@@ -234,6 +234,16 @@ class M4Config:
     chunker: ChunkingConfig | None = None
     reranker: str | None = None  # M4 does not rerank
 
+    # Paper-fidelity switch (see m4_raptor.py DEVIATIONS block #1). The
+    # RAPTOR paper's collapsed retrieval ranks the flattened node set by
+    # DENSE cosine only. Default False = paper-faithful dense-only first
+    # stage. True restores the dense+BM25 RRF first stage as an OPT-IN
+    # ablation (a strengthening over dense-only per CLAUDE.md rule #8).
+    # Query-time only — NOT folded into raptor_substrate_extra, so
+    # toggling it never changes the substrate cache key (bm25.pkl is
+    # still built at index time because M7 shares the substrate).
+    hybrid_first_stage: bool = False
+
     trace: bool = False
 
 

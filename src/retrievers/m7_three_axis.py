@@ -360,6 +360,10 @@ class ThreeAxisSystem(BaseSystem):
         if use_bm25:
             bm25_scores = self._bm25.get_scores(_tokenize(view_str))
             bm25_order = bm25_scores.argsort()[::-1][: m7.first_stage_top_k]
+            # Deviation from literal Cormack-2009 RRF: drop zero-BM25 docs
+            # (no lexical overlap) before fusion. Benign — bottom-of-list,
+            # ~1/(rrf_k+rank) contribution; uniform across M3/M4/M7. (M7
+            # frozen: documentation only.)
             rankings.append(
                 [int(i) for i in bm25_order.tolist() if bm25_scores[i] > 0]
             )

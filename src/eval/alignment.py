@@ -166,7 +166,10 @@ def score_retrieval_rank_aware(
                relevant-document-rank within the top-K documents,
                normalised by min(K, n_gold). Bounded [0, 1].
       MRR    — 1 / (rank of first relevant document), 0 if none.
-               1-indexed.
+               1-indexed. Uncapped (over the full ranking); the
+               MultiHop-RAG paper reports MRR@10. For top-15 retrieval
+               these coincide unless the first relevant doc is at rank
+               11-15.
 
     Skip when `gold_atoms` is empty (null_query / unanswerable): the
     answer-side abstention scorer handles those queries. Returns

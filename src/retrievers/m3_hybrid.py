@@ -156,6 +156,11 @@ class HybridRRFSystem(BaseSystem):
 
         bm25_scores = self._bm25.get_scores(_tokenize(query))
         order = bm25_scores.argsort()[::-1][: cfg.first_stage_top_k]
+        # Deviation from literal Cormack-2009 RRF: drop zero-BM25 docs (no
+        # lexical overlap) from the sparse list before fusion. Benign — such
+        # a doc sits at the bottom of the top-K list and contributes only
+        # ~1/(rrf_k+rank) to fusion; arguably more correct (a doc sharing no
+        # query terms earns no sparse credit). Applied uniformly in M3/M4/M7.
         sparse_ranking = [i for i in order.tolist() if bm25_scores[i] > 0]
 
         fused = rrf_fuse([dense_ranking, sparse_ranking], k=cfg.rrf_k)[:k]

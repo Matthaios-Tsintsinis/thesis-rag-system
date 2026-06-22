@@ -22,10 +22,11 @@ Answer scoring (Pass-1 skeleton):
   * Other queries: token_f1(predicted, gold.free_form). This is a
     PLACEHOLDER — the official MultiHop-RAG metric is an LLM-judge on
     free-form answers per the paper. Pass-2 swaps in the judge prompt
-    (gpt-4o-mini, same controlled-reader as the systems). The
-    placeholder method tag `multihop_token_f1_placeholder` is emitted
-    so downstream analysis can identify Pass-1 numbers vs final
-    Pass-2 numbers.
+    (gpt-4o-mini, same controlled-reader as the systems). Every
+    AnswerScore carries `pass1_placeholder=True` in its metadata so
+    downstream analysis can identify Pass-1 numbers vs final Pass-2
+    numbers. (The emitted method tag is the bare `multihop_token_f1`;
+    the metadata flag, not the method string, is the Pass-1 signal.)
 """
 
 from __future__ import annotations
@@ -200,10 +201,17 @@ class MultiHopBenchmark:
         Merges:
           - score_retrieval_ck2 over (url, "<whole>") atoms — gives F1
             consistent with QASPER's scoring shape.
-          - score_retrieval_rank_aware at K=(1, 5, 10) — paper-aligned
-            (MultiHop paper uses MAP@10 + Hit + MRR over supporting
-            docs). Single gold annotator means we read the first
-            (and only) gold_passage_set.
+          - score_retrieval_rank_aware at K=(1, 5, 10). DEVIATION FROM
+            PAPER: MultiHop-RAG (Tang & Yang 2024, arXiv:2401.15391)
+            reports Hits@4, Hits@10, MAP@10, MRR@10 (K in {4,10}; MAP/MRR
+            at K=10 only). Our grid uses K=(1,5,10): K=10 matches the
+            paper directly; K=5 substitutes for the paper's K=4; K=1 is an
+            extra diagnostic column the paper does not report. MRR here is
+            uncapped (first relevant doc over the full ranking), equal to
+            the paper's MRR@10 unless the first relevant doc sits at
+            rank >10 (rare under top-15). Matrix tables must NOT be read
+            as paper-identical K=4. Single gold annotator means we read
+            the first (and only) gold_passage_set.
 
         null_query (empty gold) skips rank-aware (per the helper
         contract); CK-2 also returns skipped=True. Answer-side
