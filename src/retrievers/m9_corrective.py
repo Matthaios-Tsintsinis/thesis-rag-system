@@ -71,6 +71,15 @@ m9_n_strips_kept / m9_n_strips_total.
 # 3. Generator. Shared gpt-4o-mini final generator (professor-locked,
 #    harness-level), not the paper's generators.
 #
+# 4. Base retriever. The paper layers its corrective loop over a
+#    Contriever-class dense retriever (Self-RAG setup, Wikipedia); this
+#    M9 composes over the M3 hybrid (bge-m3 + BM25 RRF) on the
+#    benchmark corpus — forced by the closed-corpus setting and
+#    approved at proposal time (2026-06-12, "reuse M3 retrieval, don't
+#    re-implement"). Deliberate side benefit: M9's first stage IS the
+#    matrix's M3 row, so M9 minus M3 isolates the corrective layer's
+#    contribution exactly.
+#
 # === CALIBRATION FINDINGS (QASPER validation derivation, 2026-06-12;
 #     artifact derivation_validation_20260612-014811.json) ===
 #

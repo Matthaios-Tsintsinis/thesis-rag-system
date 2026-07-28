@@ -48,6 +48,23 @@ src/raptor.py. M7 layers Axes 2/3 on top of this exact substrate.
 # 4. gpt-4o-mini summariser replaces the paper's deprecated GPT-3.5-turbo,
 #    and the shared gpt-4o-mini final-answer generator (both harness-wide
 #    documented deviations, CLAUDE.md).
+# 5. Chunking + retrieval budget (UNIFORMITY DEVIATION, accepted
+#    2026-07-02). The paper segments the corpus into contiguous
+#    100-token, sentence-preserving, non-overlapping chunks and fills a
+#    2000-token context budget at retrieval (~top-20 nodes). This
+#    harness instead uses the shared word_window chunker (200 words,
+#    ~260 tokens, 50-word overlap) and the natural top-15 chunks
+#    (~3,900 evidence tokens, ~2x the paper's budget). Reason: harness
+#    uniformity — all five matrix systems resolve to the SAME chunker
+#    and the same natural top-15 (verified at ff3a189), so no system is
+#    differentially advantaged; chunking-as-a-variable is deferred to
+#    the CK-1/CK-3 ablations. Direction vs the paper is CONTESTED, not
+#    neutral: the larger evidence budget is plausibly STRONGER in
+#    absolute answer quality, while ~2.6x coarser leaves yield a
+#    shallower tree — plausibly WEAKER on RAPTOR's own hierarchy
+#    mechanism; the sign is benchmark-dependent. A paper-faithful
+#    100-token-chunking M4 ablation sits in the CK backlog as the
+#    empirical resolver.
 
 Cache key folds in:
   * shared: chunking + embedder + parsing + corpus content hash

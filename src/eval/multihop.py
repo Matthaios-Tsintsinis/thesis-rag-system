@@ -102,6 +102,13 @@ class MultiHopBenchmark:
     The `split` argument is accepted for protocol parity with QASPER
     but has only one value here (the dataset ships a single split).
     Passing anything other than 'validation' or 'test' or 'all' raises.
+
+    METHODOLOGY NOTE (single-split asymmetry): because MultiHop-RAG
+    ships ONE split, the validation-matrix run doubles as the FINAL
+    MultiHop numbers — there is no held-out portion to reserve. The
+    thesis therefore reports three benchmarks (QASPER, QuALITY,
+    NarrativeQA) on reserved test splits and MultiHop-RAG on its single
+    split; flag this asymmetry explicitly in the methods section.
     """
 
     name = "multihop_rag"
