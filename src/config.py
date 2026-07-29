@@ -85,8 +85,19 @@ RETRIEVAL_RANKING_DEPTH = 50
 #                   stays word_window so M1/M2/M3 behaviour is unchanged.
 #   "word_window" — fixed word window + overlap. Used in smoke tests and
 #                   as the current default while baselines are stabilising.
+#   "raptor_100tok" — M4 ONLY. Paper-faithful RAPTOR leaves: contiguous,
+#                   sentence-preserving, ~100 tiktoken cl100k_base tokens,
+#                   NO overlap (src/raptor_paper.py). Reads chunk_words as
+#                   a TOKEN count and requires overlap_words == 0.
+#
+# CACHE DISCIPLINE: a new strategy is a new VALUE of an existing field,
+# so `asdict(ChunkingConfig())` is unchanged and no system's cache key
+# moves. Adding a new FIELD to ChunkingConfig would move every system's
+# key at once (compute_cache_key folds the whole asdict) — that is why
+# raptor_100tok reuses chunk_words/overlap_words instead of declaring
+# its own size field. tests/test_raptor_chunking.py pins the schema.
 
-ChunkingStrategy = Literal["semantic", "word_window"]
+ChunkingStrategy = Literal["semantic", "word_window", "raptor_100tok"]
 
 
 # --- Generation -----------------------------------------------------------

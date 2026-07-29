@@ -9,8 +9,14 @@ Two strategies share the Chunk dataclass and `chunk_corpus` entrypoint:
                     Used for production benchmarks.
   * "word_window" — fixed-size word window with overlap. Cheap;
                     used in the smoke test and when no embedder is loaded.
+  * "raptor_100tok" — M4 ONLY. Paper-faithful RAPTOR leaves: contiguous,
+                    sentence-preserving, ~100 tiktoken tokens, no overlap.
+                    Segmentation lives in `src/raptor_paper.py`; this
+                    module only adapts it to the Chunk dataclass.
 
-Strategy is selected by HarnessConfig.chunking.strategy.
+Strategy is selected by HarnessConfig.chunking.strategy, or per-system
+via the `chunker` override on a system config (M4 uses that route so
+its chunker change cannot move any other system's cache key).
 """
 
 from __future__ import annotations
@@ -92,6 +98,59 @@ def _chunk_doc_word_window(
         if start + chunk_words >= len(words):
             break
     return chunks
+
+
+# --- RAPTOR paper-faithful (M4 only) ---------------------------------------
+
+
+def _chunk_doc_raptor_100tok(
+    doc: ParsedDocument,
+    cfg: ChunkingConfig,
+) -> list[Chunk]:
+    """Paper-faithful RAPTOR leaves: ~100 tokens, sentence-preserving, no overlap.
+
+    Delegates the actual segmentation to `src.raptor_paper.
+    split_text_raptor` (which carries the fidelity notes and the one
+    documented divergence from the reference implementation). This
+    wrapper only maps TextSpans onto the shared Chunk dataclass.
+
+    `cfg.chunk_words` is read as a TOKEN budget here, not a word count —
+    see the strategy note in config.py. `cfg.overlap_words` must be 0;
+    the reference never overlaps and a non-zero value would silently
+    misrepresent the strategy.
+
+    The span offsets land in `Chunk.metadata` (start_char / end_char /
+    n_tokens). Chunk.metadata is NOT part of any cache key, so carrying
+    them is free. M4's per-parent `index_items` override consumes them
+    to derive gold_provenance by offset intersection.
+    """
+    if cfg.overlap_words != 0:
+        raise ValueError(
+            "raptor_100tok is a non-overlapping strategy "
+            f"(reference overlap=0); got overlap_words={cfg.overlap_words}"
+        )
+
+    # Local import: raptor_paper pulls tiktoken lazily, and chunking.py
+    # is imported by cache.py on every path including ones with no
+    # tokenizer available.
+    from .raptor_paper import split_text_raptor
+
+    spans = split_text_raptor(doc.text, max_tokens=cfg.chunk_words)
+    return [
+        Chunk(
+            chunk_id=f"{doc.doc_id}::{i:04d}",
+            doc_id=doc.doc_id,
+            text=s.text,
+            n_words=len(s.text.split()),
+            position=i,
+            metadata={
+                "start_char": s.start_char,
+                "end_char": s.end_char,
+                "n_tokens": s.n_tokens,
+            },
+        )
+        for i, s in enumerate(spans)
+    ]
 
 
 # --- Semantic --------------------------------------------------------------
@@ -249,6 +308,8 @@ def chunk_document(
         return _chunk_doc_semantic(doc, cfg, embedder)
     if cfg.strategy == "word_window":
         return _chunk_doc_word_window(doc, cfg.chunk_words, cfg.overlap_words)
+    if cfg.strategy == "raptor_100tok":
+        return _chunk_doc_raptor_100tok(doc, cfg)
     raise ValueError(f"Unknown chunking strategy: {cfg.strategy!r}")
 
 
