@@ -94,9 +94,14 @@ the shared harness chunker at this commit, so NO cache key moves.
 from __future__ import annotations
 
 import functools
+import json
 import re
-from dataclasses import dataclass
-from typing import Any
+from collections import Counter
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Callable
+
+import numpy as np
 
 
 # Reference: `tokenizer=tiktoken.get_encoding("cl100k_base")` as the
@@ -310,10 +315,830 @@ def split_text_raptor(
     return spans
 
 
+# =========================================================================
+# Bottom-up tree: UMAP (global + local) -> BIC-selected GMM soft clustering
+# -> per-cluster summary -> re-embed -> repeat.
+#
+# PAPER (§3, and the Abstract's "from the bottom up"): "Once clustered, a
+# Language Model is used to summarize the grouped texts. These summarized
+# texts are then re-embedded, and the cycle of embedding, clustering, and
+# summarization continues until further clustering becomes infeasible,
+# resulting in a structured, multi-layered tree representation."
+#
+# This is NOT what src/raptor.py does. That module partitions ONE
+# all-chunk root top-down with recursive MiniBatchKMeans, which produces a
+# strict single-parent tree of bounded branching. The paper's algorithm
+# agglomerates upward and its soft clustering lets a node belong to
+# several parents, so the result is a DAG. That difference is why this
+# module carries its own node model instead of extending RaptorNode
+# (whose single `parent_id` cannot express it) — and why src/raptor.py,
+# which the frozen M7 consumes, is never opened.
+#
+# Every constant below is the reference implementation's default. The
+# paper states none of them; see the module docstring's UNVERIFIED
+# framing — they are attributable to the code, not the paper.
+#
+# DOCUMENTED MICRO-DIVERGENCES from the reference, all ruled 2026-07-29:
+#
+#  (i) UMAP is SEEDED. The reference passes no `random_state`, so its
+#      trees differ run to run. We seed, because a cache key that does
+#      not determine the artifact it names is not a cache key — the same
+#      infrastructure-contract reasoning that keeps summarisation at
+#      temperature 0. Cost: seeding forces UMAP to n_jobs=1, i.e.
+#      single-threaded, which is the dominant wall-clock term in tree
+#      construction. Accepted.
+#
+# (ii) RE-CLUSTER RECURSION IS DEPTH-GUARDED. The reference's
+#      `perform_clustering` recurses whenever a cluster's combined text
+#      exceeds `max_length_in_cluster`, with no base case beyond
+#      `len(nodes) == 1`; a cluster that keeps re-forming identically
+#      recurses forever. A build that cannot terminate cannot produce an
+#      artifact, so the guard is admissible on impossibility grounds. It
+#      accepts the oversized cluster instead of recursing further and
+#      increments `stats["recluster_guard_trips"]` — a non-zero count is
+#      a FINDING about the clustering, to be reported, not silenced.
+#
+#(iii) The reference's recursive call drops `reduction_dimension` and
+#      `threshold`, silently reverting them to 10 and 0.1 even when the
+#      caller overrode them. We thread the params through instead. At our
+#      configuration the two are identical (our defaults ARE 10 and 0.1),
+#      so this is observable only under a non-default override we do not
+#      use. Recorded for completeness.
+#
+# (iv) Two degenerate cases that CRASH or silently drop nodes in the
+#      reference are guarded, both impossibility-class: an empty BIC
+#      search range (`np.arange(1, 1)` -> argmin on empty), and a label
+#      set where no node cleared the GMM threshold (-> zero clusters, so
+#      every node at that layer vanishes from the tree). Both guards are
+#      counted in `stats`.
+#
+# The reference's SEED INCONSISTENCY is reproduced exactly, not fixed:
+# `random_state=224` for the BIC search, `random_state=0` for the final
+# fit. Noted as an observed oddity of the reference; the paper is silent,
+# the code specifies, cost is zero, so the code wins.
+# =========================================================================
+
+
+PAPER_TREE_SCHEMA_VERSION = "raptor_paper_bottom_up_v1"
+
+# Reference cluster_utils.py module constant: RANDOM_SEED = 224.
+REFERENCE_RANDOM_SEED = 224
+
+
+@dataclass(frozen=True)
+class PaperTreeParams:
+    """Reference-implementation defaults for the paper-faithful tree.
+
+    Field-by-field provenance (all from parthsarthi03/raptor@master):
+      reduction_dimension   ClusterTreeConfig(reduction_dimension=10)
+      gmm_threshold         RAPTOR_Clustering.perform_clustering(threshold=0.1)
+                            — the GMM posterior-membership cutoff. NOT the
+                            same quantity as TreeBuilderConfig.threshold=0.5,
+                            which is a retrieval selection threshold in a
+                            different file. Easy to conflate; don't.
+      max_length_in_cluster RAPTOR_Clustering.perform_clustering(3500),
+                            measured in cl100k_base TOKENS summed over the
+                            cluster's node texts.
+      num_layers            TreeBuilderConfig(num_layers=5) — an upper
+                            bound; the realised depth is usually lower.
+      local_n_neighbors     local_cluster_embeddings(num_neighbors=10).
+                            The GLOBAL n_neighbors is not a parameter —
+                            the reference computes int((n-1)**0.5).
+      metric                both UMAP calls use "cosine".
+      bic_max_clusters      get_optimal_clusters(max_clusters=50).
+      bic_random_state      224, the module RANDOM_SEED.
+      gmm_random_state      0, GMM_cluster's own default. The mismatch
+                            with 224 is the reference's, reproduced.
+      umap_random_state     OURS. The reference seeds nothing.
+      max_recluster_depth   OURS. The reference has no bound at all.
+
+    Frozen and asdict-able: this lands in M4's cache-key extras as the
+    "tree" field, replacing RaptorBuildParams. A different schema here is
+    exactly what forks M4's substrate key away from the KMeans-era one.
+    """
+
+    reduction_dimension: int = 10
+    gmm_threshold: float = 0.1
+    max_length_in_cluster: int = 3500
+    num_layers: int = 5
+    local_n_neighbors: int = 10
+    metric: str = "cosine"
+    bic_max_clusters: int = 50
+    bic_random_state: int = REFERENCE_RANDOM_SEED
+    gmm_random_state: int = 0
+    umap_random_state: int = 42
+    max_recluster_depth: int = 8
+
+
+@dataclass
+class PaperNode:
+    """One node of the paper-faithful DAG. Layer 0 nodes are leaf chunks.
+
+    `parent_ids` is a LIST because the paper's soft clustering puts a node
+    in every cluster whose GMM posterior exceeds the threshold, so a node
+    can be summarised into several parents. `leaf_indices` is the
+    transitive closure down to layer-0 chunk indices, which is what
+    provenance and diagnostics need; it can overlap between siblings, and
+    that is correct rather than a bug.
+    """
+
+    node_id: str
+    layer: int
+    text: str
+    children: list[str] = field(default_factory=list)
+    parent_ids: list[str] = field(default_factory=list)
+    leaf_indices: list[int] = field(default_factory=list)
+    embedding: np.ndarray | None = None
+
+    @property
+    def is_leaf(self) -> bool:
+        return self.layer == 0
+
+
+@dataclass
+class PaperTree:
+    nodes: dict[str, PaperNode]
+    layer_to_nodes: dict[int, list[str]]
+    n_layers: int
+    params: PaperTreeParams
+    stats: dict = field(default_factory=dict)
+
+    def all_node_ids(self) -> list[str]:
+        """Every node, every layer, leaves included — the collapsed set."""
+        out: list[str] = []
+        for layer in sorted(self.layer_to_nodes):
+            out.extend(self.layer_to_nodes[layer])
+        return out
+
+    def summary_nodes(self) -> list[PaperNode]:
+        return [n for n in self.nodes.values() if n.layer > 0]
+
+
+# --- clustering (port of cluster_utils.py) --------------------------------
+
+
+def _umap_reduce(
+    embeddings: np.ndarray,
+    dim: int,
+    n_neighbors: int,
+    metric: str,
+    random_state: int,
+) -> np.ndarray:
+    import umap
+
+    return umap.UMAP(
+        n_neighbors=n_neighbors,
+        n_components=dim,
+        metric=metric,
+        random_state=random_state,
+    ).fit_transform(embeddings)
+
+
+def _global_cluster_embeddings(
+    embeddings: np.ndarray, dim: int, params: PaperTreeParams
+) -> np.ndarray:
+    """Reference: n_neighbors defaults to int((len(embeddings) - 1) ** 0.5)."""
+    n_neighbors = int((len(embeddings) - 1) ** 0.5)
+    return _umap_reduce(
+        embeddings, dim, max(2, n_neighbors), params.metric, params.umap_random_state
+    )
+
+
+def _local_cluster_embeddings(
+    embeddings: np.ndarray, dim: int, params: PaperTreeParams
+) -> np.ndarray:
+    """Reference: fixed num_neighbors=10.
+
+    Note the reference clamps `dim` for the GLOBAL call
+    (`min(dim, len(embeddings) - 2)`) but passes the raw `dim` here. We
+    clamp both, because an unclamped local call raises on a small
+    cluster — impossibility-class, and unreachable at the reference's own
+    defaults only because the `len <= dim + 1` escape hatch fires first.
+    """
+    return _umap_reduce(
+        embeddings,
+        min(dim, max(2, len(embeddings) - 2)),
+        min(params.local_n_neighbors, max(2, len(embeddings) - 1)),
+        params.metric,
+        params.umap_random_state,
+    )
+
+
+def _get_optimal_clusters(
+    embeddings: np.ndarray, params: PaperTreeParams, stats: dict
+) -> int:
+    """BIC sweep. Reference: arange(1, min(max_clusters, n)), seed 224.
+
+    `np.arange` excludes its stop, so the reference searches
+    1..min(50, n)-1 and never evaluates n itself. Reproduced verbatim.
+    """
+    from sklearn.mixture import GaussianMixture
+
+    max_clusters = min(params.bic_max_clusters, len(embeddings))
+    candidates = np.arange(1, max_clusters)
+    if len(candidates) == 0:
+        # GUARD (iv): the reference would call argmin on an empty list.
+        # Reachable only for n <= 1, which the escape hatches upstream
+        # normally prevent.
+        stats["empty_bic_range_trips"] = stats.get("empty_bic_range_trips", 0) + 1
+        return 1
+    bics: list[float] = []
+    for n in candidates:
+        gm = GaussianMixture(
+            n_components=int(n), random_state=params.bic_random_state
+        )
+        gm.fit(embeddings)
+        bics.append(float(gm.bic(embeddings)))
+    return int(candidates[int(np.argmin(bics))])
+
+
+def _gmm_cluster(
+    embeddings: np.ndarray, params: PaperTreeParams, stats: dict
+) -> tuple[list[np.ndarray], int]:
+    """Soft assignment: a node joins EVERY component above the threshold.
+
+    Reference seeds the final fit with random_state=0 while the BIC
+    search above uses 224. The inconsistency is the reference's and is
+    reproduced deliberately (ruling 3).
+    """
+    from sklearn.mixture import GaussianMixture
+
+    n_clusters = _get_optimal_clusters(embeddings, params, stats)
+    gm = GaussianMixture(
+        n_components=n_clusters, random_state=params.gmm_random_state
+    )
+    gm.fit(embeddings)
+    probs = gm.predict_proba(embeddings)
+    labels = [np.where(p > params.gmm_threshold)[0] for p in probs]
+    return labels, n_clusters
+
+
+def _two_stage_labels(
+    embeddings: np.ndarray, params: PaperTreeParams, stats: dict
+) -> list[np.ndarray]:
+    """Global-then-local soft clustering, flat global label space.
+
+    Reference `perform_clustering(embeddings, dim, threshold)`: reduce
+    globally, GMM, then for each global cluster reduce locally and GMM
+    again, offsetting local label ids by a running total so the returned
+    label space is flat.
+    """
+    dim = params.reduction_dimension
+    n = len(embeddings)
+    if n <= dim + 1:
+        return [np.array([0]) for _ in range(n)]
+
+    reduced_global = _global_cluster_embeddings(
+        embeddings, min(dim, n - 2), params
+    )
+    global_labels, n_global = _gmm_cluster(reduced_global, params, stats)
+
+    out: list[np.ndarray] = [np.array([], dtype=int) for _ in range(n)]
+    total = 0
+    for gi in range(n_global):
+        members = [i for i, lab in enumerate(global_labels) if gi in lab]
+        if not members:
+            continue
+        sub = embeddings[members]
+        if len(sub) <= dim + 1:
+            # Reference escape hatch: too small to reduce, one cluster.
+            local_labels = [np.array([0]) for _ in members]
+            n_local = 1
+        else:
+            reduced_local = _local_cluster_embeddings(sub, dim, params)
+            local_labels, n_local = _gmm_cluster(reduced_local, params, stats)
+        for pos, lab in enumerate(local_labels):
+            for li in np.atleast_1d(lab).tolist():
+                out[members[pos]] = np.append(out[members[pos]], int(li) + total)
+        total += n_local
+    return out
+
+
+def perform_clustering(
+    nodes: list[PaperNode],
+    params: PaperTreeParams,
+    stats: dict | None = None,
+    *,
+    _depth: int = 0,
+) -> list[list[PaperNode]]:
+    """Reference RAPTOR_Clustering.perform_clustering, guarded.
+
+    Returns a list of clusters; a node may appear in several of them
+    (soft membership). A cluster whose combined text exceeds
+    `max_length_in_cluster` tokens is recursively re-clustered, bounded
+    by `max_recluster_depth` — see micro-divergence (ii).
+    """
+    stats = stats if stats is not None else {}
+    if len(nodes) <= 1:
+        return [list(nodes)]
+
+    embeddings = np.vstack([
+        np.asarray(n.embedding, dtype=np.float32).reshape(1, -1) for n in nodes
+    ])
+    labels = _two_stage_labels(embeddings, params, stats)
+
+    non_empty = [lab for lab in labels if len(lab) > 0]
+    if not non_empty:
+        # GUARD (iv): nothing cleared the threshold. The reference would
+        # produce zero clusters and drop every node at this layer.
+        stats["empty_label_trips"] = stats.get("empty_label_trips", 0) + 1
+        return [list(nodes)]
+
+    clusters: list[list[PaperNode]] = []
+    for label in sorted({int(x) for lab in non_empty for x in lab.tolist()}):
+        members = [nodes[i] for i, lab in enumerate(labels) if label in lab]
+        if not members:
+            continue
+        if len(members) == 1:
+            clusters.append(members)
+            continue
+        total_tokens = sum(
+            len(_encoding().encode(m.text)) for m in members
+        )
+        if total_tokens <= params.max_length_in_cluster:
+            clusters.append(members)
+            continue
+        if _depth >= params.max_recluster_depth:
+            stats["recluster_guard_trips"] = (
+                stats.get("recluster_guard_trips", 0) + 1
+            )
+            clusters.append(members)
+            continue
+        stats["recluster_calls"] = stats.get("recluster_calls", 0) + 1
+        clusters.extend(
+            perform_clustering(members, params, stats, _depth=_depth + 1)
+        )
+    return clusters
+
+
+# --- summarisation input format (port of utils.get_text) ------------------
+
+
+def get_text(nodes: list[PaperNode]) -> str:
+    """Reference utils.get_text: collapse newlines per node, join on blank lines.
+
+    This is the exact string the reference hands the summariser, so it is
+    reproduced verbatim including the trailing "\\n\\n". Note it collapses
+    internal newlines — the same treatment this module's chunker already
+    applies at split time.
+    """
+    out = ""
+    for n in nodes:
+        out += f"{' '.join(n.text.splitlines())}"
+        out += "\n\n"
+    return out
+
+
+# --- bottom-up construction (port of cluster_tree_builder.construct_tree) -
+
+
+ClusterFn = Callable[[list[PaperNode], PaperTreeParams, dict], list[list[PaperNode]]]
+SummarizeContextFn = Callable[[str], str]
+EmbedFn = Callable[[list[str]], np.ndarray]
+
+
+def _cluster_sort_key(
+    cluster: list[PaperNode], position: dict[str, int]
+) -> tuple:
+    """Deterministic cluster ordering, so node ids never depend on timing.
+
+    The reference assigns node indices inside a Lock-guarded dict while
+    summarising on a ThreadPoolExecutor, which makes its ids a function
+    of completion order. Ours are a function of member position in the
+    input layer, so `max_workers > 1` cannot perturb the artifact — the
+    cache-identity contract again (see micro-divergence (i)).
+    """
+    positions = sorted(position[n.node_id] for n in cluster)
+    return (positions[0], len(positions), tuple(positions))
+
+
+def build_paper_tree(
+    chunk_texts: list[str],
+    chunk_embeddings: np.ndarray,
+    *,
+    params: PaperTreeParams,
+    summarize_fn: SummarizeContextFn,
+    embed_fn: EmbedFn,
+    cluster_fn: ClusterFn | None = None,
+    max_workers: int = 1,
+    on_summary: Callable[[PaperNode], None] | None = None,
+    verbose: bool = False,
+) -> PaperTree:
+    """Build the paper's bottom-up tree.
+
+    Layer 0 is the leaf chunks. Each iteration soft-clusters the current
+    layer, summarises each cluster over `get_text(cluster)`, embeds the
+    new summaries, and repeats. Stops at `params.num_layers` iterations
+    or, per the reference, as soon as a layer holds no more than
+    `reduction_dimension + 1` nodes.
+
+    `summarize_fn` takes ONE concatenated context string, matching the
+    reference's `summarize(context=node_texts, ...)`. That differs from
+    src/raptor.py's list-of-passages signature by design.
+
+    `cluster_fn` is a test seam: it defaults to `perform_clustering` and
+    exists so the deterministic bookkeeping (ids, multi-parent links,
+    leaf-index closure) can be tested without paying for UMAP fits.
+
+    `max_workers > 1` threads only the summariser API calls. Node ids and
+    tree shape are computed before any call is dispatched, so the
+    artifact is byte-identical to a sequential build.
+    """
+    if chunk_embeddings.ndim != 2:
+        raise ValueError("chunk_embeddings must be 2D (n_chunks, dim)")
+    if len(chunk_texts) != chunk_embeddings.shape[0]:
+        raise ValueError(
+            f"chunk_texts ({len(chunk_texts)}) and chunk_embeddings "
+            f"({chunk_embeddings.shape[0]}) length mismatch"
+        )
+    if not chunk_texts:
+        raise ValueError("chunk_texts must be non-empty")
+
+    cluster = cluster_fn if cluster_fn is not None else perform_clustering
+    stats: dict = {"n_summary_calls": 0}
+
+    nodes: dict[str, PaperNode] = {}
+    layer_to_nodes: dict[int, list[str]] = {0: []}
+    for i, text in enumerate(chunk_texts):
+        nid = f"L0_{i:06d}"
+        nodes[nid] = PaperNode(
+            node_id=nid,
+            layer=0,
+            text=text,
+            leaf_indices=[i],
+            embedding=chunk_embeddings[i].astype(np.float32, copy=False),
+        )
+        layer_to_nodes[0].append(nid)
+
+    current = list(layer_to_nodes[0])
+    realised_layers = 1
+
+    for layer in range(params.num_layers):
+        if len(current) <= params.reduction_dimension + 1:
+            # Reference stop condition: `len(node_list_current_layer) <=
+            # self.reduction_dimension + 1`.
+            if verbose:
+                print(
+                    f"[raptor_paper] stop at layer {layer}: "
+                    f"{len(current)} nodes <= {params.reduction_dimension + 1}"
+                )
+            break
+
+        layer_nodes = [nodes[nid] for nid in current]
+        position = {nid: i for i, nid in enumerate(current)}
+        clusters = cluster(layer_nodes, params, stats)
+        clusters = [c for c in clusters if c]
+        if not clusters:
+            break
+        clusters.sort(key=lambda c: _cluster_sort_key(c, position))
+
+        contexts = [get_text(c) for c in clusters]
+        if max_workers > 1 and len(contexts) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                summaries = list(pool.map(summarize_fn, contexts))
+        else:
+            summaries = [summarize_fn(ctx) for ctx in contexts]
+        stats["n_summary_calls"] += len(summaries)
+
+        next_layer = layer + 1
+        new_ids: list[str] = []
+        for rank, (members, summary) in enumerate(zip(clusters, summaries)):
+            nid = f"L{next_layer}_{rank:06d}"
+            leaves: set[int] = set()
+            for m in members:
+                leaves.update(m.leaf_indices)
+            node = PaperNode(
+                node_id=nid,
+                layer=next_layer,
+                text=summary or "",
+                children=[m.node_id for m in members],
+                leaf_indices=sorted(leaves),
+            )
+            for m in members:
+                m.parent_ids.append(nid)
+            nodes[nid] = node
+            new_ids.append(nid)
+            if on_summary is not None:
+                on_summary(node)
+
+        # Batch-embed the new layer's summaries in one pass. Empty
+        # summaries get no embedding and are excluded from the collapsed
+        # index, mirroring src/raptor.py's handling.
+        texts = [nodes[nid].text for nid in new_ids]
+        keep = [bool(t and t.strip()) for t in texts]
+        to_embed = [t for t, k in zip(texts, keep) if k]
+        if to_embed:
+            emb = embed_fn(to_embed)
+            it = iter(emb)
+            for nid, k in zip(new_ids, keep):
+                nodes[nid].embedding = (
+                    next(it).astype(np.float32, copy=False) if k else None
+                )
+
+        layer_to_nodes[next_layer] = new_ids
+        realised_layers = next_layer + 1
+        # A node whose summariser returned empty text has no embedding and
+        # cannot be clustered further (np.asarray(None) would raise). It
+        # stays in the tree for provenance but drops out of the next
+        # round, and out of the collapsed index. The reference does not
+        # check this because it never inspects the summariser's output.
+        current = [nid for nid in new_ids if nodes[nid].embedding is not None]
+        if not current:
+            break
+        if verbose:
+            print(
+                f"[raptor_paper] layer {next_layer}: {len(new_ids)} nodes "
+                f"from {len(layer_nodes)} ({len(layer_nodes) / max(1, len(new_ids)):.1f} children/parent)"
+            )
+
+    tree = PaperTree(
+        nodes=nodes,
+        layer_to_nodes=layer_to_nodes,
+        n_layers=realised_layers,
+        params=params,
+        stats=stats,
+    )
+    tree.stats.update(tree_stats(tree))
+    return tree
+
+
+# --- fidelity gates -------------------------------------------------------
+
+
+def tree_stats(tree: PaperTree) -> dict:
+    """Diagnostics, including the three paper-comparable fidelity gates.
+
+    Paper targets (App. C Table 10 / App. I), to be checked on the FIRST
+    real tree before any further benchmark is built:
+      * children per parent  5.7 - 6.8
+      * mean summary length  ~131 tokens  — but see ruling 4: the
+        reference caps completions at summarization_length=100, so a
+        faithful build should land NEAR 100 with visible truncation. A
+        mean at ~100 rather than ~131 is itself the finding, namely that
+        the paper's reported figure cannot have come from this config.
+      * non-leaf share of RETRIEVED nodes 18.5% - 57% — query-time, so
+        it is measured by the analyser, not here.
+    """
+    summaries = tree.summary_nodes()
+    n_children = [len(n.children) for n in summaries]
+    summary_tokens = [
+        len(_encoding().encode(n.text)) for n in summaries if n.text.strip()
+    ]
+    multi_parent = [n for n in tree.nodes.values() if len(n.parent_ids) > 1]
+    return {
+        "n_nodes": len(tree.nodes),
+        "n_leaves": len(tree.layer_to_nodes.get(0, [])),
+        "n_summary_nodes": len(summaries),
+        "n_layers": tree.n_layers,
+        "layer_sizes": {
+            int(k): len(v) for k, v in sorted(tree.layer_to_nodes.items())
+        },
+        "mean_children_per_parent": (
+            float(np.mean(n_children)) if n_children else 0.0
+        ),
+        "mean_summary_tokens": (
+            float(np.mean(summary_tokens)) if summary_tokens else 0.0
+        ),
+        "max_summary_tokens": max(summary_tokens) if summary_tokens else 0,
+        "n_multi_parent_nodes": len(multi_parent),
+        "multi_parent_share": (
+            len(multi_parent) / len(tree.nodes) if tree.nodes else 0.0
+        ),
+        "parent_count_histogram": dict(
+            Counter(len(n.parent_ids) for n in tree.nodes.values())
+        ),
+    }
+
+
+# --- collapsed index (paper: the ENTIRE tree in one layer) ----------------
+
+
+@dataclass
+class PaperCollapsedIndex:
+    """FAISS index over EVERY node of the tree, leaves and summaries alike.
+
+    Paper §3 Querying: "First, collapse the entire RAPTOR tree into a
+    single layer... calculate the cosine similarity between the query
+    embedding and the embeddings of all nodes present in the collapsed
+    set." There is no root exclusion — src/raptor.py's
+    `include_root_in_flat_index=False` has no counterpart here, because
+    the paper's top layer is whatever the clustering produced rather than
+    a synthetic all-corpus root.
+    """
+
+    faiss_index: Any
+    refs: list[dict]  # {"node_id": str, "layer": int, "is_leaf": bool}
+    dim: int
+
+
+def build_collapsed_index(tree: PaperTree) -> PaperCollapsedIndex:
+    import faiss
+
+    rows: list[np.ndarray] = []
+    refs: list[dict] = []
+    for nid in tree.all_node_ids():
+        node = tree.nodes[nid]
+        if node.embedding is None:
+            continue
+        rows.append(np.asarray(node.embedding, dtype=np.float32).reshape(1, -1))
+        refs.append({
+            "node_id": nid,
+            "layer": int(node.layer),
+            "is_leaf": bool(node.is_leaf),
+        })
+    if not rows:
+        raise RuntimeError("collapsed index: no embedded nodes")
+
+    combined = np.vstack(rows)
+    dim = int(combined.shape[1])
+    index = faiss.IndexFlatIP(dim)
+    index.add(combined)
+    return PaperCollapsedIndex(faiss_index=index, refs=refs, dim=dim)
+
+
+# --- serialisation (JSON topology + .npy embeddings + FAISS binary) -------
+# Same contract as src/raptor.py: no pickle, because these artifacts get
+# re-inspected months later during thesis writing and JSON survives
+# Python upgrades that pickle does not.
+
+
+def save_paper_tree(tree: PaperTree, tree_json_path: Path, emb_path: Path) -> None:
+    tree_json_path.parent.mkdir(parents=True, exist_ok=True)
+    ordered = tree.all_node_ids()
+    obj = {
+        "schema": PAPER_TREE_SCHEMA_VERSION,
+        "n_layers": tree.n_layers,
+        "params": asdict(tree.params),
+        "stats": tree.stats,
+        "layer_to_nodes": {
+            str(k): list(v) for k, v in sorted(tree.layer_to_nodes.items())
+        },
+        "nodes": [
+            {
+                "node_id": n.node_id,
+                "layer": n.layer,
+                "text": n.text,
+                "children": list(n.children),
+                "parent_ids": list(n.parent_ids),
+                "leaf_indices": list(n.leaf_indices),
+                "has_embedding": n.embedding is not None,
+            }
+            for n in (tree.nodes[nid] for nid in ordered)
+        ],
+    }
+    tree_json_path.write_text(json.dumps(obj, indent=2, ensure_ascii=False))
+
+    embs = [
+        tree.nodes[nid].embedding
+        for nid in ordered
+        if tree.nodes[nid].embedding is not None
+    ]
+    mat = (
+        np.vstack([e.reshape(1, -1) for e in embs]).astype(np.float32)
+        if embs
+        else np.zeros((0, 0), dtype=np.float32)
+    )
+    np.save(emb_path, mat)
+
+
+def load_paper_tree(tree_json_path: Path, emb_path: Path) -> PaperTree:
+    obj = json.loads(tree_json_path.read_text())
+    schema = obj.get("schema")
+    if schema != PAPER_TREE_SCHEMA_VERSION:
+        raise ValueError(
+            f"paper tree schema mismatch: on-disk {schema!r} != "
+            f"{PAPER_TREE_SCHEMA_VERSION!r}. The cache key should have "
+            "prevented this; do not silently coerce."
+        )
+    params = PaperTreeParams(**obj["params"])
+    embs = np.load(emb_path) if Path(emb_path).exists() else None
+    emb_iter = iter(embs) if embs is not None and len(embs) > 0 else None
+
+    nodes: dict[str, PaperNode] = {}
+    for d in obj["nodes"]:
+        node = PaperNode(
+            node_id=d["node_id"],
+            layer=int(d["layer"]),
+            text=d.get("text", ""),
+            children=list(d.get("children", ())),
+            parent_ids=list(d.get("parent_ids", ())),
+            leaf_indices=[int(i) for i in d.get("leaf_indices", ())],
+        )
+        if d.get("has_embedding") and emb_iter is not None:
+            node.embedding = next(emb_iter).astype(np.float32, copy=False)
+        nodes[node.node_id] = node
+
+    return PaperTree(
+        nodes=nodes,
+        layer_to_nodes={
+            int(k): list(v) for k, v in obj["layer_to_nodes"].items()
+        },
+        n_layers=int(obj["n_layers"]),
+        params=params,
+        stats=dict(obj.get("stats", {})),
+    )
+
+
+def save_collapsed_index(
+    idx: PaperCollapsedIndex, faiss_path: Path, meta_path: Path
+) -> None:
+    import faiss
+
+    faiss_path.parent.mkdir(parents=True, exist_ok=True)
+    faiss.write_index(idx.faiss_index, str(faiss_path))
+    meta_path.write_text(
+        json.dumps({"dim": idx.dim, "refs": idx.refs}, ensure_ascii=False)
+    )
+
+
+def load_collapsed_index(
+    faiss_path: Path, meta_path: Path
+) -> PaperCollapsedIndex:
+    import faiss
+
+    meta = json.loads(meta_path.read_text())
+    return PaperCollapsedIndex(
+        faiss_index=faiss.read_index(str(faiss_path)),
+        refs=list(meta["refs"]),
+        dim=int(meta["dim"]),
+    )
+
+
+# --- cache identity (Lever B, strict reading) -----------------------------
+
+
+def paper_substrate_extra(
+    *,
+    params: PaperTreeParams,
+    summary_model: str,
+    summary_prompt_version: str,
+    chunker_version: str = RAPTOR_CHUNKER_VERSION,
+    summary_max_tokens: int = 100,
+    sparse: str = "bm25okapi",
+    fusion: str = "rrf",
+    rrf_k: int = 60,
+    include_root: bool = True,
+) -> dict:
+    """M4's substrate-key extras. Deliberately NOT a call into src/raptor.py.
+
+    The approved lever was "an optional kwarg on raptor_substrate_extra,
+    written into the dict only when passed", which is provably safe for
+    the frozen M7 — but it requires editing a file M7 imports. This
+    function is the stricter reading of the same intent: it emits the
+    SAME seven base fields that `raptor.raptor_substrate_extra` emits,
+    plus the M4-only keys, so `src/raptor.py` is never opened at all and
+    M7's key cannot move by construction rather than by argument.
+
+    The M4-only keys exist because of the original landmine: the shared
+    extras fold tree PARAMETERS but never the clustering ALGORITHM, so
+    swapping KMeans for UMAP+GMM would have changed the artifacts without
+    changing the key and every warm cache would have silently served the
+    old tree. `clustering.algo` and `tree_schema` are what make the swap
+    visible to the key.
+
+    `include_root` defaults True: the paper collapses the ENTIRE tree,
+    and there is no synthetic all-corpus root to exclude. The field is
+    kept only so the base schema stays recognisable next to M7's.
+    """
+    return {
+        # --- the seven base fields, same names as raptor_substrate_extra ---
+        "tree": asdict(params),
+        "summary_model": summary_model,
+        "summary_prompt_version": summary_prompt_version,
+        "include_root_in_flat_index": bool(include_root),
+        "sparse": sparse,
+        "fusion": fusion,
+        "rrf_k": int(rrf_k),
+        # --- M4-only: what the shared extras could not express ---
+        "clustering": {"algo": "umap_gmm_bic"},
+        "tree_schema": PAPER_TREE_SCHEMA_VERSION,
+        "chunker_impl": chunker_version,
+        "summary_max_tokens": int(summary_max_tokens),
+    }
+
+
 __all__ = [
     "REFERENCE_ENCODING",
+    "REFERENCE_RANDOM_SEED",
     "RAPTOR_CHUNKER_VERSION",
+    "PAPER_TREE_SCHEMA_VERSION",
     "TextSpan",
+    "PaperNode",
+    "PaperTree",
+    "PaperTreeParams",
+    "PaperCollapsedIndex",
     "count_tokens_reference",
     "split_text_raptor",
+    "perform_clustering",
+    "get_text",
+    "build_paper_tree",
+    "tree_stats",
+    "build_collapsed_index",
+    "save_paper_tree",
+    "load_paper_tree",
+    "save_collapsed_index",
+    "load_collapsed_index",
+    "paper_substrate_extra",
 ]
