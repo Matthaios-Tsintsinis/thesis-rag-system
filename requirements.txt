@@ -23,7 +23,43 @@ openpyxl>=3.1                   # xlsx engine for pandas
 
 # --- M8 hierarchical clustering ---
 scikit-learn>=1.4               # MiniBatchKMeans + TfidfVectorizer
+                                # (also GaussianMixture for M4's paper-faithful
+                                # UMAP+GMM clustering — already satisfied)
 nltk>=3.8                       # EN+EL stopwords for TF-IDF keyword extractor
+
+# --- M4 paper-faithful RAPTOR clustering (src/raptor_paper.py) ---
+# The RAPTOR paper reduces node embeddings with UMAP (global then local)
+# and soft-clusters them with a BIC-selected GMM. Neither is substitutable
+# without abandoning paper fidelity, so these are hard requirements for
+# M4, not optional extras.
+umap-learn>=0.5.12              # verified 0.5.12 on Colab 2026-07-29
+numba>=0.66                     # FLOOR IS LOAD-BEARING, DO NOT LOWER.
+                                # numba 0.60.0 pins numpy<2.1, which collides
+                                # head-on with this file's numpy>=2.1 floor.
+                                # The collision was invisible for weeks because
+                                # nothing imported numba; umap-learn does.
+                                # Resolution is upgrading numba (>=0.66 drops
+                                # the numpy<2.1 pin), NOT lowering numpy —
+                                # numpy<2.1 breaks the faiss / torch /
+                                # sentence-transformers wheels the whole
+                                # harness runs on.
+                                # Pulled transitively: llvmlite, pynndescent.
+#
+# REPRODUCIBILITY NOTE. UMAP output is version-sensitive even under a
+# pinned random_state, so M4's tree topology is reproducible only against
+# a pinned stack, not absolutely. Verified-working set, and the one to
+# quote in the thesis methods section:
+#   numpy 2.4.6 / numba 0.66.0 / llvmlite 0.48.0 / umap-learn 0.5.12 /
+#   pynndescent 0.6.0   (Colab, Python 3.12, 2026-07-29)
+#
+# INSTALL ORDER IS NOT OPTIONAL — see src/colab_setup.py
+# verify_umap_stack(). Installing these upgrades numpy inside a live
+# kernel that already imported the stock version, which leaves a spliced
+# module tree; the observed failure is
+#   ImportError: cannot import name '_center' from 'numpy._core.umath'
+# and it takes down faiss / torch / sentence-transformers, not just UMAP.
+# Install, RESTART THE RUNTIME, then verify. Never run an eval cell in
+# the same kernel session as the install.
 
 # --- Generator (Qwen2.5-3B-Instruct, 4-bit NF4 on CUDA) ---
 transformers>=4.44
