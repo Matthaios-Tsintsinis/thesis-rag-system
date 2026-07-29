@@ -56,16 +56,30 @@ the shared harness chunker at this commit, so NO cache key moves.
 #   would feed the generator punctuation-free text, which no reading
 #   of the paper supports.
 #
-#   Two consequences, accepted:
-#   1. Token accounting shifts. The reference counts tokens on
-#      STRIPPED sentences; we count on punctuated ones, so each
-#      sentence costs ~1 more token and our 100-token chunks hold
-#      ~1-3% less prose than the reference's would.
-#   2. Newlines are treated differently from punctuation. `. ! ? , ; :`
-#      are CONTENT and are restored; `\\n` is LAYOUT and is consumed as
-#      a pure boundary. This also matches reference behaviour
-#      downstream, whose `get_text` collapses newlines regardless
-#      (`' '.join(node.text.splitlines())`).
+#   SUB-RULING on newlines (ruled 2026-07-29, alongside the above).
+#   Ruling 1 restores `. ! ? , ; :` but NOT `\\n`. This is an
+#   application of the ruling, not an exception to it: the ruling
+#   concerns TERMINATORS destroyed by a regex artifact, and a newline is
+#   not a terminator — it is layout. Three reasons it must collapse to a
+#   single space rather than be preserved literally:
+#     (a) the paper is silent on newlines and describes only "short,
+#         contiguous texts", so nothing asks for them;
+#     (b) the reference collapses them anyway at READ time — `get_text`
+#         does `' '.join(node.text.splitlines())` before any node text
+#         reaches an embedder or a prompt — so preserving them would
+#         diverge from reference BEHAVIOUR while claiming to follow
+#         reference code;
+#     (c) preserving them would therefore diverge from BOTH the code and
+#         the paper text, which is the one outcome no reading supports.
+#   So: `. ! ? , ; :` are CONTENT and are restored and attached; `\\n`
+#   runs are consumed as pure boundaries.
+#
+#   CONSEQUENCE, accepted, no action. Token accounting shifts. The
+#   reference counts tokens on STRIPPED sentences; we count on
+#   punctuated ones, so each sentence costs ~1 more token and our
+#   100-token chunks hold roughly 1-3% less prose than the reference's
+#   would. This is a direct and unavoidable consequence of ruling 1 and
+#   is recorded rather than corrected.
 #
 # CACHE DISCIPLINE. The 100-token size is carried on the EXISTING
 # `ChunkingConfig.chunk_words` field (read as TOKENS under
