@@ -145,21 +145,95 @@ def _generate_openai(
     )
 
 
+def assert_loaded_generator_matches(
+    *,
+    requested_name: str,
+    loaded_name: str | None,
+    want_4bit: bool,
+    is_quantized: bool,
+    dtype_str: str,
+) -> None:
+    """Refuse a generator that is not the one the caller asked for.
+
+    THE b6e35c6 LESSON, ENFORCED. That bug ran Qwen2.5-3B locally while
+    every report said gpt-4o-mini, and it survived because nothing
+    compared the configured generator against the loaded one — the only
+    tell was a 6.17GB download in a Colab log. Recording provenance is
+    not enough; a mismatch has to ABORT, because the failure is silent
+    by construction and every downstream number inherits it.
+
+    Three ways the artifact can differ from the name:
+      * a different checkpoint than requested;
+      * quantization applied (or skipped) against the config, which
+        makes it a materially different model from the one the thesis
+        names;
+      * an unintended dtype — `torch_dtype="auto"` can yield fp32 or
+        bf16 depending on the checkpoint, which changes both numerics
+        and VRAM.
+
+    Pure function so the policy is testable without a GPU or a download.
+    """
+    if loaded_name and loaded_name != requested_name:
+        raise RuntimeError(
+            f"generator mismatch: requested {requested_name!r} but loaded "
+            f"{loaded_name!r}. Refusing to run — this is the b6e35c6 "
+            "failure mode (reporting one model while running another)."
+        )
+    if bool(is_quantized) != bool(want_4bit):
+        raise RuntimeError(
+            f"quantization mismatch for {requested_name!r}: config asked for "
+            f"load_in_4bit={want_4bit} but the loaded model "
+            f"{'IS' if is_quantized else 'is NOT'} quantized. A silently "
+            "quantized model is not the model the thesis names."
+        )
+    if not want_4bit and dtype_str not in ("torch.float16", "torch.bfloat16"):
+        raise RuntimeError(
+            f"unexpected dtype {dtype_str} for {requested_name!r}. "
+            "Unquantized local generators must load in fp16/bf16; fp32 "
+            "doubles VRAM and changes numerics vs the reported run."
+        )
+
+
+def generator_identity(model_name: str, *, load_in_4bit: bool) -> dict:
+    """Runtime identity of the generator, for the manifest / run summary.
+
+    Recorded so a cell can be traced to the exact artifact that produced
+    it. GPU class is included because local decoding is not bit-identical
+    across GPU generations — see the determinism note in the M4 fidelity
+    plan; a tree or an answer set is reproducible against a pinned
+    runtime, not absolutely.
+    """
+    import torch
+
+    gpu = (
+        torch.cuda.get_device_name(0)
+        if torch.cuda.is_available()
+        else "cpu"
+    )
+    return {
+        "generator_model": model_name,
+        "load_in_4bit": bool(load_in_4bit),
+        "torch_version": torch.__version__,
+        "gpu": gpu,
+    }
+
+
 @functools.lru_cache(maxsize=2)
 def load_generator(
     model_name: str = GENERATOR_MODEL,
-    load_in_4bit: bool = True,
+    load_in_4bit: bool = False,
 ) -> Any:
-    """Return (tokenizer, model). 4-bit NF4 quant on CUDA via bitsandbytes.
+    """Return (tokenizer, model). fp16 by default; 4-bit only on request.
 
-    Only used by the local-HF answer path (`_generate_local`). The
-    default eval grid routes to OpenAI via `generate()` and never calls
-    this function. Kept for the opt-in local-generator ablation.
+    Used by the local-HF answer path (`_generate_local`). The default is
+    now fp16 — see config.LOAD_GENERATOR_IN_4BIT for why the previous
+    True default was a latent repeat of b6e35c6. The load is gated by
+    `assert_loaded_generator_matches`, which aborts rather than warns.
     """
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    kwargs: dict = {"torch_dtype": "auto"}
+    kwargs: dict = {}
     if load_in_4bit and torch.cuda.is_available():
         from transformers import BitsAndBytesConfig
 
@@ -171,11 +245,28 @@ def load_generator(
         )
         kwargs["device_map"] = "auto"
     elif torch.cuda.is_available():
+        # EXPLICIT fp16, never torch_dtype="auto" — "auto" resolves from
+        # the checkpoint and can hand back fp32 or bf16 without saying so.
+        kwargs["torch_dtype"] = torch.float16
         kwargs["device_map"] = "auto"
+    else:
+        kwargs["torch_dtype"] = torch.float32  # CPU smoke only
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForCausalLM.from_pretrained(model_name, **kwargs)
     model.eval()
+
+    assert_loaded_generator_matches(
+        requested_name=model_name,
+        loaded_name=getattr(model.config, "_name_or_path", None),
+        want_4bit=bool(load_in_4bit and torch.cuda.is_available()),
+        is_quantized=getattr(model.config, "quantization_config", None) is not None,
+        dtype_str=str(model.dtype),
+    )
+    print(
+        "[models] loaded local generator: "
+        f"{generator_identity(model_name, load_in_4bit=load_in_4bit)}"
+    )
     return tokenizer, model
 
 

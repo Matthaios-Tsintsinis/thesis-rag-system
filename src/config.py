@@ -105,7 +105,15 @@ ChunkingStrategy = Literal["semantic", "word_window", "raptor_100tok"]
 GEN_MAX_NEW_TOKENS = 512
 GEN_TEMPERATURE = 0.0
 GEN_TOP_P = 1.0
-LOAD_GENERATOR_IN_4BIT = True
+# fp16, NOT 4-bit. This default was True and it is the b6e35c6 failure
+# mode waiting to recur: a silently quantized model is NOT the model the
+# thesis names, and nothing in the output would have said so. Under the
+# local-generator design the reported models (Qwen2.5-7B / Llama-3.1-8B,
+# ~15-16GB fp16) fit an L4's 24GB without quantization, so there is no
+# reason to quantize and every reason not to. `models.load_generator`
+# now REFUSES to return a model whose realised quantization or dtype
+# disagrees with what was requested.
+LOAD_GENERATOR_IN_4BIT = False
 
 
 # --- Prompts --------------------------------------------------------------
