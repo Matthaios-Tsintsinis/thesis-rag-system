@@ -83,7 +83,19 @@ import numpy as np
 
 
 SYSTEMS = ("M1", "M2", "M3", "M4", "M9")
-BENCHMARKS = ("multihop_rag", "narrativeqa")
+# QASPER and QuALITY are being dropped from the matrix, but their banked
+# cells are included deliberately: they are where the tightest orderings
+# were read off (QASPER 0.338-0.343, QuALITY 0.723-0.735 across four
+# systems), so they are the sharpest test of whether differences in that
+# range were ever supported. Answering that is worth more than the
+# benchmarks themselves.
+#
+# NOTE on QuALITY: its answer metric is multiple-choice accuracy, so
+# per-query deltas are in {-1, 0, +1}. The paired sign-flip permutation
+# test handles that correctly and degenerate-free — on binary paired
+# data it reduces to an exact McNemar test, which is the textbook-right
+# choice. A t-test on {-1,0,+1} would not be.
+BENCHMARKS = ("multihop_rag", "narrativeqa", "qasper", "quality")
 METRICS = ("retrieval", "answer")
 
 N_BOOT = 10_000
