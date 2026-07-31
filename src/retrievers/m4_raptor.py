@@ -1,88 +1,79 @@
-"""M4 — Official RAPTOR (collapsed retrieval).
+"""M4 — RAPTOR collapsed retrieval, paper-faithful (Sarthi et al., ICLR 2024).
 
-The eval plan's primary headline baseline (Section 3, system M4). The
-RAPTOR paper [R3] reports collapsed retrieval as the stronger variant
-of RAPTOR over single-path tree traversal; this implementation follows
-that variant and PIPELINE_DESIGN.md sections 3.4, 3.5, and 4.4 Axis-1
-Part A. See the DEVIATIONS block below for where M4 diverges from the
-published paper and why.
+Rebuilt 2026-07-29 under the M4 paper-fidelity directive: M4 is to be as
+close to arXiv:2401.18059 as it is possible to make it, and the only
+admissible reasons to deviate are dramatic cost, literal impossibility,
+or an infrastructure contract the harness cannot function without.
+Comparability with the other systems, harness uniformity, implementation
+effort, and "it might beat M7" are explicitly NOT reasons. A faithful
+RAPTOR beating M7 is a real result.
 
-NO cross-encoder rerank in M4 — the published collapsed-RAPTOR pipeline
-has none, and reranking is M7's contribution to attribute, not M4's.
-By default M4's first stage is DENSE-ONLY cosine ranking over the flat
-collapsed index (paper-faithful); the flat index returns chunks after
-summary-node expansion.
+Pipeline, end to end:
+  chunk        100 tiktoken tokens, sentence-preserving, no overlap
+               (raptor_paper.split_text_raptor)
+  embed        SBERT multi-qa-mpnet-base-cos-v1, the checkpoint the paper names
+  tree         BOTTOM-UP: UMAP global+local -> BIC-selected GMM soft
+               clustering -> summarise each cluster -> re-embed -> repeat
+               (raptor_paper.build_paper_tree)
+  retrieve     collapse the ENTIRE tree into one layer, rank ALL nodes by
+               dense cosine, take top-k
+  context      retrieved summary nodes go into the prompt AS THEIR OWN TEXT
 
-Index-time substrate (chunks, embeddings, tree with LLM summaries,
-flat collapsed index, BM25 over leaf chunks) is shared with M7 via
-src/raptor.py. M7 layers Axes 2/3 on top of this exact substrate.
+# === DEVIATIONS FROM THE RAPTOR PAPER — thesis footnote ===
+# 1. Summariser. The paper uses gpt-3.5-turbo. GENUINELY FORCED: the
+#    model is deprecated and cannot be relied on for the lifetime of the
+#    thesis. M4Config.summary_model carries the replacement.
+# 2. Reader. The paper reads with GPT-3.5 / GPT-4 / UnifiedQA-3B; this
+#    harness holds ONE reader constant across every system so that
+#    per-system deltas attribute to retrieval rather than to reader
+#    capacity. Experimental control, not a fidelity choice.
+# 3. Reader prompt. The paper's QA prompt ("You are Question Answering
+#    Portal" / "Given Context: ... Give the best full answer amongst the
+#    option to question ...") is replaced by the harness-wide answer
+#    prompt, whose exact abstention string is load-bearing for the
+#    unanswerable / abstention scorers across every benchmark.
+# 4. Summarisation temperature is 0.0; the reference leaves it unset
+#    (=1.0). Infrastructure contract: a cache key must determine the
+#    artifact it names. Consequence recorded — the reference's own trees
+#    are not reproducible run to run.
+# 5. UMAP is seeded and the re-cluster recursion is depth-guarded; the
+#    reference does neither. See the micro-divergence block in
+#    src/raptor_paper.py for all four, with reasoning.
+# 6. Chunk terminators are restored rather than discarded. See ruling 1
+#    and its newline sub-ruling in src/raptor_paper.py.
+# 7. NO SPARSE RETRIEVAL. The paper's collapsed retrieval is dense cosine
+#    only, so this rebuild drops the BM25 index and the opt-in
+#    dense+BM25 RRF first stage that the previous M4 carried. Both
+#    existed because M4 used to SHARE a substrate with M7, which needs
+#    BM25; M4 now owns its namespace and the paper has no sparse
+#    component, so carrying one would be non-paper machinery kept for no
+#    reason. rrf_k / first_stage_top_k remain on M4Config only so that
+#    existing callers construct.
+#
+# NOT a deviation, recorded because it looks like one: retrieved SUMMARY
+# nodes carry an EMPTY gold_provenance, so the CK-2 retrieval scorer
+# cannot credit them. That is honest rather than convenient — a summary
+# is abstractive text with no gold span, and crediting it with its
+# descendants' atoms would inflate recall while collapsing precision, and
+# would destroy MultiHop's document ranking outright. The consequence is
+# real and must be reported: M4's retrieval-F1 is NOT directly comparable
+# to systems that return only leaf chunks, because 18.5-57% of its
+# retrieved units (paper App. I) are unscoreable by construction. The
+# leaf-expanded diagnostic twin exists to quantify exactly that gap.
 
-# === DEVIATIONS FROM THE RAPTOR PAPER (Sarthi et al., ICLR 2024) — thesis footnote ===
-# 1. First-stage retrieval (FIDELITY-RESTORED). The paper's collapsed
-#    retrieval ranks the flattened node set by DENSE cosine similarity
-#    only. M4 runs dense-only by default (M4Config.hybrid_first_stage=
-#    False) to match the paper. The shared RAPTOR substrate also builds
-#    a BM25 index (M7 needs it); M4 simply does not use it at query
-#    time. hybrid_first_stage=True restores a dense+BM25 RRF first stage
-#    as an OPT-IN ablation — that is a strengthening over dense-only
-#    (CLAUDE.md rule #8) and is off by default. The flag is query-time
-#    only, NOT in raptor_substrate_extra, so toggling it never changes
-#    the substrate cache key.
-# 2. Clustering (SIMPLIFICATION). The paper builds the tree with UMAP
-#    dimensionality reduction + Gaussian Mixture Model SOFT clustering
-#    (a node may belong to multiple parents), global-then-local, BIC for
-#    component count. The shared substrate (src/raptor.py) instead uses
-#    recursive MiniBatchKMeans (HARD assignment, fixed per-node count
-#    bounded by branching_factor). Hard k-means is strictly LESS
-#    expressive than soft GMM — a simplification that cannot make M4
-#    stronger than its paper version, so it needs no rule-#8 sign-off,
-#    only this note.
-# 3. Summary-node expansion (SIMPLIFICATION). Published collapsed-RAPTOR
-#    can return summary nodes DIRECTLY into context. M4 reuses the shared
-#    §4.4 per-node-type expansion (built for M7): every retrieved summary
-#    hit is expanded to query-scored descendant leaf chunks (tagged
-#    source_unit_type=summary_low/mid/high). M4 therefore feeds the
-#    generator chunk text, not summary text; the summary_* tags are
-#    provenance labels, not summary nodes in context. Changes granularity
-#    (chunks vs summaries), not a capability upgrade.
-# 4. gpt-4o-mini summariser replaces the paper's deprecated GPT-3.5-turbo,
-#    and the shared gpt-4o-mini final-answer generator (both harness-wide
-#    documented deviations, CLAUDE.md).
-# 5. Chunking + retrieval budget (UNIFORMITY DEVIATION, accepted
-#    2026-07-02). The paper segments the corpus into contiguous
-#    100-token, sentence-preserving, non-overlapping chunks and fills a
-#    2000-token context budget at retrieval (~top-20 nodes). This
-#    harness instead uses the shared word_window chunker (200 words,
-#    ~260 tokens, 50-word overlap) and the natural top-15 chunks
-#    (~3,900 evidence tokens, ~2x the paper's budget). Reason: harness
-#    uniformity — all five matrix systems resolve to the SAME chunker
-#    and the same natural top-15 (verified at ff3a189), so no system is
-#    differentially advantaged; chunking-as-a-variable is deferred to
-#    the CK-1/CK-3 ablations. Direction vs the paper is CONTESTED, not
-#    neutral: the larger evidence budget is plausibly STRONGER in
-#    absolute answer quality, while ~2.6x coarser leaves yield a
-#    shallower tree — plausibly WEAKER on RAPTOR's own hierarchy
-#    mechanism; the sign is benchmark-dependent. A paper-faithful
-#    100-token-chunking M4 ablation sits in the CK backlog as the
-#    empirical resolver.
-
-Cache key folds in:
-  * shared: chunking + embedder + parsing + corpus content hash
-  * M4 extras: tree build params, summary model + prompt version,
-    include_root flag, sparse retriever name, fusion type + RRF k.
-Swapping the summarizer (e.g. gpt-4o-mini -> gpt-4.1-mini) or bumping
-SUMMARY_PROMPT_VERSION invalidates every cached tree summary cleanly.
-The answer generator is NOT in the key (it runs at query time, leaves
-no baked artifact).
+Cache: M4 owns `cache/M4_RAPTOR/<key>/`, its own namespace. It no longer
+shares the RAPTOR/ namespace with the frozen M7 — the tree schema, the
+chunker and the clustering algorithm all differ. The key is derived by
+raptor_paper.paper_substrate_extra(), which emits the same seven base
+fields the shared extras emit plus the M4-only ones, so src/raptor.py is
+never opened and M7's key cannot move by construction.
 """
 
 from __future__ import annotations
 
-import re
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 
@@ -94,10 +85,8 @@ from ..cache import (
     corpus_content_hash,
     load_chunks,
     load_embeddings,
-    load_pickle,
     save_chunks,
     save_embeddings,
-    save_pickle,
 )
 from ..chunking import Chunk, chunk_corpus
 from ..components import (
@@ -105,58 +94,57 @@ from ..components import (
     format_components_log,
     resolve_components,
 )
-from ..config import (
-    DEFAULT_CONFIG,
-    HarnessConfig,
-)
+from ..config import DEFAULT_CONFIG, HarnessConfig
 from ..models import embed_texts, load_embedder
 from ..parsing import walk_corpus
-from ..raptor import (
-    RAPTOR_SUBSTRATE_NAMESPACE,
-    FlatCollapsedIndex,
-    RaptorNode,
-    RaptorTree,
-    build_flat_collapsed_index,
-    build_raptor_tree,
-    expand_node,
-    load_flat_index,
-    load_raptor_tree,
-    raptor_substrate_extra,
-    save_flat_index,
-    save_raptor_tree,
+from ..raptor_paper import (
+    PaperCollapsedIndex,
+    PaperNode,
+    PaperTree,
+    build_collapsed_index,
+    build_paper_tree,
+    load_collapsed_index,
+    load_paper_tree,
+    paper_substrate_extra,
+    save_collapsed_index,
+    save_paper_tree,
+    summarize_paper_style,
+    tree_stats,
 )
-from ..summarization import (
-    SUMMARY_PROMPT_VERSION,
-    summarize_passages,
-)
-from .base import AnswerResult, BaseSystem, RetrievedChunk
+from .base import BaseSystem, RetrievedChunk
 
 
-_TOKEN_RE = re.compile(r"\w+", re.UNICODE)
-
+# Own namespace: the artifacts are not interchangeable with the legacy
+# RAPTOR/ substrate that M7 consumes.
+M4_SUBSTRATE_NAMESPACE = "M4_RAPTOR"
 
 REQUIRED_FILES = (
     "chunks.jsonl",
     "embeddings.npy",
-    "bm25.pkl",
-    "raptor_tree.json",
-    "raptor_summary_embeddings.npy",
-    "flat_collapsed.index",
-    "flat_collapsed_meta.json",
+    "paper_tree.json",
+    "paper_tree_embeddings.npy",
+    "collapsed.index",
+    "collapsed_meta.json",
 )
 
 
-def _tokenize(text: str) -> list[str]:
-    return _TOKEN_RE.findall(text.lower())
+def _layer_to_unit_type(layer: int) -> str:
+    """Map a bottom-up layer index onto the harness's node-type labels.
 
-
-def _rrf_fuse(rankings: list[list[int]], k: int) -> list[tuple[int, float]]:
-    """RRF (Cormack et al. 2009) over rank lists in a unified id space."""
-    scores: dict[int, float] = {}
-    for ranking in rankings:
-        for rank, item_id in enumerate(ranking):
-            scores[item_id] = scores.get(item_id, 0.0) + 1.0 / (k + rank + 1)
-    return sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    The analyser slices on {chunk, summary_low, summary_mid, summary_high}
+    (config.NodeType), which were defined for a TOP-DOWN tree where depth
+    0 is the root. Bottom-up inverts that: layer 0 is the leaves and the
+    top layer is the broadest summary. Layer 1 is therefore the LOWEST
+    (most specific) summary tier, and the mapping keeps existing analyser
+    slices meaningful without redefining the vocabulary.
+    """
+    if layer <= 0:
+        return "chunk"
+    if layer == 1:
+        return "summary_low"
+    if layer == 2:
+        return "summary_mid"
+    return "summary_high"
 
 
 class RaptorSystem(BaseSystem):
@@ -166,28 +154,38 @@ class RaptorSystem(BaseSystem):
         super().__init__(config)
         self.chunks: list[Chunk] = []
         self.chunk_embeddings: np.ndarray | None = None
-        self._bm25: Any | None = None
-        self._tree: RaptorTree | None = None
-        self._flat: FlatCollapsedIndex | None = None
-
-        # Index-time stats. Always populated (cheap); surfaced when trace=True.
+        self._tree: PaperTree | None = None
+        self._flat: PaperCollapsedIndex | None = None
         self._index_stats: dict = {}
-        # Per-query trace. Populated only when self.config.m4.trace is True.
         self._last_trace: dict = {}
-        # Resolved components: populated at the top of index(); reused at
-        # query time so embedder identity stays consistent across passes.
         self._resolved: ResolvedComponents | None = None
 
-    # --- index ----------------------------------------------------------------
+    # --- cache identity ---------------------------------------------------
+
+    def _cache_dir(self, corpus_hash: str) -> CacheDir:
+        assert self._resolved is not None
+        m4 = self.config.m4
+        extra = paper_substrate_extra(
+            params=m4.paper,
+            summary_model=m4.summary_model,
+            summary_prompt_version=m4.summary_prompt_version,
+            summary_max_tokens=m4.summary_max_tokens,
+            rrf_k=m4.rrf_k,
+            include_root=m4.include_root_in_flat_index,
+        )
+        key = compute_cache_key(
+            chunking_config=self._resolved.chunker_config,
+            embedder_model=self._resolved.embedder_id,
+            corpus_hash=corpus_hash,
+            extra=extra,
+        )
+        return CacheDir(paths.cache_dir(), M4_SUBSTRATE_NAMESPACE, key)
+
+    # --- index ------------------------------------------------------------
 
     def index(self, corpus_path: Path) -> None:
-        import faiss
-        from rank_bm25 import BM25Okapi
-
         m4 = self.config.m4
-        # M4 does not rerank (matches the published RAPTOR paper); the
-        # resolver's default_reranker=None makes that visible in the
-        # resolved bundle and the audit log.
+        # M4 does not rerank — the published pipeline has none.
         self._resolved = resolve_components(m4, self.config, default_reranker=None)
         print(f"[components] {format_components_log(self.system_id, self._resolved)}")
         chunker_cfg = self._resolved.chunker_config
@@ -195,42 +193,21 @@ class RaptorSystem(BaseSystem):
 
         corpus_path = Path(corpus_path)
         chash = corpus_content_hash(corpus_path)
-        # Shared RAPTOR substrate key: no system_id field, so M4 and M7
-        # land on the same RAPTOR/<substrate_hash>/ directory and reuse
-        # one copy of chunks/embeddings/bm25/tree/flat index. The substrate
-        # extras intentionally do NOT include embedder_id, chunker_id, or
-        # reranker_id: embedder + chunker are already in the cache key
-        # via compute_cache_key's top-level params, and reranker is
-        # query-time (the substrate does not depend on it).
-        substrate_extra = raptor_substrate_extra(
-            build=m4.build,
-            summary_model=m4.summary_model,
-            summary_prompt_version=SUMMARY_PROMPT_VERSION,
-            include_root=m4.include_root_in_flat_index,
-            rrf_k=m4.rrf_k,
-        )
-        ckey = compute_cache_key(
-            chunking_config=chunker_cfg,
-            embedder_model=embedder_id,
-            corpus_hash=chash,
-            extra=substrate_extra,
-        )
-        cdir = CacheDir(paths.cache_dir(), RAPTOR_SUBSTRATE_NAMESPACE, ckey)
+        cdir = self._cache_dir(chash)
 
         if cdir.is_complete(REQUIRED_FILES):
             print(f"[{self.system_id}] cache hit: {cdir.path}")
             self.chunks = load_chunks(cdir.chunks_path)
             self.chunk_embeddings = load_embeddings(cdir.embeddings_path)
-            self._bm25 = load_pickle(cdir.bm25_path)
-            self._tree = load_raptor_tree(
-                cdir.path / "raptor_tree.json",
-                cdir.path / "raptor_summary_embeddings.npy",
+            self._tree = load_paper_tree(
+                cdir.path / "paper_tree.json",
+                cdir.path / "paper_tree_embeddings.npy",
             )
-            self._flat = load_flat_index(
-                cdir.path / "flat_collapsed.index",
-                cdir.path / "flat_collapsed_meta.json",
+            self._flat = load_collapsed_index(
+                cdir.path / "collapsed.index",
+                cdir.path / "collapsed_meta.json",
             )
-            self._index_stats = self._collect_index_stats(summary_calls=0)
+            self._index_stats = self._collect_index_stats()
             self._indexed = True
             return
 
@@ -247,64 +224,52 @@ class RaptorSystem(BaseSystem):
             [c.text for c in self.chunks], model_name=embedder_id
         )
 
-        # BM25 over leaf chunks only — summary nodes are paraphrased text where
-        # BM25 is unreliable (PIPELINE_DESIGN section 4.4).
-        self._bm25 = BM25Okapi([_tokenize(c.text) for c in self.chunks])
-
-        # LLM-summarised cluster tree.
         summary_calls = [0]
 
-        def _on_summary(_n: RaptorNode) -> None:
+        def _on_summary(_n: PaperNode) -> None:
             summary_calls[0] += 1
+            if summary_calls[0] % 200 == 0:
+                print(f"[{self.system_id}] {summary_calls[0]} summaries...")
 
-        def _summarize(passages: list[str]) -> str:
-            return summarize_passages(passages, model=m4.summary_model)
+        def _summarize(context: str) -> str:
+            return summarize_paper_style(
+                context,
+                model=m4.summary_model,
+                max_tokens=m4.summary_max_tokens,
+            )
 
-        # embed_fn is closed over the resolved embedder so summary
-        # embeddings use the same model as chunk embeddings.
         def _embed(texts: list[str]) -> np.ndarray:
             return embed_texts(texts, model_name=embedder_id)
 
-        self._tree = build_raptor_tree(
-            chunk_texts=[c.text for c in self.chunks],
-            chunk_embeddings=self.chunk_embeddings,
-            params=m4.build,
+        self._tree = build_paper_tree(
+            [c.text for c in self.chunks],
+            self.chunk_embeddings,
+            params=m4.paper,
             summarize_fn=_summarize,
             embed_fn=_embed,
             on_summary=_on_summary,
+            max_workers=m4.summary_max_workers,
+            verbose=True,
         )
-        print(
-            f"[{self.system_id}] tree built: {len(self._tree.nodes)} nodes, "
-            f"{summary_calls[0]} gpt-4o-mini calls"
-        )
+        self._flat = build_collapsed_index(self._tree)
 
-        # Flat collapsed index: chunks + non-root summary embeddings, one matrix.
-        self._flat = build_flat_collapsed_index(
-            self._tree,
-            self.chunk_embeddings,
-            expansion=m4.expansion,
-            include_root=m4.include_root_in_flat_index,
-        )
-
-        # --- persist ---
         save_chunks(self.chunks, cdir.chunks_path)
         save_embeddings(self.chunk_embeddings, cdir.embeddings_path)
-        save_pickle(self._bm25, cdir.bm25_path)
-        save_raptor_tree(
+        save_paper_tree(
             self._tree,
-            cdir.path / "raptor_tree.json",
-            cdir.path / "raptor_summary_embeddings.npy",
+            cdir.path / "paper_tree.json",
+            cdir.path / "paper_tree_embeddings.npy",
         )
-        save_flat_index(
+        save_collapsed_index(
             self._flat,
-            cdir.path / "flat_collapsed.index",
-            cdir.path / "flat_collapsed_meta.json",
+            cdir.path / "collapsed.index",
+            cdir.path / "collapsed_meta.json",
         )
 
-        self._index_stats = self._collect_index_stats(summary_calls=summary_calls[0])
+        self._index_stats = self._collect_index_stats()
         Manifest(
-            system_id=RAPTOR_SUBSTRATE_NAMESPACE,
-            cache_key=ckey,
+            system_id=M4_SUBSTRATE_NAMESPACE,
+            cache_key=cdir.cache_key,
             chunking_config=asdict(chunker_cfg),
             embedder_model=embedder_id,
             corpus_hash=chash,
@@ -313,29 +278,65 @@ class RaptorSystem(BaseSystem):
             extra={
                 "m4": asdict(m4),
                 "index_stats": self._index_stats,
+                # Runtime identity: local decoding is not bit-identical
+                # across GPU generations or library versions, so a tree is
+                # reproducible against a PINNED runtime rather than
+                # absolutely. Recorded so a mismatch is visible, not silent.
+                "summariser_runtime": self._summariser_runtime(),
             },
         ).save(cdir.manifest_path)
 
         self._indexed = True
 
+    def _summariser_runtime(self) -> dict:
+        from ..models import generator_identity
+
+        try:
+            return generator_identity(
+                self.config.m4.summary_model, load_in_4bit=False
+            )
+        except Exception:  # torch absent on a CPU-only host
+            return {"generator_model": self.config.m4.summary_model}
+
     @property
     def resolved_components(self) -> ResolvedComponents | None:
         return self._resolved
 
-    def _collect_index_stats(self, *, summary_calls: int) -> dict:
+    def _collect_index_stats(self) -> dict:
         assert self._tree is not None and self._flat is not None
-        depth_counts = Counter(n.depth for n in self._tree.nodes.values())
-        type_counts = Counter(self._flat.node_types)
-        return {
-            "n_summary_calls_at_index": int(summary_calls),
-            "tree_n_nodes": len(self._tree.nodes),
-            "tree_depth_counts": {int(d): int(c) for d, c in depth_counts.items()},
+        stats = dict(tree_stats(self._tree))
+        type_counts = Counter(
+            _layer_to_unit_type(int(r["layer"])) for r in self._flat.refs
+        )
+        stats.update({
+            "n_summary_calls_at_index": int(self._tree.stats.get("n_summary_calls", 0)),
+            # Legacy key names kept so existing smoke assertions and the
+            # analyser keep reading M4 without a parallel vocabulary.
+            "tree_n_nodes": stats["n_nodes"],
+            "tree_depth_counts": stats["layer_sizes"],
             "flat_n_chunks": int(type_counts.get("chunk", 0)),
-            "flat_n_summaries": int(sum(
-                v for k, v in type_counts.items() if k != "chunk"
-            )),
+            "flat_n_summaries": int(
+                sum(v for k, v in type_counts.items() if k != "chunk")
+            ),
             "flat_node_type_counts": {k: int(v) for k, v in type_counts.items()},
-        }
+            # FIDELITY GATES (paper App. C / App. I). children/parent and
+            # non-leaf share are pass/fail; mean summary length is
+            # INFORMATIONAL ONLY — the paper's 131 was measured with a
+            # different summariser, and ruling 4 caps completions at 100.
+            "gate_children_per_parent": stats["mean_children_per_parent"],
+            "gate_mean_summary_tokens": stats["mean_summary_tokens"],
+            # Non-zero on either counter is a FINDING to report, not an
+            # error to silence. no_progress_trips counts layers the GMM
+            # could not split at all (BIC chose k=1); recluster_guard_trips
+            # counts the depth bound firing.
+            "recluster_guard_trips": int(
+                self._tree.stats.get("recluster_guard_trips", 0)
+            ),
+            "no_progress_trips": int(
+                self._tree.stats.get("no_progress_trips", 0)
+            ),
+        })
+        return stats
 
     @property
     def index_stats(self) -> dict:
@@ -345,140 +346,91 @@ class RaptorSystem(BaseSystem):
     def last_trace(self) -> dict:
         return dict(self._last_trace)
 
-    # --- retrieve -------------------------------------------------------------
+    # --- retrieve ---------------------------------------------------------
+
+    def _node_as_chunk(self, node: PaperNode) -> Chunk:
+        """Wrap a summary node so it can travel the RetrievedChunk path.
+
+        gold_provenance stays EMPTY — see the module block. A summary is
+        abstractive text with no gold span; crediting it with its
+        descendants' atoms would inflate recall, collapse precision, and
+        wreck MultiHop's document ranking.
+        """
+        return Chunk(
+            chunk_id=node.node_id,
+            doc_id="",  # a summary spans many source documents
+            text=node.text,
+            n_words=len(node.text.split()),
+            position=node.layer,
+            metadata={
+                "raptor_layer": node.layer,
+                "n_leaf_descendants": len(node.leaf_indices),
+                "n_children": len(node.children),
+            },
+        )
 
     def retrieve(self, query: str, k: int | None = None) -> list[RetrievedChunk]:
         self._require_indexed()
         assert self._resolved is not None
-        m4 = self.config.m4
-        # Natural top-K (m4.top_k_final=FINAL_CONTEXT_CHUNKS=15). M4
-        # baseline feeds the generator at its RAPTOR-paper-validated
-        # context size. The §4.4 expansion + RRF over first_stage_top_k
-        # are deterministic given the same first_stage inputs.
-        k = k or m4.top_k_final
-        trace_on = m4.trace
-
         assert self._flat is not None and self._tree is not None
-        assert self.chunk_embeddings is not None
+        m4 = self.config.m4
+        k = k or m4.top_k_final
 
         q_vec = embed_texts([query], model_name=self._resolved.embedder_id)
-        q_vec_1d = q_vec[0]
 
-        # --- Dense top-K over flat collapsed index (chunks + non-root summaries) ---
+        # Collapsed retrieval: dense cosine over EVERY node of the tree,
+        # leaves and summaries alike (IndexFlatIP over L2-normalised
+        # vectors == cosine). No sparse component, no fusion, no
+        # expansion — the paper ranks the flattened node set directly.
         n_flat = len(self._flat.refs)
-        ks = min(m4.first_stage_top_k, n_flat)
-        dense_scores, dense_idx = self._flat.faiss_index.search(q_vec, ks)
-        dense_flat_positions = [i for i in dense_idx[0].tolist() if i >= 0]
+        scores, idx = self._flat.faiss_index.search(q_vec, min(k, n_flat))
 
-        if m4.hybrid_first_stage:
-            # OPT-IN ablation (NON-paper): fuse dense with BM25-over-leaves
-            # via RRF. A strengthening over dense-only (CLAUDE.md rule #8);
-            # off by default. See m4_raptor.py DEVIATIONS block #1.
-            # Chunk indices == flat positions for the chunk-typed prefix of
-            # the flat index, so RRF fuses both rankings in flat-position space.
-            bm25_scores = self._bm25.get_scores(_tokenize(query))
-            bm25_order = bm25_scores.argsort()[::-1][: m4.first_stage_top_k]
-            sparse_flat_positions = [
-                int(i) for i in bm25_order.tolist() if bm25_scores[i] > 0
-            ]
-            fused = _rrf_fuse(
-                [dense_flat_positions, sparse_flat_positions], k=m4.rrf_k
-            )[: m4.first_stage_top_k]
-        else:
-            # PAPER-FAITHFUL default: collapsed retrieval = dense cosine
-            # ranking over the flattened node set (IndexFlatIP over
-            # normalised vectors == cosine). faiss returns scores already
-            # sorted descending; pair them with flat positions.
-            fused = [
-                (int(p), float(s))
-                for s, p in zip(dense_scores[0].tolist(), dense_idx[0].tolist())
-                if p >= 0
-            ][: m4.first_stage_top_k]
-
-        # --- Per-node-type expansion: walk fused, expand summaries to chunks ---
-        chunk_idx_score: dict[int, float] = {}
-        # CK-4: track source unit type per chunk_idx so RetrievedChunk
-        # can carry it through to the analyser. When the same chunk
-        # appears via both a direct chunk-hit and a summary-expanded
-        # hit, the max-score branch wins for the unit type too —
-        # consistent with the score tie-break logic.
-        chunk_idx_unit_type: dict[int, str] = {}
+        out: list[RetrievedChunk] = []
         type_counter: Counter[str] = Counter()
         paths_exercised: set[str] = set()
 
-        for flat_pos, rrf_score in fused:
-            ref = self._flat.refs[flat_pos]
-            node_type = self._flat.node_types[flat_pos]
-            type_counter[node_type] += 1
-
-            if ref["type"] == "chunk":
-                paths_exercised.add("leaf")
-                ci = int(ref["chunk_idx"])
-                if rrf_score > chunk_idx_score.get(ci, -1.0):
-                    chunk_idx_score[ci] = rrf_score
-                    chunk_idx_unit_type[ci] = "chunk"
+        for score, pos in zip(scores[0].tolist(), idx[0].tolist()):
+            if pos < 0:
                 continue
-
-            # summary node -> route via §4.4 expansion rules
-            node_id = ref["node_id"]
-            expanded_chunks, branch_trace = expand_node(
-                node_id,
-                q_vec_1d,
-                self._tree,
-                self.chunk_embeddings,
-                expansion=m4.expansion,
-                _path_trace=[],
+            ref = self._flat.refs[pos]
+            node = self._tree.nodes[ref["node_id"]]
+            unit_type = _layer_to_unit_type(node.layer)
+            type_counter[unit_type] += 1
+            paths_exercised.add(
+                "leaf" if node.is_leaf else unit_type.replace("summary_", "")
             )
-            # Tag bucket the summary lived in (high/mid/low).
-            paths_exercised.add(node_type.replace("summary_", ""))
-            if trace_on:
-                # Branch traces are detailed for diagnostic runs only.
-                self._last_trace.setdefault("branch_traces", []).append({
-                    "from_node": node_id,
-                    "node_type": node_type,
-                    "branches": branch_trace,
-                    "n_chunks": len(expanded_chunks),
-                })
 
-            # Assign the originating summary's RRF score to each expanded chunk.
-            # If a chunk also appears directly later, the max wins.
-            for ci in expanded_chunks:
-                if rrf_score > chunk_idx_score.get(ci, -1.0):
-                    chunk_idx_score[ci] = rrf_score
-                    chunk_idx_unit_type[ci] = node_type  # summary_low/mid/high
+            if node.is_leaf:
+                # Leaf nodes ARE corpus chunks; hand back the real Chunk so
+                # gold_provenance (stamped by index_items) survives.
+                chunk = self.chunks[node.leaf_indices[0]]
+            else:
+                chunk = self._node_as_chunk(node)
 
-        # --- Rank chunks, dedupe by chunk_id, trim to k ---
-        ranked = sorted(chunk_idx_score.items(), key=lambda kv: kv[1], reverse=True)
-
-        seen_ids: set[str] = set()
-        out: list[RetrievedChunk] = []
-        for ci, score in ranked:
-            chunk = self.chunks[ci]
-            if chunk.chunk_id in seen_ids:
-                continue
-            seen_ids.add(chunk.chunk_id)
             out.append(
                 RetrievedChunk(
                     chunk=chunk,
                     score=float(score),
                     rank=len(out),
-                    source_unit_type=chunk_idx_unit_type.get(ci, "chunk"),
+                    source_unit_type=unit_type,
                 )
             )
             if len(out) >= k:
                 break
 
-        if trace_on:
-            self._last_trace.update({
-                "collapsed_top50_node_types": dict(type_counter),
-                "paths_exercised": sorted(paths_exercised),
-                "n_fused": len(fused),
-                "n_unique_chunks_after_expansion": len(chunk_idx_score),
-                "n_returned": len(out),
-            })
-
+        self._last_trace = {
+            "collapsed_top_node_types": dict(type_counter),
+            "paths_exercised": sorted(paths_exercised),
+            "n_returned": len(out),
+            # The App. I fidelity gate, per query. Retrieval-only: it
+            # needs no generation, so it is measurable in the cheap stage.
+            "non_leaf_share": (
+                sum(v for kk, v in type_counter.items() if kk != "chunk")
+                / max(1, sum(type_counter.values()))
+            ),
+        }
         return out
 
-    # answer() inherits BaseSystem default (CK-4 shared packer).
-    # M4's trace is available via the last_trace property; the runner
-    # surfaces it through the existing benchmark stats path.
+    # answer() inherits the BaseSystem default: retrieved node TEXT —
+    # summaries verbatim included — is concatenated into the evidence
+    # block, which is the paper's behaviour.

@@ -658,6 +658,20 @@ def perform_clustering(
         if total_tokens <= params.max_length_in_cluster:
             clusters.append(members)
             continue
+        if len(members) == len(nodes):
+            # NO-PROGRESS STOP. The "cluster" is the entire input, which
+            # happens whenever BIC selects k=1 (low-structure data, or a
+            # layer whose members are near-uniform). Re-clustering an
+            # identical set yields an identical result, so the reference
+            # recurses forever here — this is the concrete shape of the
+            # unbounded recursion, and catching it directly costs one
+            # step instead of unwinding max_recluster_depth levels of
+            # wasted UMAP+GMM. Counted separately from the depth guard
+            # because it means something different: not "too deep" but
+            # "clustering cannot split this at all".
+            stats["no_progress_trips"] = stats.get("no_progress_trips", 0) + 1
+            clusters.append(members)
+            continue
         if _depth >= params.max_recluster_depth:
             stats["recluster_guard_trips"] = (
                 stats.get("recluster_guard_trips", 0) + 1
@@ -687,6 +701,65 @@ def get_text(nodes: list[PaperNode]) -> str:
         out += f"{' '.join(n.text.splitlines())}"
         out += "\n\n"
     return out
+
+
+# --- summarisation prompt (paper Appendix D) ------------------------------
+#
+# The paper and the reference code DISAGREE on the system prompt, and the
+# paper wins because it is explicit:
+#   paper App. D : "You are a Summarizing Text Portal"
+#   code         : "You are a helpful assistant."
+# The user prompt is identical in both, trailing colon included.
+#
+# This is M4-LOCAL. Its version id lives on M4Config.summary_prompt_version,
+# never on summarization.SUMMARY_PROMPT_VERSION — that constant is a module
+# global the FROZEN M7 also reads, and bumping it would move M7's substrate
+# key.
+#
+# Deliberately NOT reusing summarization.SUMMARY_PROMPT_TEMPLATE, whose
+# wording ("in the same language they are written in", "3-5 sentences",
+# "Do not invent") is ours, not the paper's.
+
+PAPER_SUMMARY_SYSTEM_PROMPT = "You are a Summarizing Text Portal"
+PAPER_SUMMARY_USER_TEMPLATE = (
+    "Write a summary of the following, including as many key details as "
+    "possible: {context}:"
+)
+
+
+def summarize_paper_style(
+    context: str,
+    *,
+    model: str,
+    max_tokens: int = 100,
+    temperature: float = 0.0,
+) -> str:
+    """One summary call, model-agnostic.
+
+    Routes through `models.generate`, which dispatches on the model id
+    (OpenAI prefixes to the API, anything else to a local causal LM), so
+    the same code path serves an API summariser and a local one. Late
+    import keeps raptor_paper free of src imports at module load — the
+    property that lets config.py import PaperTreeParams from here without
+    a cycle.
+
+    temperature defaults to 0.0, NOT the reference's unset (=1.0). That
+    is a deliberate deviation on infrastructure grounds: a non-zero
+    temperature makes the tree a random function of its inputs, and a
+    cache key that does not determine the artifact it names is not a
+    cache key. Consequence, recorded: the reference implementation's own
+    trees are not reproducible run to run.
+    """
+    from .config import GenerationConfig
+    from .models import generate
+
+    return generate(
+        system_prompt=PAPER_SUMMARY_SYSTEM_PROMPT,
+        user_prompt=PAPER_SUMMARY_USER_TEMPLATE.format(context=context),
+        cfg=GenerationConfig(
+            model=model, max_new_tokens=max_tokens, temperature=temperature
+        ),
+    )
 
 
 # --- bottom-up construction (port of cluster_tree_builder.construct_tree) -
@@ -1129,8 +1202,11 @@ __all__ = [
     "PaperTree",
     "PaperTreeParams",
     "PaperCollapsedIndex",
+    "PAPER_SUMMARY_SYSTEM_PROMPT",
+    "PAPER_SUMMARY_USER_TEMPLATE",
     "count_tokens_reference",
     "split_text_raptor",
+    "summarize_paper_style",
     "perform_clustering",
     "get_text",
     "build_paper_tree",

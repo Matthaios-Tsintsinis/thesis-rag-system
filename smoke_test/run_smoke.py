@@ -62,6 +62,7 @@ from src.config import (
     M4Config,
     M6Config,
     M7Config,
+    PaperTreeParams,
     RaptorBuildParams,
 )
 from src.harness import JSONLBenchmark, _record
@@ -128,20 +129,28 @@ _SMOKE_SEM = ChunkingConfig(
 )
 
 
-# M4 smoke tree: production defaults (branching=4, min_cluster=24, depth=4)
-# would collapse to root on ~25 smoke chunks. Shrink so the tree actually
-# subdivides and the §4.4 routing paths get exercised. trace=True so the
-# retriever populates self.last_trace per query for sanity assertions.
+# M4 smoke tree. M4 is now the PAPER-FAITHFUL bottom-up builder
+# (src/raptor_paper.py), so the knob that matters is PaperTreeParams, not
+# RaptorBuildParams — the latter is legacy and unread by this path.
+#
+# Production reduction_dimension=10 means the builder stops as soon as a
+# layer holds <= 11 nodes, which on the ~25-chunk smoke corpus would
+# yield no summary layer at all. Shrink it so at least one real layer is
+# built and the collapsed index actually contains summary entries.
+# bic_max_clusters is lowered purely for speed: the reference sweeps up
+# to 50 GMM fits per clustering call, which is wasted work at this size.
+#
+# NOTE: M4Config.chunker now pins the paper's raptor_100tok chunker, so
+# M4 ignores the harness `chunking=` passed below — that is correct
+# per-paper behaviour, not a smoke bug.
 _SMOKE_M4 = M4Config(
-    build=RaptorBuildParams(
-        branching_factor=3,
-        min_cluster_size=3,
-        max_depth=3,
+    paper=PaperTreeParams(
+        reduction_dimension=3,
+        bic_max_clusters=6,
     ),
-    expansion=ExpansionParams(
-        max_descendant_chunks_for_direct_expansion=10,
-    ),
-    first_stage_top_k=30,
+    # Sequential: the smoke corpus is tiny and a single-threaded run is
+    # easier to read when a summary call fails.
+    summary_max_workers=1,
     trace=True,
 )
 

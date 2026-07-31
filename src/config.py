@@ -12,6 +12,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+# Safe: raptor_paper imports only the stdlib and numpy, never src.config,
+# so there is no cycle. (chunking.py late-imports raptor_paper for the
+# same reason.)
+from .raptor_paper import PaperTreeParams
+
 
 # --- Filesystem ------------------------------------------------------------
 # Path roles (INPUT_DIR / CACHE_DIR / OUTPUT_DIR / HF_CACHE_DIR) are resolved
@@ -225,12 +230,46 @@ class M4Config:
     the answer generator is harness-level (HarnessConfig.generation),
     held constant across systems.
     """
+    # --- LEGACY: the top-down MiniBatchKMeans substrate (src/raptor.py) ---
+    # Unused by the paper-faithful path, which builds bottom-up via
+    # src/raptor_paper.py and reads `paper` below. Retained so that
+    # reverting to the pre-fidelity M4 is a code revert against a
+    # preserved cache (RAPTOR/bfc50c2...), not a config redesign, and so
+    # existing callers that construct M4Config(build=..., expansion=...)
+    # keep working.
     build: RaptorBuildParams = field(default_factory=RaptorBuildParams)
     expansion: ExpansionParams = field(default_factory=ExpansionParams)
+
+    # --- paper-faithful tree (src/raptor_paper.py) ---
+    paper: PaperTreeParams = field(default_factory=PaperTreeParams)
+    # Reference TreeBuilderConfig.summarization_length. Ruling 4: this is
+    # the ONLY concrete specification anywhere; the paper's reported 131
+    # tokens is a MEASUREMENT, not a parameter, and is not to be
+    # reverse-engineered into a cap. Expect visible truncation near 100 —
+    # that discrepancy is itself a finding about the reference.
+    summary_max_tokens: int = 100
+    # M4-LOCAL prompt id. Deliberately NOT summarization.SUMMARY_PROMPT_VERSION:
+    # that is a module-level constant the FROZEN M7 also reads, so bumping
+    # it would move M7's substrate key. Proven, not assumed — see the
+    # frozen-M7 key landmine table in CLAUDE.md.
+    summary_prompt_version: str = "raptor_paper_v1"
+
     first_stage_top_k: int = FIRST_STAGE_TOP_K
     rrf_k: int = RRF_K
-    include_root_in_flat_index: bool = False
-    summary_model: str = JUDGE_MODEL  # gpt-4o-mini by project decision
+    # Paper §3 Querying collapses the ENTIRE tree into one layer. There is
+    # no synthetic all-corpus root to exclude under bottom-up
+    # construction, so unlike the legacy path this is True.
+    include_root_in_flat_index: bool = True
+    # Index-time summariser. Pinned to ONE model permanently (2026-07-29):
+    # M4's trees are always built by this model, so a later second-reader
+    # pass reuses them rather than forking a second tree set. That makes
+    # the later pass a READER comparison — same retrieval, same index,
+    # different model reading it — NOT a generator comparison. Known
+    # limitation, recorded in the audit: if this summariser's output is
+    # systematically poor, M4 is handicapped identically in every column
+    # and no later column can reveal it; the NarrativeQA-10 sensitivity
+    # check with a second summariser is the answer if one is ever needed.
+    summary_model: str = JUDGE_MODEL
     top_k_final: int = FINAL_CONTEXT_CHUNKS
 
     # --- component overrides (per-paper assignment) ---
@@ -250,17 +289,35 @@ class M4Config:
     # degrades on Greek queries — documented as a paper-faithfulness
     # limitation in the methods section.
     embedder: str | None = "sentence-transformers/multi-qa-mpnet-base-cos-v1"
-    chunker: ChunkingConfig | None = None
+    # PER-SYSTEM chunker override — the paper's 100-token, sentence-
+    # preserving, non-overlapping leaves. This is set HERE and never on
+    # HarnessConfig.chunking: the harness default is inherited by M2, M3,
+    # M9 and the frozen M7 (all of whose `chunker` is None), so changing
+    # it would move four other systems' substrate keys at once. Note also
+    # that `chunk_words` is read as a TOKEN budget under this strategy —
+    # a new FIELD on ChunkingConfig would likewise move every key, since
+    # compute_cache_key folds the whole asdict.
+    chunker: ChunkingConfig | None = field(
+        default_factory=lambda: ChunkingConfig(
+            strategy="raptor_100tok", chunk_words=100, overlap_words=0
+        )
+    )
     reranker: str | None = None  # M4 does not rerank
 
-    # Paper-fidelity switch (see m4_raptor.py DEVIATIONS block #1). The
-    # RAPTOR paper's collapsed retrieval ranks the flattened node set by
-    # DENSE cosine only. Default False = paper-faithful dense-only first
-    # stage. True restores the dense+BM25 RRF first stage as an OPT-IN
-    # ablation (a strengthening over dense-only per CLAUDE.md rule #8).
-    # Query-time only — NOT folded into raptor_substrate_extra, so
-    # toggling it never changes the substrate cache key (bm25.pkl is
-    # still built at index time because M7 shares the substrate).
+    # Index-time summariser concurrency. Throughput only: node ids and
+    # tree shape are computed before any summary call is dispatched, so
+    # the artifact is byte-identical at any worker count (pinned by a
+    # test in tests/test_raptor_paper_tree.py). 4 is the value the
+    # token-per-minute arithmetic supports; raise only if the serving
+    # limits do.
+    summary_max_workers: int = 4
+
+    # UNREAD by the paper-faithful path, retained so existing callers
+    # construct. The rebuild dropped BM25 entirely: the paper's collapsed
+    # retrieval is dense cosine only, and the sparse index existed only
+    # because M4 used to SHARE a substrate with M7, which needs it. M4
+    # now owns its namespace, so carrying non-paper machinery would be
+    # keeping it for no reason. See m4_raptor.py DEVIATIONS item 7.
     hybrid_first_stage: bool = False
 
     trace: bool = False
