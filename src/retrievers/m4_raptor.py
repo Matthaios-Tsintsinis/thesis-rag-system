@@ -194,6 +194,55 @@ class RaptorSystem(BaseSystem):
         )
         return CacheDir(paths.cache_dir(), M4_SUBSTRATE_NAMESPACE, key)
 
+    def _guard_index_llm(self) -> None:
+        """Refuse to start a tree build with an API index-time LLM.
+
+        A RAPTOR build is the most expensive operation in the harness,
+        and `summary_model` is baked into the substrate cache key — so
+        building with the wrong summariser does not merely cost money,
+        it produces an artifact that is discarded wholesale the moment
+        the intended model is configured.
+
+        This exists because it already happened: a run began building
+        `M4_RAPTOR/34b630d8...` with gpt-4o-mini summaries and was
+        stopped only by a missing API key. An absent credential is not a
+        safety mechanism — it fails for the right reason by accident,
+        and it stops failing the moment a key is exported for some
+        unrelated purpose. The guard is the mechanism; the missing key
+        was luck.
+
+        Fires only on the cache-MISS path: reading a tree that was
+        legitimately built earlier costs nothing and stays allowed.
+        """
+        import os
+
+        from ..models import _is_openai_model
+
+        model = self.config.m4.summary_model
+        if not _is_openai_model(model):
+            return
+        if self.config.m4.allow_api_index_llm or os.environ.get(
+            "M4_ALLOW_API_INDEX_LLM"
+        ):
+            print(
+                f"[{self.system_id}] WARNING: building a tree with API "
+                f"summariser {model!r} — override was set explicitly."
+            )
+            return
+        raise RuntimeError(
+            f"refusing to build a RAPTOR tree with the API index-time LLM "
+            f"{model!r}.\n"
+            "The summariser is part of the substrate cache key, so this "
+            "build would produce a tree that is thrown away as soon as the "
+            "intended local summariser is configured — and RAPTOR builds "
+            "are the most expensive thing in the harness.\n"
+            "Set config.m4.summary_model to the intended local model "
+            "(JUDGE_MODEL is already local by default), or, if an API "
+            "build really is what you want, pass "
+            "M4Config(allow_api_index_llm=True) or export "
+            "M4_ALLOW_API_INDEX_LLM=1."
+        )
+
     # --- index ------------------------------------------------------------
 
     def index(self, corpus_path: Path) -> None:
@@ -224,6 +273,7 @@ class RaptorSystem(BaseSystem):
             self._indexed = True
             return
 
+        self._guard_index_llm()
         print(f"[{self.system_id}] cache miss -> building index at {cdir.path}")
         docs = list(walk_corpus(corpus_path, min_chars=chunker_cfg.min_chars_per_doc))
         embedder = (

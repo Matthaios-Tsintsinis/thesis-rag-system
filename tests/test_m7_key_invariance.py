@@ -52,7 +52,21 @@ PARSING: dict = {}
 CORPUS = "CORPUS_HASH_PLACEHOLDER"
 
 # See the expiry warning in the module docstring before touching this.
-EXPECTED_M7_KEY = "3ff43a21bf448446740badd2bd25573f"
+#
+# HISTORY of intended moves — every entry is a SHARED change that the
+# property tests below cannot see, which is precisely why the constant
+# exists:
+#   3ff43a21bf448446740badd2bd25573f  gpt-4o-mini era (through 088ba1c)
+#   a3fdf918a4197d4157bcf5cb44ec42bc  JUDGE_MODEL -> Qwen/Qwen2.5-7B-Instruct
+#
+# The 2026-08-02 move was expected: gpt-4o-mini was removed from the
+# project and JUDGE_MODEL is read by BOTH M4 and the frozen M7, so M7's
+# substrate key moves with it. When it fired, all ten property tests
+# still passed — the correct signature of a shared change rather than an
+# M4 leak. M7's preserved substrate (RAPTOR/78fb239...) is consequently
+# dead and M7 rebuilds when it joins at test scale; that cost was
+# accepted when the generator swap was approved.
+EXPECTED_M7_KEY = "a3fdf918a4197d4157bcf5cb44ec42bc"
 
 
 def m7_key(cfg) -> str:

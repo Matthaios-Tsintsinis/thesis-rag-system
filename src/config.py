@@ -31,21 +31,50 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 EMBEDDER_MODEL = "BAAI/bge-m3"
 EMBEDDING_DIM = 1024
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
-# Final-answer generator, shared across ALL systems (M1-M7) by professor
-# decision. Held constant so per-system answer-quality deltas attribute to
-# retrieval, not to generator capacity. Routed by `src.models.generate` to
-# the OpenAI API (any "gpt-*" / "o*" prefix). A local-HF causal LM (e.g.
-# "Qwen/Qwen2.5-3B-Instruct") remains reachable by explicit cfg.model
-# override -- preserved for a future local-vs-API generator ablation, NOT
-# used by the default eval grid.
-GENERATOR_MODEL = "gpt-4o-mini"
-# Index-time LLM (RAPTOR tree summaries, HippoRAG OpenIE). Intentionally
-# the SAME model id as GENERATOR_MODEL today -- distinct semantic roles
-# (answer-time vs index-time judge) but the project decision is to use one
-# OpenAI model across both phases. Kept as a separate constant so the two
-# roles can diverge later (e.g. cheaper judge at index time) without
-# touching every call site.
-JUDGE_MODEL = "gpt-4o-mini"
+# Final-answer generator, shared across ALL systems. Held constant so
+# per-system answer-quality deltas attribute to retrieval, not to reader
+# capacity.
+#
+# LOCAL as of 2026-08-02. gpt-4o-mini is removed from the project
+# entirely; `src.models.generate` routes any non-OpenAI id to
+# `_generate_local`, and `generate_batch` batches it through HF
+# transformers. Serving is HF transformers rather than vLLM, which is
+# unusable on Colab (CUDA-13 wheel against a CUDA-12 runtime, and its
+# install cycle breaks torch badly enough to need a runtime delete).
+#
+# Measured on an L4: fp16, 15.2 GB after load, 0.52 req/s at 4k-in
+# batch 8 (batch 12 OOMs), 2.07 req/s at 800-in batch 32.
+#
+# A SECOND reader (Llama-3.1-8B-Instruct) is supported as a config value
+# and may run later as a separate pass. Under the pinned-summariser
+# design that pass would be a READER comparison — same retrieval, same
+# trees, different model reading them — NOT a generator comparison.
+GENERATOR_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+# Index-time LLM (RAPTOR tree summaries; retired-M6 OpenIE). PINNED to
+# Qwen2.5-7B PERMANENTLY, and that pin is load-bearing rather than
+# incidental: it is in M4's substrate cache key, so M4's trees are always
+# built by this model and a later second-reader pass REUSES them instead
+# of forking a second tree set. That is what makes the later pass a
+# reader comparison and keeps every column varying exactly one thing.
+#
+# KNOWN LIMITATION, recorded rather than mitigated: if this summariser's
+# output is systematically poor, M4 is handicapped identically in every
+# column and no later column can reveal it. The answer, if one is ever
+# needed, is the NarrativeQA-10 sensitivity check with a second
+# summariser — not a second full tree set.
+#
+# Kept as a separate constant from GENERATOR_MODEL so the two roles can
+# diverge without touching every call site, even though they hold the
+# same value today.
+JUDGE_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+
+# Tiktoken ENCODING SELECTOR for evidence-token accounting. NOT a
+# generator, despite the name — it is passed to
+# tiktoken.encoding_for_model and only picks a byte-pair table. Left
+# pointing at an OpenAI id deliberately: changing it would change
+# evidence_tokens for every cell and break comparability with anything
+# already banked. Token counting is a measurement convention here, not a
+# model choice.
 
 
 # --- Retrieval defaults ---------------------------------------------------
@@ -271,6 +300,16 @@ class M4Config:
     # check with a second summariser is the answer if one is ever needed.
     summary_model: str = JUDGE_MODEL
     top_k_final: int = FINAL_CONTEXT_CHUNKS
+
+    # Escape hatch for the doomed-build guard in m4_raptor.index(). A
+    # RAPTOR tree build is the most expensive thing in the harness and
+    # its summariser is baked into the substrate cache key, so building
+    # one with the WRONG index-time LLM produces an artifact that is
+    # thrown away entirely. Default False: refuse to start such a build.
+    # Also settable per-run via the M4_ALLOW_API_INDEX_LLM env var, since
+    # the runner constructs systems from DEFAULT_CONFIG and has no CLI
+    # path to this field.
+    allow_api_index_llm: bool = False
 
     # --- paper retrieval budget (professor-approved 2026-08-02) ---
     # Paper §3 Querying: "we use the collapsed tree with 2000 maximum
