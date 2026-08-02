@@ -1,10 +1,18 @@
 """Two-phase runner: batching must be a throughput change, nothing else.
 
 The invariant under test is that `--batch-size N` produces the SAME
-rows, in the SAME order, with the same scores, as the sequential path.
-If batching can reorder or mismatch answers to queries, every downstream
-number is quietly wrong — and the failure looks like plausible answers
-attached to the wrong questions, not like an exception.
+rows, with the same scores, as the sequential path. If batching can
+mismatch answers to queries, every downstream number is quietly wrong —
+and the failure looks like plausible answers attached to the wrong
+questions, not like an exception.
+
+FILE ORDER IS NOT PART OF THE INVARIANT under batching. Rows are
+emitted length-sorted so each batch is flushed as it finishes, which is
+what makes a dead session cost a batch instead of a pass. Every
+consumer parses per line into dicts and never depends on order, so the
+guarantee is completeness plus correct pairing, not sequence. The
+sequential path still emits in query order and that is asserted
+separately.
 """
 
 from __future__ import annotations
@@ -113,20 +121,37 @@ def _run(batch_size):
         return [json.loads(l) for l in out.read_text(encoding="utf-8").splitlines()]
 
 
+def _by_id(rows):
+    return {r["query_id"]: r for r in rows}
+
+
 class TestTwoPhaseEquivalence(unittest.TestCase):
     def test_batched_matches_sequential_exactly(self):
-        seq = _run(None)
-        bat = _run(3)
-        self.assertEqual(len(seq), len(bat))
-        for a, b in zip(seq, bat):
-            self.assertEqual(a["query_id"], b["query_id"])
+        """Same rows, same content — compared BY query_id, because
+        batched output is emitted in length-sorted order (see below)."""
+        seq, bat = _by_id(_run(None)), _by_id(_run(3))
+        self.assertEqual(set(seq), set(bat))
+        for qid, a in seq.items():
+            b = bat[qid]
             self.assertEqual(a["predicted_answer"], b["predicted_answer"])
             self.assertEqual(a["retrieval"]["f1"], b["retrieval"]["f1"])
             self.assertEqual(a["answer"]["value"], b["answer"]["value"])
 
-    def test_output_stays_in_query_order(self):
-        rows = _run(3)
-        self.assertEqual([r["query_id"] for r in rows],
+    def test_every_query_appears_exactly_once(self):
+        """The guarantee under batching is COMPLETENESS, not file order.
+
+        Rows are emitted length-sorted so each batch can be flushed as
+        it finishes; every consumer (analyse, aggregate, the
+        significance diagnostic) parses per line into dicts and never
+        depends on order. Completeness and correct pairing are what
+        must hold.
+        """
+        ids = [r["query_id"] for r in _run(3)]
+        self.assertEqual(sorted(ids), sorted(f"q{i}" for i in range(7)))
+        self.assertEqual(len(ids), len(set(ids)))
+
+    def test_sequential_path_still_emits_in_query_order(self):
+        self.assertEqual([r["query_id"] for r in _run(None)],
                          [f"q{i}" for i in range(7)])
 
     def test_answers_are_paired_with_their_own_prompts(self):
@@ -138,8 +163,8 @@ class TestTwoPhaseEquivalence(unittest.TestCase):
         self.assertEqual(len(_run(999)), 7)
 
     def test_batch_of_one_is_fine(self):
-        self.assertEqual([r["query_id"] for r in _run(1)],
-                         [f"q{i}" for i in range(7)])
+        self.assertEqual(sorted(r["query_id"] for r in _run(1)),
+                         sorted(f"q{i}" for i in range(7)))
 
 
 class TestFallback(unittest.TestCase):
@@ -170,6 +195,129 @@ class TestFallback(unittest.TestCase):
                                        FakeBenchmark(), split="validation",
                                        max_queries=4))
             self.assertEqual(len(rows), 4)
+
+
+class TestDurabilityAndResume(unittest.TestCase):
+    """A dead session must cost a batch, not a pass.
+
+    This project's sessions have died to a reclaimed runtime, a Drive
+    disconnect, an RPD ceiling, and a torch install broken by vLLM.
+    Generating a whole unit before writing anything would mean MultiHop
+    (one unit, 2,556 queries) loses over an hour to any of them.
+    """
+
+    def _crashing_batch(self, fail_on_call):
+        state = {"n": 0}
+
+        def gb(system_prompts, user_prompts, cfg=None, **kw):
+            state["n"] += 1
+            if state["n"] >= fail_on_call:
+                raise RuntimeError("simulated runtime death")
+            return _fake_generate_batch(system_prompts, user_prompts, cfg)
+
+        return gb
+
+    @staticmethod
+    def _rows(path):
+        return [
+            json.loads(l)
+            for l in path.read_text(encoding="utf-8").splitlines()
+            if l.strip()
+        ]
+
+    def test_completed_batches_survive_a_mid_pass_crash(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "o.jsonl"
+            runner = BenchmarkRunner(
+                output_path=out, verbose=False, batch_size=2
+            )
+            with mock.patch("src.models.generate", _fake_generate), mock.patch(
+                "src.models.generate_batch", self._crashing_batch(3)
+            ):
+                with self.assertRaises(RuntimeError):
+                    list(
+                        runner.run(
+                            FakeSystem(config=DEFAULT_CONFIG),
+                            FakeBenchmark(),
+                            split="validation",
+                        )
+                    )
+            rows = self._rows(out)
+        self.assertEqual(len(rows), 4, "completed batches were not flushed")
+
+    def test_resume_skips_banked_queries_and_appends(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "o.jsonl"
+            with mock.patch("src.models.generate", _fake_generate), mock.patch(
+                "src.models.generate_batch", self._crashing_batch(3)
+            ):
+                with self.assertRaises(RuntimeError):
+                    list(
+                        BenchmarkRunner(
+                            output_path=out, verbose=False, batch_size=2
+                        ).run(
+                            FakeSystem(config=DEFAULT_CONFIG),
+                            FakeBenchmark(),
+                            split="validation",
+                        )
+                    )
+            partial = self._rows(out)
+
+            with mock.patch("src.models.generate", _fake_generate), mock.patch(
+                "src.models.generate_batch", _fake_generate_batch
+            ):
+                list(
+                    BenchmarkRunner(
+                        output_path=out,
+                        verbose=False,
+                        batch_size=2,
+                        resume=True,
+                    ).run(
+                        FakeSystem(config=DEFAULT_CONFIG),
+                        FakeBenchmark(),
+                        split="validation",
+                    )
+                )
+            rows = self._rows(out)
+
+        ids = [r["query_id"] for r in rows]
+        self.assertEqual(sorted(ids), sorted(f"q{i}" for i in range(7)))
+        self.assertEqual(len(ids), len(set(ids)), "resume duplicated a query")
+        self.assertGreater(len(rows), len(partial))
+
+    def test_without_resume_a_rerun_truncates(self):
+        """Historic behaviour, preserved as the default."""
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "o.jsonl"
+            out.write_text('{"query_id": "stale"}\n', encoding="utf-8")
+            with mock.patch("src.models.generate", _fake_generate), mock.patch(
+                "src.models.generate_batch", _fake_generate_batch
+            ):
+                list(
+                    BenchmarkRunner(
+                        output_path=out, verbose=False, batch_size=2
+                    ).run(
+                        FakeSystem(config=DEFAULT_CONFIG),
+                        FakeBenchmark(),
+                        split="validation",
+                    )
+                )
+            text = out.read_text(encoding="utf-8")
+        self.assertNotIn("stale", text)
+
+    def test_resume_tolerates_a_torn_final_line(self):
+        """A session killed mid-write leaves partial JSON — the exact
+        case resume exists for, so it must not raise."""
+        with tempfile.TemporaryDirectory() as td:
+            out = Path(td) / "o.jsonl"
+            out.write_text(
+                '{"query_id": "q0", "x": 1}\n{"query_id": "q1"',
+                encoding="utf-8",
+            )
+            runner = BenchmarkRunner(
+                output_path=out, verbose=False, batch_size=2, resume=True
+            )
+            self.assertEqual(runner._existing_query_ids(), {"q0"})
 
 
 if __name__ == "__main__":

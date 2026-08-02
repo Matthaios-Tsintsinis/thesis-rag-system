@@ -82,9 +82,19 @@ class BenchmarkRunner:
         output_path: Path,
         verbose: bool = True,
         batch_size: int | None = None,
+        resume: bool = False,
     ) -> None:
         self.output_path = output_path
         self.verbose = verbose
+        # Resume an interrupted pass: append to the existing JSONL and
+        # skip query_ids already present. Index caches survive a dead
+        # session on their own, but without this the answers do not —
+        # and a re-run would TRUNCATE the partial output. On this project
+        # sessions have died to a reclaimed runtime, a Drive disconnect,
+        # an RPD ceiling and a broken torch install, so treating an
+        # interrupted pass as normal rather than exceptional is the
+        # correct default posture even though the flag is opt-in.
+        self.resume = resume
         # None -> sequential answering (the historic path, and the right
         # one against an API). An int enables TWO-PHASE answering for
         # systems that support it: retrieve every query first, then
@@ -93,6 +103,28 @@ class BenchmarkRunner:
         # answering wastes ~90% of throughput and generation is ~90% of
         # the cost.
         self.batch_size = batch_size
+
+    def _existing_query_ids(self) -> set[str]:
+        """query_ids already banked in the output file, for --resume.
+
+        Tolerates a truncated final line: a session killed mid-write
+        leaves a partial JSON object, and that is exactly the case
+        resume exists to handle, so it must not raise. The partial row's
+        query is simply re-answered.
+        """
+        if not self.resume or not self.output_path.exists():
+            return set()
+        done: set[str] = set()
+        with self.output_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    done.add(json.loads(line)["query_id"])
+                except (json.JSONDecodeError, KeyError):
+                    continue  # torn final line
+        return done
 
     def _answer_unit(
         self,
@@ -121,37 +153,65 @@ class BenchmarkRunner:
                 yield q, ar, time.perf_counter() - t_q
             return
 
-        from ..models import generate_batch
+        from ..models import deterministic_batch_order, generate_batch
 
         # PHASE A — retrieval + any query-time LLM work, sequential.
         t_a = time.perf_counter()
         prepared = [system.prepare(q.question_text) for q in queries]
         phase_a_s = time.perf_counter() - t_a
-
-        # PHASE B — one batched generation pass over the whole unit.
-        t_b = time.perf_counter()
-        answers = generate_batch(
-            [p.system_prompt for p in prepared],
-            [p.user_prompt for p in prepared],
-            cfg=system.config.generation,
-            batch_size=self.batch_size,
-        )
-        phase_b_s = time.perf_counter() - t_b
-
         if self.verbose:
-            print(
-                f"  phase_a(retrieve)={phase_a_s:.1f}s  "
-                f"phase_b(generate,batch={self.batch_size})={phase_b_s:.1f}s  "
-                f"n={len(queries)}  "
-                f"{len(queries) / max(phase_b_s, 1e-9):.2f} gen-req/s"
-            )
+            print(f"  phase_a(retrieve)={phase_a_s:.1f}s  n={len(queries)}")
 
-        # Per-query generation time is not observable once batched;
-        # amortise it rather than invent a measured-looking number.
-        per_query_gen_s = phase_b_s / max(1, len(prepared))
-        for q, p, ans in zip(queries, prepared, answers):
-            ar = system.finish(p, ans, generate_s=per_query_gen_s)
-            yield q, ar, ar.latency_s
+        # PHASE B — batched generation, YIELDED PER BATCH so the caller
+        # can write and flush incrementally.
+        #
+        # DURABILITY over ordering, deliberately. Generating the whole
+        # unit before yielding anything would mean MultiHop (ONE unit,
+        # 2,556 queries) writes nothing for well over an hour and loses
+        # everything to a reclaimed runtime or a Drive disconnect — both
+        # of which have happened on this project. Yielding per batch caps
+        # the loss at one batch.
+        #
+        # Length sorting happens HERE, across the whole unit, rather than
+        # inside generate_batch: sorting per-batch would only homogenise
+        # within an already-arbitrary group and lose most of the padding
+        # saving. The consequence is that rows are emitted in
+        # LENGTH-SORTED order, not query order. That is safe — every row
+        # carries query_id and every downstream consumer (analyse,
+        # aggregate, the significance diagnostic) parses per line into
+        # dicts and never depends on file order. Sorting is by
+        # n_input_tokens, already computed by prepare(), so it costs no
+        # extra tokenisation.
+        order, _ = deterministic_batch_order([p.n_input_tokens for p in prepared])
+
+        t_b = time.perf_counter()
+        n_done = 0
+        for start in range(0, len(order), self.batch_size):
+            idxs = order[start : start + self.batch_size]
+            t_batch = time.perf_counter()
+            answers = generate_batch(
+                [prepared[i].system_prompt for i in idxs],
+                [prepared[i].user_prompt for i in idxs],
+                cfg=system.config.generation,
+                batch_size=self.batch_size,
+                # Already globally sorted; re-sorting inside the call
+                # would be a no-op on a homogeneous group.
+                sort_by_length=False,
+            )
+            batch_s = time.perf_counter() - t_batch
+            # Per-query generation time is not observable once batched;
+            # amortise it rather than invent a measured-looking number.
+            per_query_gen_s = batch_s / max(1, len(idxs))
+            for i, ans in zip(idxs, answers):
+                ar = system.finish(prepared[i], ans, generate_s=per_query_gen_s)
+                yield queries[i], ar, ar.latency_s
+            n_done += len(idxs)
+            if self.verbose:
+                elapsed = time.perf_counter() - t_b
+                print(
+                    f"  phase_b {n_done}/{len(order)}  "
+                    f"{n_done / max(elapsed, 1e-9):.2f} gen-req/s"
+                )
 
     def run(
         self,
@@ -176,7 +236,15 @@ class BenchmarkRunner:
         n_queries = 0
         t_start = time.perf_counter()
 
-        with self.output_path.open("w", encoding="utf-8") as fout:
+        already_done = self._existing_query_ids()
+        if already_done and self.verbose:
+            print(
+                f"[eval] resuming: {len(already_done)} queries already in "
+                f"{self.output_path.name}, skipping them"
+            )
+        mode = "a" if (self.resume and already_done) else "w"
+
+        with self.output_path.open(mode, encoding="utf-8") as fout:
             stopped = False
             for unit_idx, unit in enumerate(
                 benchmark.iter_eval_units(split=split, max_units=max_units)
@@ -203,6 +271,8 @@ class BenchmarkRunner:
                     ) >= max_queries:
                         stopped = True
                         break
+                    if q.query_id in already_done:
+                        continue
                     unit_queries.append(q)
 
                 for q, ar, latency_s in self._answer_unit(system, unit_queries):

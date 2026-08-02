@@ -141,6 +141,17 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Append to an existing output JSONL and SKIP query_ids already "
+            "in it, instead of truncating and starting over. Use after a "
+            "session dies mid-pass: index caches survive on their own, but "
+            "without this the answers do not. A torn final line from a "
+            "killed write is tolerated and that query is re-answered."
+        ),
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Suppress per-unit progress logs (still writes JSONL).",
@@ -198,6 +209,7 @@ def main() -> None:
         output_path=args.output,
         verbose=not args.quiet,
         batch_size=args.batch_size,
+        resume=args.resume,
     )
     n_scored = 0
     sum_retr_f1 = 0.0
