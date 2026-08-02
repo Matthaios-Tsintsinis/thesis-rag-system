@@ -101,10 +101,46 @@ def _safe_item_filename(item_id: str) -> str:
     return hashlib.sha1(item_id.encode("utf-8")).hexdigest()[:16]
 
 
+@dataclass
+class PreparedQuery:
+    """Everything phase A produces for one query, minus the generation.
+
+    The two-phase runner exists because the harness now generates with a
+    LOCAL model. Against an API, sequential answering was fine; against
+    HF transformers it leaves ~90% of throughput unused, and generation
+    is ~90% of the matrix cost. So retrieval (cheap, sequential, GPU-light)
+    is separated from generation (expensive, batched).
+
+    `prepare()` does retrieval, any query-time LLM work a system needs,
+    context packing and prompt assembly. `finish()` wraps a generated
+    string back into an AnswerResult. `answer()` is prepare + generate +
+    finish, so the single-query API is unchanged for smoke and for any
+    system that has not been converted.
+    """
+
+    query: str
+    retrieved: list[RetrievedChunk]
+    packed: list[RetrievedChunk]
+    system_prompt: str
+    user_prompt: str
+    evidence_tokens: int
+    n_input_tokens: int
+    n_retrieval_calls: int = 1
+    prepare_s: float = 0.0
+    extra: dict = field(default_factory=dict)
+
+
 class BaseSystem(ABC):
     """Abstract benchmarked system."""
 
     system_id: str = "base"
+
+    # False for systems that still override answer() wholesale and have
+    # not been split into prepare/finish (M1 closed-book, M7). The runner
+    # falls back to sequential answering for those rather than guessing.
+    # M1 is cheap enough not to matter (~100-token prompts); M7 is not in
+    # the baseline matrix.
+    supports_batched_answer: bool = True
 
     def __init__(self, config: HarnessConfig = DEFAULT_CONFIG) -> None:
         self.config = config
@@ -152,10 +188,28 @@ class BaseSystem(ABC):
           4. Return AnswerResult(retrieved=full, packed=packed,
              evidence_tokens, n_input_tokens=full assembled prompt).
         """
+        from ..models import generate
+
+        prepared = self.prepare(query, k=k)
+        ans = generate(
+            system_prompt=prepared.system_prompt,
+            user_prompt=prepared.user_prompt,
+            cfg=self.config.generation,
+        )
+        return self.finish(prepared, ans)
+
+    def prepare(self, query: str, k: int | None = None) -> PreparedQuery:
+        """PHASE A: retrieve, pack, assemble the prompt. No generation.
+
+        Systems whose generation context differs materially from "the
+        retrieved chunks, packed" override THIS rather than answer() —
+        that keeps them batchable. M9 overrides it to run its corrective
+        loop and strip refinement; M9's rewrite is an LLM call, so its
+        phase A is not LLM-free, which is accepted and expected.
+        """
         # Late import to break the retrievers/base <-> prompt_packing
         # circular (prompt_packing's tiktoken init touches no retriever
         # state, so this is safe).
-        from ..models import generate
         from ..prompt_packing import count_tokens, pack_context
 
         self._require_indexed()
@@ -181,20 +235,43 @@ class BaseSystem(ABC):
             BASE_ANSWER_SYSTEM_PROMPT + "\n" + user_prompt,
             tokenizer_name=EVIDENCE_TOKEN_BUDGET_TOKENIZER,
         )
-        ans = generate(
-            system_prompt=BASE_ANSWER_SYSTEM_PROMPT,
-            user_prompt=user_prompt,
-            cfg=self.config.generation,
-        )
-        return AnswerResult(
+        return PreparedQuery(
             query=query,
-            answer=ans,
             retrieved=retrieved,
             packed=packed,
-            latency_s=self._now() - t0,
-            n_retrieval_calls=1,
-            n_input_tokens=n_input_tokens,
+            system_prompt=BASE_ANSWER_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
             evidence_tokens=evidence_tokens,
+            n_input_tokens=n_input_tokens,
+            n_retrieval_calls=1,
+            prepare_s=self._now() - t0,
+        )
+
+    def finish(
+        self,
+        prepared: PreparedQuery,
+        answer_text: str,
+        *,
+        generate_s: float = 0.0,
+    ) -> AnswerResult:
+        """PHASE B tail: wrap a generated string into an AnswerResult.
+
+        `generate_s` is the generation time attributable to this query.
+        Under batching that is an AMORTISED share of the batch's wall
+        clock, not a measured per-query duration — per-query latency is
+        not observable once requests are batched, and reporting it as if
+        it were would be a fabricated number.
+        """
+        return AnswerResult(
+            query=prepared.query,
+            answer=answer_text,
+            retrieved=prepared.retrieved,
+            packed=prepared.packed,
+            latency_s=prepared.prepare_s + generate_s,
+            n_retrieval_calls=prepared.n_retrieval_calls,
+            n_input_tokens=prepared.n_input_tokens,
+            evidence_tokens=prepared.evidence_tokens,
+            extra=dict(prepared.extra),
         )
 
     def index_items(self, items: Sequence["CorpusItem"]) -> None:

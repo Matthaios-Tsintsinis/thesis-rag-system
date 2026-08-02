@@ -133,6 +133,13 @@ def _sigmoid(x: float) -> float:
 
 class ThreeAxisSystem(BaseSystem):
     system_id = "M7"
+    # Still overrides answer() wholesale rather than splitting into
+    # prepare()/finish(), so the two-phase runner answers it sequentially.
+    # Deliberate: M1's prompts are ~100 tokens (closed-book, no evidence)
+    # so batching buys almost nothing, and M7 is excluded from the
+    # baseline matrix. Converting either is a later change, not a
+    # prerequisite.
+    supports_batched_answer = False
 
     def __init__(self, config: HarnessConfig = DEFAULT_CONFIG) -> None:
         super().__init__(config)

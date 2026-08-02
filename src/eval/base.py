@@ -32,7 +32,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Iterable, Iterator, Protocol
 
-from ..retrievers.base import BaseSystem, RetrievedChunk
+from ..retrievers.base import AnswerResult, BaseSystem, RetrievedChunk
 from .alignment import score_retrieval_ck2
 from .types import AnswerScore, EvalQuery, EvalUnit, RetrievalScore, ScoredQuery
 
@@ -81,9 +81,77 @@ class BenchmarkRunner:
         *,
         output_path: Path,
         verbose: bool = True,
+        batch_size: int | None = None,
     ) -> None:
         self.output_path = output_path
         self.verbose = verbose
+        # None -> sequential answering (the historic path, and the right
+        # one against an API). An int enables TWO-PHASE answering for
+        # systems that support it: retrieve every query first, then
+        # generate the whole unit in batches. Necessary because the
+        # harness now generates with a LOCAL model, where sequential
+        # answering wastes ~90% of throughput and generation is ~90% of
+        # the cost.
+        self.batch_size = batch_size
+
+    def _answer_unit(
+        self,
+        system: BaseSystem,
+        queries: list[EvalQuery],
+    ) -> Iterator[tuple[EvalQuery, "AnswerResult", float]]:
+        """Yield (query, AnswerResult, latency_s) for one unit's queries.
+
+        Sequential unless batching is enabled AND the system supports it
+        (M1 and M7 still override answer() wholesale — see
+        BaseSystem.supports_batched_answer). Falling back rather than
+        guessing keeps an unconverted system correct instead of subtly
+        wrong.
+
+        Output order is ALWAYS the input query order, regardless of the
+        length-sorted order generation actually ran in.
+        """
+        if not queries:
+            return
+        if self.batch_size is None or not getattr(
+            system, "supports_batched_answer", False
+        ):
+            for q in queries:
+                t_q = time.perf_counter()
+                ar = system.answer(q.question_text)
+                yield q, ar, time.perf_counter() - t_q
+            return
+
+        from ..models import generate_batch
+
+        # PHASE A — retrieval + any query-time LLM work, sequential.
+        t_a = time.perf_counter()
+        prepared = [system.prepare(q.question_text) for q in queries]
+        phase_a_s = time.perf_counter() - t_a
+
+        # PHASE B — one batched generation pass over the whole unit.
+        t_b = time.perf_counter()
+        answers = generate_batch(
+            [p.system_prompt for p in prepared],
+            [p.user_prompt for p in prepared],
+            cfg=system.config.generation,
+            batch_size=self.batch_size,
+        )
+        phase_b_s = time.perf_counter() - t_b
+
+        if self.verbose:
+            print(
+                f"  phase_a(retrieve)={phase_a_s:.1f}s  "
+                f"phase_b(generate,batch={self.batch_size})={phase_b_s:.1f}s  "
+                f"n={len(queries)}  "
+                f"{len(queries) / max(phase_b_s, 1e-9):.2f} gen-req/s"
+            )
+
+        # Per-query generation time is not observable once batched;
+        # amortise it rather than invent a measured-looking number.
+        per_query_gen_s = phase_b_s / max(1, len(prepared))
+        for q, p, ans in zip(queries, prepared, answers):
+            ar = system.finish(p, ans, generate_s=per_query_gen_s)
+            yield q, ar, ar.latency_s
 
     def run(
         self,
@@ -126,13 +194,18 @@ class BenchmarkRunner:
                 if self.verbose:
                     print(f"  index_s={index_s:.2f}")
 
+                # Select this unit's queries up front so phase A and
+                # phase B iterate the same list.
+                unit_queries: list[EvalQuery] = []
                 for q in unit.queries:
-                    if max_queries is not None and n_queries >= max_queries:
+                    if max_queries is not None and (
+                        n_queries + len(unit_queries)
+                    ) >= max_queries:
                         stopped = True
                         break
-                    t_q = time.perf_counter()
-                    ar = system.answer(q.question_text)
-                    latency_s = time.perf_counter() - t_q
+                    unit_queries.append(q)
+
+                for q, ar, latency_s in self._answer_unit(system, unit_queries):
 
                     # Retrieval scoring is benchmark-specific: each
                     # benchmark implements score_retrieval to combine

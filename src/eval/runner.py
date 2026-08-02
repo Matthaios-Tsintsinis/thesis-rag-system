@@ -124,6 +124,23 @@ def main() -> None:
         "validation run before the full 2556.",
     )
     parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help=(
+            "Enable TWO-PHASE answering: retrieve every query in a unit "
+            "first, then generate the unit in batches of this size. "
+            "Omit for the historic sequential path. Only affects systems "
+            "with supports_batched_answer=True (M1 and M7 stay "
+            "sequential). Needed for local generation, where sequential "
+            "answering wastes most of the GPU; measured feasible batch "
+            "on an L4 with Qwen2.5-7B fp16 is 8 at 4k context and 32 at "
+            "800 tokens. NOTE: batch composition can change generated "
+            "text even at temperature 0, so keep this FIXED across the "
+            "cells you intend to compare."
+        ),
+    )
+    parser.add_argument(
         "--quiet",
         action="store_true",
         help="Suppress per-unit progress logs (still writes JSONL).",
@@ -177,7 +194,11 @@ def main() -> None:
     benchmark_cls = BENCHMARK_REGISTRY[args.benchmark]
     benchmark = benchmark_cls()
 
-    runner = BenchmarkRunner(output_path=args.output, verbose=not args.quiet)
+    runner = BenchmarkRunner(
+        output_path=args.output,
+        verbose=not args.quiet,
+        batch_size=args.batch_size,
+    )
     n_scored = 0
     sum_retr_f1 = 0.0
     sum_retr_skipped = 0

@@ -134,7 +134,7 @@ from ..config import (
     RERANKER_MODEL,
 )
 from ..models import generate, rerank_scores
-from .base import AnswerResult, BaseSystem, RetrievedChunk
+from .base import AnswerResult, BaseSystem, PreparedQuery, RetrievedChunk
 from .m3_hybrid import HybridRRFSystem
 
 
@@ -408,15 +408,25 @@ class CorrectiveRAGSystem(BaseSystem):
 
     # --- answering ------------------------------------------------------------
 
-    def answer(self, query: str, k: int | None = None) -> AnswerResult:
-        """Corrective retrieve -> strip refinement -> pack -> generate.
+    def prepare(self, query: str, k: int | None = None) -> PreparedQuery:
+        """Corrective retrieve -> strip refinement -> pack -> prompt.
 
-        Overrides the BaseSystem default because M9's generation context
-        differs materially (refined strips, not raw chunks). Populates
-        AnswerResult.packed / evidence_tokens / n_input_tokens per the
-        base contract so --check-budget-equality stays meaningful.
-        AnswerResult.retrieved keeps the UNREFINED chunks — that is the
-        retrieval output CK-2 scores.
+        Overrides prepare(), NOT answer(), so M9 stays batchable: the
+        expensive part (final generation) goes through the shared
+        phase-B batch, while the corrective loop and strip refinement
+        stay here in phase A.
+
+        M9's phase A is deliberately NOT LLM-free — the INCORRECT branch
+        issues a query-rewrite call. Those prompts are tiny (~50 tokens)
+        so running them sequentially costs little, but the design has to
+        allow it rather than assume phase A never touches the model. The
+        rewrite fire-rate is logged per query (m9_action / rewrite_fired)
+        and is worth watching on MultiHop, where the corrective layer
+        showed its only supported effect; on QASPER the branch was dead.
+
+        `retrieved` keeps the UNREFINED chunks — that is the retrieval
+        output CK-2 scores. `packed` carries the refined strips, which
+        is what actually reaches the generator.
         """
         # Late imports mirror BaseSystem.answer (see its comment on the
         # retrievers/base <-> prompt_packing import ordering).
@@ -464,20 +474,16 @@ class CorrectiveRAGSystem(BaseSystem):
             BASE_ANSWER_SYSTEM_PROMPT + "\n" + user_prompt,
             tokenizer_name=EVIDENCE_TOKEN_BUDGET_TOKENIZER,
         )
-        ans = generate(
-            system_prompt=BASE_ANSWER_SYSTEM_PROMPT,
-            user_prompt=user_prompt,
-            cfg=self.config.generation,
-        )
-        return AnswerResult(
+        return PreparedQuery(
             query=query,
-            answer=ans,
             retrieved=retrieved,
             packed=packed,
-            latency_s=self._now() - t0,
-            n_retrieval_calls=int(meta.get("m9_n_retrieval_calls", 1)),
-            n_input_tokens=n_input_tokens,
+            system_prompt=BASE_ANSWER_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
             evidence_tokens=evidence_tokens,
+            n_input_tokens=n_input_tokens,
+            n_retrieval_calls=int(meta.get("m9_n_retrieval_calls", 1)),
+            prepare_s=self._now() - t0,
             extra=meta,
         )
 
