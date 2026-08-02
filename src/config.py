@@ -272,6 +272,40 @@ class M4Config:
     summary_model: str = JUDGE_MODEL
     top_k_final: int = FINAL_CONTEXT_CHUNKS
 
+    # --- paper retrieval budget (professor-approved 2026-08-02) ---
+    # Paper §3 Querying: "we use the collapsed tree with 2000 maximum
+    # tokens, which approximately equates to retrieving the top-20
+    # nodes", selecting by "Keep adding nodes to the result set until you
+    # reach a predefined maximum number of tokens".
+    #
+    # M4 ONLY. M1/M2/M3/M9 stay at natural top-15 (locked decision #3).
+    # The professor's ruling was that he does not mind top-15 versus a
+    # token budget — what he wants is the model matching its paper. Those
+    # four are METHOD baselines whose papers specify no budget, so moving
+    # them would be a feasibility change wearing a fidelity
+    # justification. Only RAPTOR changes, and only because its paper
+    # says so.
+    #
+    # ASYMMETRY THIS CREATES, stated rather than left to be discovered:
+    # M4 then answers from ~2,000 evidence tokens while M2/M3/M9 answer
+    # from ~3,900 — M4 competes on roughly half the context. It compounds
+    # with a measured side effect of the fidelity rebuild: the paper
+    # chunker had already collapsed M4's context from ~3,900 to ~1,700
+    # (top-15 of ~110-token units instead of ~260-token ones), so the
+    # budget fill actually raises M4's context slightly rather than
+    # lowering it.
+    #
+    # PAPER vs REFERENCE CODE, an observed divergence: the code applies
+    # `indices[:top_k]` with top_k=10 BEFORE its 3500-token cap, so the
+    # reference retrieves ~10 nodes (~1,000 tokens) and the token cap
+    # never binds. We follow the PAPER TEXT, which is what the thesis
+    # cites and competes against.
+    #
+    # Query-time only: NOT part of paper_substrate_extra, so changing it
+    # never moves the substrate cache key.
+    # None restores plain top_k_final selection.
+    retrieval_budget_tokens: int | None = 2000
+
     # --- component overrides (per-paper assignment) ---
     # Per-paper rule (professor-approved): each system uses the
     # components its own paper specifies. The RAPTOR paper uses

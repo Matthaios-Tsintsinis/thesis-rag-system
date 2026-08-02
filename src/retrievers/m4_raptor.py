@@ -50,6 +50,18 @@ Pipeline, end to end:
 #    reason. rrf_k / first_stage_top_k remain on M4Config only so that
 #    existing callers construct.
 #
+# 8. Retrieval budget RESTORED (professor-approved 2026-08-02), M4 ONLY.
+#    The paper fills a 2,000-token context budget (~top-20 nodes)
+#    rather than taking a fixed top-k. M1/M2/M3/M9 stay at natural
+#    top-15 — their papers specify no budget, so moving them would be a
+#    feasibility change wearing a fidelity justification. CONSEQUENT
+#    ASYMMETRY, stated not hidden: M4 answers from ~2,000 evidence
+#    tokens against their ~3,900, i.e. roughly half the context.
+#    OBSERVED PAPER/CODE DIVERGENCE: the reference applies
+#    indices[:top_k] with top_k=10 BEFORE its 3500-token cap, so it
+#    retrieves ~10 nodes (~1,000 tokens) and the cap never binds. We
+#    follow the PAPER TEXT, which is what the thesis cites.
+#
 # NOT a deviation, recorded because it looks like one: retrieved SUMMARY
 # nodes carry an EMPTY gold_provenance, so the CK-2 retrieval scorer
 # cannot credit them. That is honest rather than convenient — a summary
@@ -94,7 +106,7 @@ from ..components import (
     format_components_log,
     resolve_components,
 )
-from ..config import DEFAULT_CONFIG, HarnessConfig
+from ..config import DEFAULT_CONFIG, RETRIEVAL_RANKING_DEPTH, HarnessConfig
 from ..models import embed_texts, load_embedder
 from ..parsing import walk_corpus
 from ..raptor_paper import (
@@ -103,6 +115,7 @@ from ..raptor_paper import (
     PaperTree,
     build_collapsed_index,
     build_paper_tree,
+    count_tokens_plain,
     load_collapsed_index,
     load_paper_tree,
     paper_substrate_extra,
@@ -374,6 +387,12 @@ class RaptorSystem(BaseSystem):
         assert self._resolved is not None
         assert self._flat is not None and self._tree is not None
         m4 = self.config.m4
+        # BUDGET MODE vs COUNT MODE. The paper fills a token budget
+        # rather than taking a fixed k ("Keep adding nodes to the result
+        # set until you reach a predefined maximum number of tokens").
+        # An explicit caller-supplied k always wins — CK-2 harness paths
+        # and the smoke test pass one, and they mean it.
+        budget = m4.retrieval_budget_tokens if k is None else None
         k = k or m4.top_k_final
 
         q_vec = embed_texts([query], model_name=self._resolved.embedder_id)
@@ -383,17 +402,33 @@ class RaptorSystem(BaseSystem):
         # vectors == cosine). No sparse component, no fusion, no
         # expansion — the paper ranks the flattened node set directly.
         n_flat = len(self._flat.refs)
-        scores, idx = self._flat.faiss_index.search(q_vec, min(k, n_flat))
+        # In budget mode the stopping point is not known in advance, so
+        # pull a deep-enough candidate pool. RETRIEVAL_RANKING_DEPTH
+        # nodes of ~110 tokens is several times any plausible budget.
+        depth = max(k, RETRIEVAL_RANKING_DEPTH) if budget else k
+        scores, idx = self._flat.faiss_index.search(q_vec, min(depth, n_flat))
 
         out: list[RetrievedChunk] = []
         type_counter: Counter[str] = Counter()
         paths_exercised: set[str] = set()
+        budget_tokens = 0
 
         for score, pos in zip(scores[0].tolist(), idx[0].tolist()):
             if pos < 0:
                 continue
             ref = self._flat.refs[pos]
             node = self._tree.nodes[ref["node_id"]]
+
+            if budget is not None:
+                n_tok = count_tokens_plain(node.text)
+                # Stop at the first node that would overflow. The
+                # reference's `break` is a hard stop, not a skip — it
+                # does not continue looking for a smaller node that
+                # would still fit, and neither do we.
+                if out and budget_tokens + n_tok > budget:
+                    break
+                budget_tokens += n_tok
+
             unit_type = _layer_to_unit_type(node.layer)
             type_counter[unit_type] += 1
             paths_exercised.add(
@@ -415,13 +450,15 @@ class RaptorSystem(BaseSystem):
                     source_unit_type=unit_type,
                 )
             )
-            if len(out) >= k:
+            if budget is None and len(out) >= k:
                 break
 
         self._last_trace = {
             "collapsed_top_node_types": dict(type_counter),
             "paths_exercised": sorted(paths_exercised),
             "n_returned": len(out),
+            "budget_tokens_used": budget_tokens if budget is not None else None,
+            "budget_tokens_limit": budget,
             # The App. I fidelity gate, per query. Retrieval-only: it
             # needs no generation, so it is measurable in the cheap stage.
             "non_leaf_share": (

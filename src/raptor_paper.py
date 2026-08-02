@@ -134,6 +134,18 @@ def _encoding(name: str = REFERENCE_ENCODING) -> Any:
     return tiktoken.get_encoding(name)
 
 
+def count_tokens_plain(text: str, *, encoding_name: str = REFERENCE_ENCODING) -> int:
+    """Bare cl100k_base token count, no leading space.
+
+    This is the convention the reference uses everywhere OUTSIDE the
+    chunker: `len(tokenizer.encode(node.text))` for the 3500-token
+    cluster cap and for the retrieval token budget. The chunker's
+    leading-space convention (`count_tokens_reference`) is a separate
+    quirk of `split_text` and must not be mixed with this one.
+    """
+    return len(_encoding(encoding_name).encode(text))
+
+
 def count_tokens_reference(text: str, *, encoding_name: str = REFERENCE_ENCODING) -> int:
     """Token count under the reference's convention.
 
