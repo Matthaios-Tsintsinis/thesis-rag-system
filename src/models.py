@@ -304,6 +304,195 @@ def _generate_local(
     return tokenizer.decode(generated, skip_special_tokens=True).strip()
 
 
+def deterministic_batch_order(lengths: list[int]) -> tuple[list[int], list[int]]:
+    """Length-sorted permutation + its inverse. Pure, so it is testable.
+
+    Batched generation pads every sequence to the batch maximum, so a
+    batch mixing a 300-token prompt with a 4,000-token one pays 4,000 for
+    both. Sorting by length before batching removes most of that waste.
+
+    The sort key is (length, original_index) and the sort is stable, so
+    the permutation is a pure function of the input lengths — never of
+    dict iteration order, scores, or arrival timing. That matters beyond
+    tidiness: batch COMPOSITION can change generated text (padding and
+    batched-matmul reduction order can flip argmax on near-ties), so a
+    non-deterministic order would make the run non-reproducible. See
+    `generate_batch` for the rest of that argument.
+
+    Returns (order, inverse) with `[out[i] for i in inverse]` restoring
+    input order from results computed in `order`.
+    """
+    order = sorted(range(len(lengths)), key=lambda i: (lengths[i], i))
+    inverse = [0] * len(order)
+    for position, original in enumerate(order):
+        inverse[original] = position
+    return order, inverse
+
+
+def describe_generator_runtime(
+    model_name: str = GENERATOR_MODEL, *, load_in_4bit: bool = False
+) -> dict:
+    """Load the generator and report what actually got built.
+
+    Exists for the measurement round: attention implementation is the
+    single biggest free lever on batch size at 4k context, and it is not
+    knowable from config — recent transformers picks SDPA when torch
+    supports it, older ones fall back to eager, and eager materialises a
+    batch x heads x seq x seq attention matrix that dominates VRAM.
+    """
+    import torch
+
+    tokenizer, model = load_generator(model_name, load_in_4bit)
+    return {
+        **generator_identity(model_name, load_in_4bit=load_in_4bit),
+        "attn_implementation": getattr(
+            model.config, "_attn_implementation", "unknown"
+        ),
+        "dtype": str(model.dtype),
+        "n_layers": getattr(model.config, "num_hidden_layers", None),
+        "n_kv_heads": getattr(model.config, "num_key_value_heads", None),
+        "max_position_embeddings": getattr(
+            model.config, "max_position_embeddings", None
+        ),
+        "tokenizer_padding_side": tokenizer.padding_side,
+        "vram_allocated_gb": (
+            round(torch.cuda.memory_allocated() / 1e9, 2)
+            if torch.cuda.is_available() else None
+        ),
+    }
+
+
+def generate_batch(
+    system_prompts: list[str],
+    user_prompts: list[str],
+    cfg: GenerationConfig | None = None,
+    *,
+    batch_size: int = 8,
+    sort_by_length: bool = True,
+    progress_every: int = 0,
+) -> list[str]:
+    """Batched generation. Returns answers aligned to the INPUT order.
+
+    Phase B of the two-phase runner. Against an API the harness could
+    stay sequential; against a local model that leaves ~90% of the
+    throughput unused, and the measured cost of the matrix is dominated
+    by this call.
+
+    FOUR REQUIREMENTS THAT SILENTLY CORRUPT OUTPUT IF MISSED. Each
+    produces plausible-looking text rather than an error, which is why
+    they are enforced here rather than left to call sites:
+
+      1. LEFT padding. Decoder-only generation continues from the last
+         position, so right-padded rows continue from PAD and emit
+         garbage. The tokenizer's padding_side is forced to "left" for
+         the duration and restored afterwards.
+      2. A real pad token. Many chat checkpoints ship pad_token=None;
+         falling back to eos_token is the standard fix.
+      3. An explicit attention_mask, so padded positions are not attended.
+      4. Correct slicing of the generated span. With LEFT padding every
+         row's continuation begins at the same index (the padded input
+         width), which is precisely why left padding makes this safe —
+         with right padding the offset differs per row and a shared
+         slice silently truncates or leaks prompt text.
+
+    DETERMINISM. Batch composition can change generated text even at
+    temperature 0. We control batching completely — no continuous
+    batching, no arrival-timing dependence — so the run is reproducible
+    provided batch_size and the ordering are fixed. `sort_by_length` uses
+    the pure, stable key in `deterministic_batch_order`. If the
+    batch-invariance probe shows composition matters, batch_size becomes
+    part of the artifact's identity and belongs in the cache key of
+    anything cached (see raptor_paper.paper_substrate_extra).
+
+    OpenAI-model ids fall back to the sequential API path — batching is a
+    local-model concern, and the API already parallelises server-side.
+    """
+    cfg = cfg or GenerationConfig()
+    if len(system_prompts) != len(user_prompts):
+        raise ValueError(
+            f"prompt list length mismatch: {len(system_prompts)} system vs "
+            f"{len(user_prompts)} user"
+        )
+    if not user_prompts:
+        return []
+    if batch_size < 1:
+        raise ValueError("batch_size must be >= 1")
+
+    if _is_openai_model(cfg.model):
+        return [
+            _generate_openai(s, u, cfg)
+            for s, u in zip(system_prompts, user_prompts)
+        ]
+
+    import torch
+
+    tokenizer, model = load_generator(cfg.model, cfg.load_in_4bit)
+
+    texts = [
+        tokenizer.apply_chat_template(
+            [{"role": "system", "content": s}, {"role": "user", "content": u}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        for s, u in zip(system_prompts, user_prompts)
+    ]
+
+    if sort_by_length:
+        lengths = [len(tokenizer(t, add_special_tokens=False)["input_ids"])
+                   for t in texts]
+        # Only the forward permutation is needed: results are written
+        # back by original index, so no inverse pass is required.
+        order, _ = deterministic_batch_order(lengths)
+    else:
+        order = list(range(len(texts)))
+
+    prev_side = tokenizer.padding_side
+    prev_pad = tokenizer.pad_token
+    tokenizer.padding_side = "left"          # requirement 1
+    if tokenizer.pad_token is None:          # requirement 2
+        tokenizer.pad_token = tokenizer.eos_token
+
+    results: list[str] = [""] * len(texts)
+    try:
+        for start in range(0, len(order), batch_size):
+            idxs = order[start : start + batch_size]
+            batch_texts = [texts[i] for i in idxs]
+            enc = tokenizer(
+                batch_texts,
+                return_tensors="pt",
+                padding=True,
+                add_special_tokens=False,
+            ).to(model.device)
+
+            with torch.inference_mode():
+                out = model.generate(
+                    input_ids=enc["input_ids"],
+                    attention_mask=enc["attention_mask"],   # requirement 3
+                    max_new_tokens=cfg.max_new_tokens,
+                    do_sample=cfg.temperature > 0,
+                    temperature=max(cfg.temperature, 1e-5),
+                    top_p=cfg.top_p,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+
+            # Requirement 4: left padding aligns every row's continuation
+            # to the same offset.
+            gen = out[:, enc["input_ids"].shape[1] :]
+            for i, row in zip(idxs, gen):
+                results[i] = tokenizer.decode(
+                    row, skip_special_tokens=True
+                ).strip()
+
+            if progress_every and (start // batch_size) % progress_every == 0:
+                done = min(start + batch_size, len(order))
+                print(f"[generate_batch] {done}/{len(order)}")
+    finally:
+        tokenizer.padding_side = prev_side
+        tokenizer.pad_token = prev_pad
+
+    return results
+
+
 def generate(
     system_prompt: str,
     user_prompt: str,
