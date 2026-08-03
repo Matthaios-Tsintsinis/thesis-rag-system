@@ -329,21 +329,173 @@ def deterministic_batch_order(lengths: list[int]) -> tuple[list[int], list[int]]
     return order, inverse
 
 
+def token_budget_batches(
+    order: list[int],
+    lengths: list[int],
+    *,
+    max_padded_tokens: int,
+    max_batch_size: int | None = None,
+) -> list[list[int]]:
+    """Group pre-sorted indices so that n * longest <= max_padded_tokens.
+
+    WHY THIS EXISTS, measured rather than theorised. A fixed batch COUNT
+    has to be sized for the worst-case batch, because a batch pads every
+    member to its longest one — so the memory cost is `n * max_len`, not
+    `sum(len)`. Real prompts are ragged: a synthetic benchmark of uniform
+    4,000-token prompts survived batch 8 at 21.7 GB, and real MultiHop
+    prompts at the same batch size OOM'd, because their padded width
+    exceeded 4,000.
+
+    Worse, length sorting — which is on, and which does reduce total
+    padding waste — CONCENTRATES the longest prompts into a single
+    batch. That batch sets peak memory. Sorting is a throughput win and
+    a peak-memory non-win.
+
+    Bounding padded tokens instead adapts to raggedness: many short
+    prompts give a wide batch, a few long ones give a narrow batch, and
+    peak memory is bounded by construction rather than by guessing a
+    count that happens to fit the longest case. It also means one knob
+    covers both context regimes — M4's ~2k prompts and M2/M3/M9's ~4k —
+    instead of a separate batch size per system.
+
+    `order` is the length-sorted index order; `lengths[i]` is item i's
+    token count. Pure and deterministic, so batch composition is a
+    function of the inputs and the budget alone. Note that composition
+    therefore depends on the budget: if the batch-invariance probe shows
+    composition changes output, the budget is part of the artifact's
+    identity wherever the artifact is cached.
+
+    A single item wider than the budget gets its own batch rather than
+    being dropped — the same "include it anyway" policy the context
+    packer uses, for the same reason.
+    """
+    if max_padded_tokens < 1:
+        raise ValueError("max_padded_tokens must be >= 1")
+    batches: list[list[int]] = []
+    current: list[int] = []
+    current_max = 0
+    for idx in order:
+        candidate_max = max(current_max, lengths[idx])
+        n_after = len(current) + 1
+        over_tokens = n_after * candidate_max > max_padded_tokens
+        over_count = (
+            max_batch_size is not None and n_after > max_batch_size
+        )
+        if current and (over_tokens or over_count):
+            batches.append(current)
+            current, current_max = [], 0
+            candidate_max = lengths[idx]
+        current.append(idx)
+        current_max = candidate_max
+    if current:
+        batches.append(current)
+    return batches
+
+
+def configure_cuda_allocator() -> str | None:
+    """Set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True if unset.
+
+    Must run BEFORE torch initialises CUDA — the variable is read at
+    allocator setup and changing it afterwards does nothing.
+
+    Ragged batches are the allocator's worst case: every distinct padded
+    width asks for a differently-sized block, and freed blocks of the
+    wrong size cannot be reused. The observed OOM had 1.34 GiB
+    reserved-but-unallocated, i.e. memory torch was holding but could not
+    hand out — expandable segments is the mechanism that targets exactly
+    that. Returns the value in force, or None if torch is absent.
+    """
+    import os
+
+    key = "PYTORCH_CUDA_ALLOC_CONF"
+    if not os.environ.get(key):
+        os.environ[key] = "expandable_segments:True"
+    return os.environ[key]
+
+
+def release_generator() -> None:
+    """Drop the cached generator and return its VRAM.
+
+    `load_generator` is lru_cached, so the model outlives any single
+    inspection and keeps ~15 GB resident. That is correct for a run and
+    wrong for a probe: it OOM'd a subsequent `python -m src.eval.runner`
+    subprocess launched from the same notebook.
+    """
+    import gc
+
+    load_generator.cache_clear()
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
+
+
+def describe_generator_config(model_name: str = GENERATOR_MODEL) -> dict:
+    """Architecture facts WITHOUT loading weights. Safe to call anywhere.
+
+    Enough to compute KV-cache arithmetic (layers x kv_heads x head_dim)
+    when planning a batch budget. What it cannot tell you is the
+    attention implementation, which is resolved at model construction —
+    for that you need `describe_generator_runtime`.
+    """
+    from transformers import AutoConfig
+
+    c = AutoConfig.from_pretrained(model_name)
+    n_layers = getattr(c, "num_hidden_layers", None)
+    n_kv = getattr(c, "num_key_value_heads", None)
+    head_dim = getattr(c, "head_dim", None) or (
+        (getattr(c, "hidden_size", 0) // getattr(c, "num_attention_heads", 1))
+        or None
+    )
+    kv_bytes_per_token = (
+        2 * n_layers * n_kv * head_dim * 2
+        if None not in (n_layers, n_kv, head_dim)
+        else None
+    )
+    return {
+        "model": model_name,
+        "n_layers": n_layers,
+        "n_attention_heads": getattr(c, "num_attention_heads", None),
+        "n_kv_heads": n_kv,
+        "head_dim": head_dim,
+        "max_position_embeddings": getattr(c, "max_position_embeddings", None),
+        "vocab_size": getattr(c, "vocab_size", None),
+        # fp16 KV per token per sequence; multiply by padded tokens to
+        # size a batch budget.
+        "kv_bytes_per_token_fp16": kv_bytes_per_token,
+    }
+
+
 def describe_generator_runtime(
-    model_name: str = GENERATOR_MODEL, *, load_in_4bit: bool = False
+    model_name: str = GENERATOR_MODEL,
+    *,
+    load_in_4bit: bool = False,
+    release: bool = True,
 ) -> dict:
-    """Load the generator and report what actually got built.
+    """Load the generator, report what actually got built, then RELEASE it.
 
     Exists for the measurement round: attention implementation is the
     single biggest free lever on batch size at 4k context, and it is not
     knowable from config — recent transformers picks SDPA when torch
     supports it, older ones fall back to eager, and eager materialises a
     batch x heads x seq x seq attention matrix that dominates VRAM.
+
+    `release=True` by DEFAULT, and that default is a bug fix: because
+    `load_generator` is lru_cached, an earlier version left ~15 GB
+    resident in the calling process and OOM'd the next
+    `python -m src.eval.runner` subprocess launched from the same
+    notebook. A probe must not cost the run that follows it. Pass
+    release=False only when the caller intends to generate immediately
+    afterwards in the same process.
     """
     import torch
 
     tokenizer, model = load_generator(model_name, load_in_4bit)
-    return {
+    out = {
         **generator_identity(model_name, load_in_4bit=load_in_4bit),
         "attn_implementation": getattr(
             model.config, "_attn_implementation", "unknown"
@@ -359,7 +511,14 @@ def describe_generator_runtime(
             round(torch.cuda.memory_allocated() / 1e9, 2)
             if torch.cuda.is_available() else None
         ),
+        "cuda_alloc_conf": __import__("os").environ.get(
+            "PYTORCH_CUDA_ALLOC_CONF"
+        ),
     }
+    del tokenizer, model
+    if release:
+        release_generator()
+    return out
 
 
 def generate_batch(
@@ -370,6 +529,7 @@ def generate_batch(
     batch_size: int = 8,
     sort_by_length: bool = True,
     progress_every: int = 0,
+    max_padded_tokens: int | None = None,
 ) -> list[str]:
     """Batched generation. Returns answers aligned to the INPUT order.
 
@@ -424,6 +584,7 @@ def generate_batch(
             for s, u in zip(system_prompts, user_prompts)
         ]
 
+    configure_cuda_allocator()
     import torch
 
     tokenizer, model = load_generator(cfg.model, cfg.load_in_4bit)
@@ -437,14 +598,29 @@ def generate_batch(
         for s, u in zip(system_prompts, user_prompts)
     ]
 
+    need_lengths = sort_by_length or max_padded_tokens is not None
+    lengths = (
+        [len(tokenizer(t, add_special_tokens=False)["input_ids"]) for t in texts]
+        if need_lengths
+        else [0] * len(texts)
+    )
     if sort_by_length:
-        lengths = [len(tokenizer(t, add_special_tokens=False)["input_ids"])
-                   for t in texts]
         # Only the forward permutation is needed: results are written
         # back by original index, so no inverse pass is required.
         order, _ = deterministic_batch_order(lengths)
     else:
         order = list(range(len(texts)))
+
+    if max_padded_tokens is not None:
+        groups = token_budget_batches(
+            order, lengths,
+            max_padded_tokens=max_padded_tokens,
+            max_batch_size=batch_size,
+        )
+    else:
+        groups = [
+            order[s : s + batch_size] for s in range(0, len(order), batch_size)
+        ]
 
     prev_side = tokenizer.padding_side
     prev_pad = tokenizer.pad_token
@@ -454,8 +630,8 @@ def generate_batch(
 
     results: list[str] = [""] * len(texts)
     try:
-        for start in range(0, len(order), batch_size):
-            idxs = order[start : start + batch_size]
+        n_done = 0
+        for group_no, idxs in enumerate(groups):
             batch_texts = [texts[i] for i in idxs]
             enc = tokenizer(
                 batch_texts,
@@ -483,9 +659,9 @@ def generate_batch(
                     row, skip_special_tokens=True
                 ).strip()
 
-            if progress_every and (start // batch_size) % progress_every == 0:
-                done = min(start + batch_size, len(order))
-                print(f"[generate_batch] {done}/{len(order)}")
+            n_done += len(idxs)
+            if progress_every and group_no % progress_every == 0:
+                print(f"[generate_batch] {n_done}/{len(order)}")
     finally:
         tokenizer.padding_side = prev_side
         tokenizer.pad_token = prev_pad

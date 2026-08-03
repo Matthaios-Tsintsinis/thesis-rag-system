@@ -15,7 +15,12 @@ import unittest
 from unittest import mock
 
 from src.config import GenerationConfig
-from src.models import deterministic_batch_order, generate_batch
+from src.models import (
+    configure_cuda_allocator,
+    deterministic_batch_order,
+    generate_batch,
+    token_budget_batches,
+)
 
 
 class TestDeterministicBatchOrder(unittest.TestCase):
@@ -82,6 +87,100 @@ class TestRoutingAndContract(unittest.TestCase):
                 ["s"], ["u"], GenerationConfig(model="gpt-4o-mini"), batch_size=0
             )
 
+
+
+class TestTokenBudgetBatches(unittest.TestCase):
+    """Bound n * longest instead of n.
+
+    A fixed count must be sized for the worst-case batch, because a
+    batch pads to its longest member. Measured: uniform 4k prompts
+    survived batch 8 at 21.7GB; real ragged MultiHop prompts OOM'd at
+    the same count.
+    """
+
+    def test_narrow_batches_for_long_prompts_wide_for_short(self):
+        order, lengths = [0, 1, 2, 3, 4, 5], [100, 100, 100, 4000, 4000, 4000]
+        groups = token_budget_batches(
+            order, lengths, max_padded_tokens=8000, max_batch_size=8
+        )
+        self.assertEqual(groups, [[0, 1, 2], [3, 4], [5]])
+
+    def test_never_exceeds_the_padded_budget(self):
+        import random
+
+        rng = random.Random(0)
+        lengths = [rng.randint(200, 4200) for _ in range(200)]
+        order, _ = deterministic_batch_order(lengths)
+        groups = token_budget_batches(
+            order, lengths, max_padded_tokens=20_000, max_batch_size=64
+        )
+        for g in groups:
+            padded = len(g) * max(lengths[i] for i in g)
+            if len(g) > 1:
+                self.assertLessEqual(padded, 20_000)
+
+    def test_every_item_appears_exactly_once(self):
+        lengths = [i * 37 % 900 + 50 for i in range(97)]
+        order, _ = deterministic_batch_order(lengths)
+        groups = token_budget_batches(
+            order, lengths, max_padded_tokens=5000
+        )
+        flat = [i for g in groups for i in g]
+        self.assertEqual(sorted(flat), sorted(range(97)))
+
+    def test_oversize_item_gets_its_own_batch_not_dropped(self):
+        """Same include-it-anyway policy as the context packer: one
+        over-budget item beats zero output."""
+        groups = token_budget_batches([0], [99_999], max_padded_tokens=1000)
+        self.assertEqual(groups, [[0]])
+
+    def test_count_cap_still_applies(self):
+        lengths = [10] * 50
+        order, _ = deterministic_batch_order(lengths)
+        groups = token_budget_batches(
+            order, lengths, max_padded_tokens=10_000_000, max_batch_size=8
+        )
+        self.assertTrue(all(len(g) <= 8 for g in groups))
+
+    def test_deterministic(self):
+        lengths = [i * 13 % 700 + 40 for i in range(60)]
+        order, _ = deterministic_batch_order(lengths)
+        a = token_budget_batches(order, lengths, max_padded_tokens=6000)
+        b = token_budget_batches(order, lengths, max_padded_tokens=6000)
+        self.assertEqual(a, b)
+
+    def test_rejects_nonpositive_budget(self):
+        with self.assertRaises(ValueError):
+            token_budget_batches([0], [10], max_padded_tokens=0)
+
+
+class TestAllocatorConfig(unittest.TestCase):
+    def test_sets_expandable_segments_when_unset(self):
+        import os
+
+        prev = os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+        try:
+            self.assertEqual(
+                configure_cuda_allocator(), "expandable_segments:True"
+            )
+        finally:
+            os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+            if prev is not None:
+                os.environ["PYTORCH_CUDA_ALLOC_CONF"] = prev
+
+    def test_respects_an_explicit_user_setting(self):
+        import os
+
+        prev = os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+        try:
+            self.assertEqual(
+                configure_cuda_allocator(), "max_split_size_mb:128"
+            )
+        finally:
+            os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+            if prev is not None:
+                os.environ["PYTORCH_CUDA_ALLOC_CONF"] = prev
 
 if __name__ == "__main__":
     unittest.main()

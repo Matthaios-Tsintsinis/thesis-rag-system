@@ -83,6 +83,7 @@ class BenchmarkRunner:
         verbose: bool = True,
         batch_size: int | None = None,
         resume: bool = False,
+        max_padded_tokens: int | None = None,
     ) -> None:
         self.output_path = output_path
         self.verbose = verbose
@@ -95,6 +96,12 @@ class BenchmarkRunner:
         # interrupted pass as normal rather than exceptional is the
         # correct default posture even though the flag is opt-in.
         self.resume = resume
+        # Upper bound on n * longest-prompt within a batch. When set,
+        # it governs batch shape and `batch_size` becomes an upper
+        # bound on COUNT rather than the batch size itself. This is
+        # the knob that survives ragged real prompts; a fixed count
+        # measured on uniform synthetic prompts does not.
+        self.max_padded_tokens = max_padded_tokens
         # None -> sequential answering (the historic path, and the right
         # one against an API). An int enables TWO-PHASE answering for
         # systems that support it: retrieve every query first, then
@@ -153,7 +160,11 @@ class BenchmarkRunner:
                 yield q, ar, time.perf_counter() - t_q
             return
 
-        from ..models import deterministic_batch_order, generate_batch
+        from ..models import (
+            deterministic_batch_order,
+            generate_batch,
+            token_budget_batches,
+        )
 
         # PHASE A — retrieval + any query-time LLM work, sequential.
         t_a = time.perf_counter()
@@ -182,12 +193,32 @@ class BenchmarkRunner:
         # dicts and never depends on file order. Sorting is by
         # n_input_tokens, already computed by prepare(), so it costs no
         # extra tokenisation.
-        order, _ = deterministic_batch_order([p.n_input_tokens for p in prepared])
+        lengths = [p.n_input_tokens for p in prepared]
+        order, _ = deterministic_batch_order(lengths)
+
+        # BATCH SHAPE. A fixed count must be sized for the worst-case
+        # batch, because padding makes the cost n * longest rather than
+        # sum(len) — and length sorting, while it cuts total padding
+        # waste, CONCENTRATES the longest prompts into one batch, which
+        # is precisely the batch that OOMs. Bounding padded tokens
+        # instead adapts to raggedness and bounds peak memory by
+        # construction, with one knob covering both M4's ~2k prompts and
+        # M2/M3/M9's ~4k.
+        if self.max_padded_tokens is not None:
+            groups = token_budget_batches(
+                order, lengths,
+                max_padded_tokens=self.max_padded_tokens,
+                max_batch_size=self.batch_size,
+            )
+        else:
+            groups = [
+                order[s : s + self.batch_size]
+                for s in range(0, len(order), self.batch_size)
+            ]
 
         t_b = time.perf_counter()
         n_done = 0
-        for start in range(0, len(order), self.batch_size):
-            idxs = order[start : start + self.batch_size]
+        for idxs in groups:
             t_batch = time.perf_counter()
             answers = generate_batch(
                 [prepared[i].system_prompt for i in idxs],

@@ -141,6 +141,22 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--max-padded-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Cap n * longest-prompt within a generation batch, instead of "
+            "using a fixed batch count. Real prompts are ragged and a batch "
+            "pads to its longest member, so a count tuned on uniform "
+            "synthetic prompts OOMs on real ones: batch 8 survived uniform "
+            "4k prompts at 21.7GB and OOM'd on real MultiHop prompts. With "
+            "this set, --batch-size becomes an upper bound on COUNT only. "
+            "One knob covers both context regimes (M4 ~2k, M2/M3/M9 ~4k). "
+            "Suggested starting point on a 24GB L4 with Qwen2.5-7B fp16: "
+            "20000, then raise until it stops fitting."
+        ),
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help=(
@@ -210,6 +226,7 @@ def main() -> None:
         verbose=not args.quiet,
         batch_size=args.batch_size,
         resume=args.resume,
+        max_padded_tokens=args.max_padded_tokens,
     )
     n_scored = 0
     sum_retr_f1 = 0.0
