@@ -377,13 +377,33 @@ class M4Config:
     )
     reranker: str | None = None  # M4 does not rerank
 
-    # Index-time summariser concurrency. Throughput only: node ids and
-    # tree shape are computed before any summary call is dispatched, so
-    # the artifact is byte-identical at any worker count (pinned by a
-    # test in tests/test_raptor_paper_tree.py). 4 is the value the
-    # token-per-minute arithmetic supports; raise only if the serving
-    # limits do.
-    summary_max_workers: int = 4
+    # --- index-time summariser batching (local model) ---
+    # These REPLACE the previous `summary_max_workers` thread pool, which
+    # was correct against an API and unsafe against a local one: threads
+    # contend on the GIL, serialise onto one CUDA stream, each
+    # `model.generate` allocates its own KV cache, and — decisively —
+    # `models.load_generator` is lru_cached, so every thread shares one
+    # tokenizer object that `generate_batch` MUTATES (padding side). A
+    # thread observing a right-padded tokenizer mid-call does not crash;
+    # it emits fluent text continued from PAD.
+    #
+    # BOTH ARE CACHE-KEY INPUTS (raptor_paper.paper_substrate_extra).
+    # Batch composition can change generated text at temperature 0, and
+    # summaries are CACHED — they are the artifact M4's substrate key
+    # names — so the batch shape is named rather than assumed inert.
+    # Accepted cost: retuning either invalidates every tree built at the
+    # old value. Node ids and tree shape are NOT affected by either (they
+    # are computed before any call is dispatched); a test pins that.
+    #
+    # summary_max_padded_tokens bounds n * longest-prompt in a batch.
+    # It is not optional: cluster contexts range from ~110 tokens to
+    # PaperTreeParams.max_length_in_cluster (3500), so a fixed count
+    # sized for short clusters OOMs on a layer of long ones. 16000 is a
+    # REASONED default, not a measurement — set below the measured 20000
+    # answer-path ceiling, with extra headroom because summaries decode
+    # 100 new tokens rather than 512.
+    summary_batch_size: int = 32
+    summary_max_padded_tokens: int = 16000
 
     # UNREAD by the paper-faithful path, retained so existing callers
     # construct. The rebuild dropped BM25 entirely: the paper's collapsed

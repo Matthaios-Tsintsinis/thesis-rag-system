@@ -739,6 +739,84 @@ PAPER_SUMMARY_USER_TEMPLATE = (
 )
 
 
+def summarize_paper_style_batch(
+    contexts: list[str],
+    *,
+    model: str,
+    max_tokens: int = 100,
+    temperature: float = 0.0,
+    batch_size: int = 32,
+    max_padded_tokens: int | None = 16000,
+    progress_every: int = 1,
+) -> list[str]:
+    """A whole layer's cluster summaries in one batched call. M4's path.
+
+    WHY A LAYER IS THE BATCH. Bottom-up construction produces an entire
+    layer's clusters before any of them is summarised, so the layer is a
+    natural batch with no reordering, no queueing and no partial results
+    to reconcile. Passing the WHOLE layer (rather than pre-slicing it)
+    is deliberate: `generate_batch` length-sorts internally, and sorting
+    across the full layer removes far more padding waste than sorting
+    within arbitrary pre-cut groups.
+
+    WHY NOT THREADS, which this replaces. `M4Config.summary_max_workers`
+    dispatched `summarize_fn` through a ThreadPoolExecutor, which was
+    right against an API and is wrong against a local model on three
+    counts: threads contend on the GIL, they serialise onto one CUDA
+    stream anyway, and each concurrent `model.generate` allocates its own
+    KV cache. The decisive one is subtler — `models.load_generator` is
+    `lru_cache`d, so every thread shares ONE tokenizer object, and
+    `generate_batch` MUTATES it (forces `padding_side="left"`, restores
+    in a `finally`). Concurrent callers can therefore observe a
+    right-padded tokenizer mid-call, which does not raise; it produces
+    fluent text continued from PAD. Silent corruption, not a crash.
+
+    WHY SUMMARIES BATCH WELL WHEN 4k ANSWERS DO NOT. A batch runs until
+    its LONGEST member stops, so one non-terminating generation makes
+    every member pay the cap. At answer time that cap is
+    GEN_MAX_NEW_TOKENS=512 and the tail dominates. Here `max_tokens` is
+    the reference's summarization_length=100, so the worst case is 100
+    decode steps for the batch — the uncapped-tail failure cannot occur.
+    This is the one place batching is unambiguously correct.
+
+    BATCH SHAPE IS PART OF THE ARTIFACT'S IDENTITY. Batch composition can
+    change generated text at temperature 0 (padding plus batched-matmul
+    reduction order flipping argmax on near-ties), and unlike answers,
+    summaries are CACHED — they are the artifact a substrate key names.
+    So `batch_size` and `max_padded_tokens` are both folded into
+    `paper_substrate_extra` rather than assumed inert. Naming them beats
+    pretending invariance; the cost is that changing either invalidates
+    every tree built at the old value.
+
+    `max_padded_tokens` is needed rather than optional: cluster contexts
+    run from ~110 tokens up to `PaperTreeParams.max_length_in_cluster`
+    (3500), so a fixed count sized for the short case OOMs on a layer of
+    long ones — the same raggedness argument that produced
+    `models.token_budget_batches`.
+
+    The GenerationConfig leaves `load_in_4bit` at the config default,
+    which MUST match the answer path: `load_generator` is keyed on
+    (model_name, load_in_4bit), so a mismatch would load a second ~15 GB
+    copy of the same weights instead of reusing the resident one.
+    """
+    from .config import GenerationConfig
+    from .models import generate_batch
+
+    if not contexts:
+        return []
+    return generate_batch(
+        [PAPER_SUMMARY_SYSTEM_PROMPT] * len(contexts),
+        [PAPER_SUMMARY_USER_TEMPLATE.format(context=c) for c in contexts],
+        cfg=GenerationConfig(
+            model=model, max_new_tokens=max_tokens, temperature=temperature
+        ),
+        batch_size=batch_size,
+        sort_by_length=True,
+        progress_every=progress_every,
+        max_padded_tokens=max_padded_tokens,
+    )
+
+
 def summarize_paper_style(
     context: str,
     *,
@@ -746,7 +824,11 @@ def summarize_paper_style(
     max_tokens: int = 100,
     temperature: float = 0.0,
 ) -> str:
-    """One summary call, model-agnostic.
+    """One summary call, model-agnostic. Retained for single-call use.
+
+    M4's index path uses `summarize_paper_style_batch`; this stays as the
+    reference-faithful one-context form (and the place the prompt and
+    temperature reasoning below is recorded).
 
     Routes through `models.generate`, which dispatches on the model id
     (OpenAI prefixes to the API, anything else to a local causal LM), so
@@ -778,7 +860,7 @@ def summarize_paper_style(
 
 
 ClusterFn = Callable[[list[PaperNode], PaperTreeParams, dict], list[list[PaperNode]]]
-SummarizeContextFn = Callable[[str], str]
+SummarizeBatchFn = Callable[[list[str]], list[str]]
 EmbedFn = Callable[[list[str]], np.ndarray]
 
 
@@ -790,8 +872,10 @@ def _cluster_sort_key(
     The reference assigns node indices inside a Lock-guarded dict while
     summarising on a ThreadPoolExecutor, which makes its ids a function
     of completion order. Ours are a function of member position in the
-    input layer, so `max_workers > 1` cannot perturb the artifact — the
-    cache-identity contract again (see micro-divergence (i)).
+    input layer, so no concurrency or batching decision can perturb the
+    tree's SHAPE or its node IDS — the cache-identity contract again (see
+    micro-divergence (i)). Summary TEXT is a separate matter: batch
+    composition can move it, which is why batch shape is in the key.
     """
     positions = sorted(position[n.node_id] for n in cluster)
     return (positions[0], len(positions), tuple(positions))
@@ -802,32 +886,36 @@ def build_paper_tree(
     chunk_embeddings: np.ndarray,
     *,
     params: PaperTreeParams,
-    summarize_fn: SummarizeContextFn,
+    summarize_batch_fn: SummarizeBatchFn,
     embed_fn: EmbedFn,
     cluster_fn: ClusterFn | None = None,
-    max_workers: int = 1,
     on_summary: Callable[[PaperNode], None] | None = None,
     verbose: bool = False,
 ) -> PaperTree:
     """Build the paper's bottom-up tree.
 
     Layer 0 is the leaf chunks. Each iteration soft-clusters the current
-    layer, summarises each cluster over `get_text(cluster)`, embeds the
+    layer, summarises every cluster over `get_text(cluster)`, embeds the
     new summaries, and repeats. Stops at `params.num_layers` iterations
     or, per the reference, as soon as a layer holds no more than
     `reduction_dimension + 1` nodes.
 
-    `summarize_fn` takes ONE concatenated context string, matching the
-    reference's `summarize(context=node_texts, ...)`. That differs from
-    src/raptor.py's list-of-passages signature by design.
+    `summarize_batch_fn` takes a WHOLE LAYER's concatenated context
+    strings and returns summaries POSITIONALLY ALIGNED to them. Each
+    context is what the reference passes as `summarize(context=...)`; the
+    batching is ours, and it is the layer-granularity form because a
+    layer is produced all at once (see `summarize_paper_style_batch` for
+    why this replaced a ThreadPoolExecutor, and why the batch shape is
+    part of the substrate cache key).
 
     `cluster_fn` is a test seam: it defaults to `perform_clustering` and
     exists so the deterministic bookkeeping (ids, multi-parent links,
     leaf-index closure) can be tested without paying for UMAP fits.
 
-    `max_workers > 1` threads only the summariser API calls. Node ids and
-    tree shape are computed before any call is dispatched, so the
-    artifact is byte-identical to a sequential build.
+    Node ids and tree shape are computed before any summary call is
+    dispatched, so they are invariant under every batching decision.
+    Summary TEXT is not promised to be, which is exactly why batch size
+    and the padded-token budget are named in the key.
     """
     if chunk_embeddings.ndim != 2:
         raise ValueError("chunk_embeddings must be 2D (n_chunks, dim)")
@@ -878,14 +966,17 @@ def build_paper_tree(
         clusters.sort(key=lambda c: _cluster_sort_key(c, position))
 
         contexts = [get_text(c) for c in clusters]
-        if max_workers > 1 and len(contexts) > 1:
-            from concurrent.futures import ThreadPoolExecutor
-
-            with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                summaries = list(pool.map(summarize_fn, contexts))
-        else:
-            summaries = [summarize_fn(ctx) for ctx in contexts]
+        summaries = list(summarize_batch_fn(contexts))
+        if len(summaries) != len(contexts):
+            # Alignment is POSITIONAL, so a length mismatch does not
+            # raise on its own — it silently attaches each summary to the
+            # wrong cluster and produces a plausible, wrong tree. Refuse.
+            raise RuntimeError(
+                f"summarize_batch_fn returned {len(summaries)} summaries for "
+                f"{len(contexts)} clusters at layer {layer + 1}"
+            )
         stats["n_summary_calls"] += len(summaries)
+        stats["n_summary_layers"] = stats.get("n_summary_layers", 0) + 1
 
         next_layer = layer + 1
         new_ids: list[str] = []
@@ -1161,6 +1252,8 @@ def paper_substrate_extra(
     summary_prompt_version: str,
     chunker_version: str = RAPTOR_CHUNKER_VERSION,
     summary_max_tokens: int = 100,
+    summary_batch_size: int = 32,
+    summary_max_padded_tokens: int = 16000,
     sparse: str = "bm25okapi",
     fusion: str = "rrf",
     rrf_k: int = 60,
@@ -1186,6 +1279,15 @@ def paper_substrate_extra(
     `include_root` defaults True: the paper collapses the ENTIRE tree,
     and there is no synthetic all-corpus root to exclude. The field is
     kept only so the base schema stays recognisable next to M7's.
+
+    `summary_batch_size` / `summary_max_padded_tokens` name the SHAPE of
+    the batched summariser call. They are here because batch composition
+    can change generated text at temperature 0, and summaries — unlike
+    answers — are cached, so they ARE the artifact this key names.
+    Naming the shape beats assuming invariance; the accepted cost is that
+    retuning either knob (after an OOM, say) invalidates every tree built
+    at the old value. Both are M4-local: they live on M4Config, which
+    nothing on M7's key derivation reads.
     """
     return {
         # --- the seven base fields, same names as raptor_substrate_extra ---
@@ -1201,6 +1303,8 @@ def paper_substrate_extra(
         "tree_schema": PAPER_TREE_SCHEMA_VERSION,
         "chunker_impl": chunker_version,
         "summary_max_tokens": int(summary_max_tokens),
+        "summary_batch_size": int(summary_batch_size),
+        "summary_max_padded_tokens": int(summary_max_padded_tokens),
     }
 
 
@@ -1219,6 +1323,7 @@ __all__ = [
     "count_tokens_reference",
     "split_text_raptor",
     "summarize_paper_style",
+    "summarize_paper_style_batch",
     "perform_clustering",
     "get_text",
     "build_paper_tree",

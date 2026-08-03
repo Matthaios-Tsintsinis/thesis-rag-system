@@ -121,7 +121,7 @@ from ..raptor_paper import (
     paper_substrate_extra,
     save_collapsed_index,
     save_paper_tree,
-    summarize_paper_style,
+    summarize_paper_style_batch,
     tree_stats,
 )
 from .base import BaseSystem, RetrievedChunk
@@ -183,6 +183,10 @@ class RaptorSystem(BaseSystem):
             summary_model=m4.summary_model,
             summary_prompt_version=m4.summary_prompt_version,
             summary_max_tokens=m4.summary_max_tokens,
+            # Batch shape is part of the artifact: composition can move
+            # generated text at temperature 0, and summaries are cached.
+            summary_batch_size=m4.summary_batch_size,
+            summary_max_padded_tokens=m4.summary_max_padded_tokens,
             rrf_k=m4.rrf_k,
             include_root=m4.include_root_in_flat_index,
         )
@@ -289,16 +293,26 @@ class RaptorSystem(BaseSystem):
 
         summary_calls = [0]
 
+        # Post-hoc count only. Since summarisation is batched per LAYER,
+        # these fire in bursts once a layer's call returns; live progress
+        # inside a layer comes from generate_batch's own reporting.
         def _on_summary(_n: PaperNode) -> None:
             summary_calls[0] += 1
             if summary_calls[0] % 200 == 0:
                 print(f"[{self.system_id}] {summary_calls[0]} summaries...")
 
-        def _summarize(context: str) -> str:
-            return summarize_paper_style(
-                context,
+        def _summarize_batch(contexts: list[str]) -> list[str]:
+            # ONE call per tree layer. Bottom-up construction produces a
+            # whole layer's clusters at once, so the layer is the natural
+            # batch, and handing over the full layer lets generate_batch
+            # length-sort across all of it rather than within arbitrary
+            # pre-cut groups.
+            return summarize_paper_style_batch(
+                contexts,
                 model=m4.summary_model,
                 max_tokens=m4.summary_max_tokens,
+                batch_size=m4.summary_batch_size,
+                max_padded_tokens=m4.summary_max_padded_tokens,
             )
 
         def _embed(texts: list[str]) -> np.ndarray:
@@ -308,10 +322,9 @@ class RaptorSystem(BaseSystem):
             [c.text for c in self.chunks],
             self.chunk_embeddings,
             params=m4.paper,
-            summarize_fn=_summarize,
+            summarize_batch_fn=_summarize_batch,
             embed_fn=_embed,
             on_summary=_on_summary,
-            max_workers=m4.summary_max_workers,
             verbose=True,
         )
         self._flat = build_collapsed_index(self._tree)

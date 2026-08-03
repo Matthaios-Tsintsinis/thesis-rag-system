@@ -2,8 +2,8 @@
 
 Two tiers. The bulk use an injected `cluster_fn` so the deterministic
 bookkeeping — node ids, multi-parent links, leaf-index closure, stop
-condition, threading invariance, serialisation — is tested without paying
-for UMAP fits. A small number exercise the REAL UMAP+GMM path, since a
+condition, batch-shape invariance of the topology, serialisation — is
+tested without paying for UMAP fits. A small number exercise the REAL UMAP+GMM path, since a
 clustering port whose clustering was never run is not verified.
 """
 
@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 
 from src.raptor import raptor_substrate_extra
-from src.config import RaptorBuildParams
+from src.config import M4Config, RaptorBuildParams
 from src.raptor_paper import (
     PAPER_TREE_SCHEMA_VERSION,
     PaperNode,
@@ -86,7 +86,7 @@ class TestBottomUpConstruction(unittest.TestCase):
             self.texts,
             self.embs,
             params=self.params,
-            summarize_fn=lambda ctx: f"summary of {len(ctx)} chars",
+            summarize_batch_fn=lambda cs: [f"summary of {len(c)} chars" for c in cs],
             embed_fn=_fake_embed,
             cluster_fn=_pairwise_cluster_fn,
             **kw,
@@ -120,7 +120,7 @@ class TestBottomUpConstruction(unittest.TestCase):
         params = PaperTreeParams(reduction_dimension=1, num_layers=2)
         tree = build_paper_tree(
             self.texts, self.embs, params=params,
-            summarize_fn=lambda ctx: "s", embed_fn=_fake_embed,
+            summarize_batch_fn=lambda cs: ["s"] * len(cs), embed_fn=_fake_embed,
             cluster_fn=_pairwise_cluster_fn,
         )
         self.assertLessEqual(max(tree.layer_to_nodes), 2)
@@ -163,7 +163,7 @@ class TestBottomUpConstruction(unittest.TestCase):
         calls = []
         build_paper_tree(
             self.texts, self.embs, params=self.params,
-            summarize_fn=lambda ctx: (calls.append(ctx), "s")[1],
+            summarize_batch_fn=lambda cs: (calls.extend(cs), ["s"] * len(cs))[1],
             embed_fn=_fake_embed, cluster_fn=_pairwise_cluster_fn,
         )
         self.assertGreater(len(calls), 0)
@@ -171,7 +171,7 @@ class TestBottomUpConstruction(unittest.TestCase):
     def test_empty_summary_node_survives_but_stops_clustering(self):
         tree = build_paper_tree(
             self.texts, self.embs, params=self.params,
-            summarize_fn=lambda ctx: "",
+            summarize_batch_fn=lambda cs: [""] * len(cs),
             embed_fn=_fake_embed, cluster_fn=_pairwise_cluster_fn,
         )
         # Layer 1 exists, carries no embeddings, and nothing built above it.
@@ -184,13 +184,13 @@ class TestBottomUpConstruction(unittest.TestCase):
     def test_rejects_bad_inputs(self):
         with self.assertRaises(ValueError):
             build_paper_tree([], np.zeros((0, EMB_DIM)), params=self.params,
-                             summarize_fn=lambda c: "s", embed_fn=_fake_embed)
+                             summarize_batch_fn=lambda cs: ["s"] * len(cs), embed_fn=_fake_embed)
         with self.assertRaises(ValueError):
             build_paper_tree(["a", "b"], _fake_embed(["a"]), params=self.params,
-                             summarize_fn=lambda c: "s", embed_fn=_fake_embed)
+                             summarize_batch_fn=lambda cs: ["s"] * len(cs), embed_fn=_fake_embed)
         with self.assertRaises(ValueError):
             build_paper_tree(["a"], np.zeros(EMB_DIM), params=self.params,
-                             summarize_fn=lambda c: "s", embed_fn=_fake_embed)
+                             summarize_batch_fn=lambda cs: ["s"] * len(cs), embed_fn=_fake_embed)
 
 
 class TestDeterminism(unittest.TestCase):
@@ -203,7 +203,7 @@ class TestDeterminism(unittest.TestCase):
     def _ids_and_texts(self, **kw):
         tree = build_paper_tree(
             self.texts, self.embs, params=self.params,
-            summarize_fn=lambda ctx: f"S:{len(ctx)}",
+            summarize_batch_fn=lambda cs: [f"S:{len(c)}" for c in cs],
             embed_fn=_fake_embed, cluster_fn=_pairwise_cluster_fn, **kw
         )
         return [(nid, tree.nodes[nid].text) for nid in tree.all_node_ids()]
@@ -211,17 +211,66 @@ class TestDeterminism(unittest.TestCase):
     def test_repeat_builds_are_identical(self):
         self.assertEqual(self._ids_and_texts(), self._ids_and_texts())
 
-    def test_threading_does_not_change_the_artifact(self):
-        """max_workers must be a throughput knob, never a semantic one.
+    def test_batch_shape_cannot_move_ids_or_topology(self):
+        """What batching IS allowed to change, and what it is not.
 
-        The reference assigns node indices inside a Lock-guarded dict
-        while summarising on a thread pool, making its ids a function of
-        completion order. Ours are a function of member position.
+        Replaces the old `max_workers` throughput-knob test, whose
+        subject was deleted when the ThreadPoolExecutor went away (it was
+        unsafe against a local model — one lru_cached tokenizer, mutated
+        per call).
+
+        THE PROPERTY, and it is narrower than the old one on purpose:
+        node IDS and TOPOLOGY are a function of member position in the
+        input layer, computed before any summary call is dispatched, so
+        NO batching decision can perturb them. The reference, by
+        contrast, assigns indices inside a Lock-guarded dict while
+        summarising on a thread pool, making its ids a function of
+        completion order.
+
+        WHAT IS DELIBERATELY NOT ASSERTED: that summary TEXT is invariant
+        under batch shape. It may not be — padding and batched-matmul
+        reduction order can flip argmax on near-ties even at temperature
+        0. That is precisely the open question, and the project's answer
+        is to NAME batch_size and max_padded_tokens in M4's substrate key
+        (raptor_paper.paper_substrate_extra) rather than to assume
+        invariance here. Asserting text invariance with a fake
+        summariser would prove nothing about the real one and would read
+        as a guarantee the code does not make.
         """
-        self.assertEqual(
-            self._ids_and_texts(max_workers=1),
-            self._ids_and_texts(max_workers=4),
-        )
+        def ids_and_shape(chunk_size):
+            # A summariser that batches its input differently every time,
+            # while returning position-stable text, isolates SHAPE from
+            # TEXT: any id or topology difference would be caused by the
+            # grouping alone.
+            def summarize(cs):
+                out = []
+                for s in range(0, len(cs), chunk_size):
+                    out.extend(f"S:{len(c)}" for c in cs[s : s + chunk_size])
+                return out
+
+            tree = build_paper_tree(
+                self.texts, self.embs, params=self.params,
+                summarize_batch_fn=summarize, embed_fn=_fake_embed,
+                cluster_fn=_pairwise_cluster_fn,
+            )
+            return (
+                tree.all_node_ids(),
+                {nid: sorted(tree.nodes[nid].children) for nid in tree.nodes},
+                tree.layer_to_nodes,
+            )
+
+        self.assertEqual(ids_and_shape(1), ids_and_shape(4))
+        self.assertEqual(ids_and_shape(1), ids_and_shape(1000))
+
+    def test_misaligned_summary_count_is_refused(self):
+        """A short return would silently attach summaries to the wrong
+        clusters — positional alignment fails quietly, so it must raise."""
+        with self.assertRaises(RuntimeError):
+            build_paper_tree(
+                self.texts, self.embs, params=self.params,
+                summarize_batch_fn=lambda cs: ["s"] * (len(cs) - 1),
+                embed_fn=_fake_embed, cluster_fn=_pairwise_cluster_fn,
+            )
 
 
 class TestGetText(unittest.TestCase):
@@ -245,7 +294,7 @@ class TestCollapsedIndex(unittest.TestCase):
         texts, embs = _leaf_inputs(16)
         self.tree = build_paper_tree(
             texts, embs, params=self.params,
-            summarize_fn=lambda ctx: f"S:{len(ctx)}",
+            summarize_batch_fn=lambda cs: [f"S:{len(c)}" for c in cs],
             embed_fn=_fake_embed, cluster_fn=_pairwise_cluster_fn,
         )
 
@@ -288,7 +337,7 @@ class TestSerialisation(unittest.TestCase):
         texts, embs = _leaf_inputs(16)
         self.tree = build_paper_tree(
             texts, embs, params=self.params,
-            summarize_fn=lambda ctx: f"S:{len(ctx)}",
+            summarize_batch_fn=lambda cs: [f"S:{len(c)}" for c in cs],
             embed_fn=_fake_embed, cluster_fn=_pairwise_cluster_fn,
         )
 
@@ -371,6 +420,37 @@ class TestCacheIdentity(unittest.TestCase):
         self.assertEqual(mine["tree_schema"], PAPER_TREE_SCHEMA_VERSION)
         self.assertIn("chunker_impl", mine)
         self.assertIn("summary_max_tokens", mine)
+
+    def test_batch_shape_is_named_in_the_key(self):
+        """Summaries are CACHED, so batch composition is not free.
+
+        Batch composition can change generated text at temperature 0.
+        Answers are not cached, so their variance is documented noise;
+        summaries ARE the artifact this key names, so the shape that
+        produced them has to be in it. Both knobs, because
+        token_budget_batches takes batch_size as a count cap and so both
+        participate in composition.
+        """
+        mine = self._extra()
+        self.assertIn("summary_batch_size", mine)
+        self.assertIn("summary_max_padded_tokens", mine)
+        self.assertNotEqual(mine, self._extra(summary_batch_size=8))
+        self.assertNotEqual(mine, self._extra(summary_max_padded_tokens=8000))
+
+    def test_extras_defaults_match_m4config(self):
+        """The extras defaults and M4Config must not drift apart.
+
+        m4_raptor passes every value explicitly, but the test helpers and
+        any future caller lean on these defaults; a silent divergence
+        would make a test compute a key production never uses.
+        """
+        m4 = M4Config()
+        mine = self._extra()
+        self.assertEqual(mine["summary_batch_size"], m4.summary_batch_size)
+        self.assertEqual(
+            mine["summary_max_padded_tokens"], m4.summary_max_padded_tokens
+        )
+        self.assertEqual(mine["summary_max_tokens"], m4.summary_max_tokens)
 
     def test_tree_field_is_the_paper_params_not_raptor_build_params(self):
         mine = self._extra()
@@ -458,7 +538,7 @@ class TestRealClustering(unittest.TestCase):
 
         tree = build_paper_tree(
             texts, X, params=params,
-            summarize_fn=lambda ctx: f"summary covering {len(ctx.split())} words",
+            summarize_batch_fn=lambda cs: [f"summary covering {len(c.split())} words" for c in cs],
             embed_fn=lambda ts: _fake_embed_dim(ts, X.shape[1]),
         )
 

@@ -96,6 +96,8 @@ def m4_key(cfg) -> str:
         summary_model=cfg.m4.summary_model,
         summary_prompt_version=cfg.m4.summary_prompt_version,
         summary_max_tokens=cfg.m4.summary_max_tokens,
+        summary_batch_size=cfg.m4.summary_batch_size,
+        summary_max_padded_tokens=cfg.m4.summary_max_padded_tokens,
         rrf_k=cfg.m4.rrf_k,
         include_root=cfg.m4.include_root_in_flat_index,
     )
@@ -159,6 +161,40 @@ class TestM7KeyInvariance(unittest.TestCase):
             "M4 summary token cap",
         )
 
+    def test_m4_summary_batch_shape_does_not_move_m7(self):
+        """The batched-summarisation lever, proven M4-local.
+
+        Batch composition can change generated text at temperature 0 and
+        summaries are cached, so the batch shape had to enter M4's
+        substrate key. The safe lever for that is M4Config fields emitted
+        by raptor_paper.paper_substrate_extra — nothing on M7's
+        derivation reads either. The unsafe alternatives, for the record:
+        a field on RaptorBuildParams or ChunkingConfig, or a bump of the
+        global SUMMARY_PROMPT_VERSION, all of which M7 reads.
+        """
+        self._assert_m7_unmoved(
+            replace(
+                self.base.m4,
+                summary_batch_size=4,
+                summary_max_padded_tokens=8000,
+            ),
+            "M4 summary batch shape",
+        )
+
+    def test_m4_batch_shape_does_move_m4(self):
+        """The other half: it must actually invalidate M4's own cache.
+
+        A key that does not move is not a safe lever, it is a silent
+        one — the original clustering landmine in reverse. If batch shape
+        can change summary text, a warm cache built at a different shape
+        must not be served.
+        """
+        base = m4_key(self.base)
+        moved = m4_key(
+            replace(self.base, m4=replace(self.base.m4, summary_batch_size=4))
+        )
+        self.assertNotEqual(base, moved)
+
     def test_m4_include_root_does_not_move_m7(self):
         self._assert_m7_unmoved(
             replace(self.base.m4, include_root_in_flat_index=False),
@@ -175,6 +211,8 @@ class TestM7KeyInvariance(unittest.TestCase):
                 summary_model="Qwen/Qwen2.5-7B-Instruct",
                 summary_prompt_version="raptor_paper_v9",
                 summary_max_tokens=42,
+                summary_batch_size=3,
+                summary_max_padded_tokens=1234,
             ),
             "every M4 fidelity change at once",
         )

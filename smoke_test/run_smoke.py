@@ -148,9 +148,11 @@ _SMOKE_M4 = M4Config(
         reduction_dimension=3,
         bic_max_clusters=6,
     ),
-    # Sequential: the smoke corpus is tiny and a single-threaded run is
-    # easier to read when a summary call fails.
-    summary_max_workers=1,
+    # One summary per batch: the smoke corpus is tiny, and an unbatched
+    # run is easier to read when a summary call fails. Note this makes
+    # the smoke M4 substrate key differ from a production one — correct,
+    # since batch shape is a key input now that summaries are batched.
+    summary_batch_size=1,
     trace=True,
 )
 
