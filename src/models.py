@@ -230,6 +230,13 @@ def load_generator(
     True default was a latent repeat of b6e35c6. The load is gated by
     `assert_loaded_generator_matches`, which aborts rather than warns.
     """
+    # The one choke point every local path goes through, and the last
+    # moment before CUDA allocates anything. Setting it in runner.main()
+    # only covers subprocess runs; a notebook calling
+    # describe_generator_runtime directly bypassed it, which is why a
+    # probe reported cuda_alloc_conf=None.
+    configure_cuda_allocator()
+
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -506,7 +513,14 @@ def describe_generator_runtime(
         "max_position_embeddings": getattr(
             model.config, "max_position_embeddings", None
         ),
-        "tokenizer_padding_side": tokenizer.padding_side,
+        # The checkpoint's idle default. generate_batch does NOT use
+        # this: it forces left padding for the duration of the call and
+        # restores afterwards, so a probe outside a generation call
+        # legitimately reports "right". Reported alongside the value
+        # actually used, because a bare "right" here reads like the bug
+        # that produces plausible text attached to the wrong question.
+        "tokenizer_padding_side_idle": tokenizer.padding_side,
+        "padding_side_used_for_generation": "left",
         "vram_allocated_gb": (
             round(torch.cuda.memory_allocated() / 1e9, 2)
             if torch.cuda.is_available() else None
