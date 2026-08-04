@@ -83,9 +83,11 @@ never opened and M7's key cannot move by construction.
 
 from __future__ import annotations
 
+import tempfile
 from collections import Counter
 from dataclasses import asdict
 from pathlib import Path
+from typing import Sequence, TYPE_CHECKING
 
 import numpy as np
 
@@ -108,7 +110,7 @@ from ..components import (
 )
 from ..config import DEFAULT_CONFIG, RETRIEVAL_RANKING_DEPTH, HarnessConfig
 from ..models import embed_texts, load_embedder
-from ..parsing import walk_corpus
+from ..parsing import clean_text, walk_corpus
 from ..raptor_paper import (
     PaperCollapsedIndex,
     PaperNode,
@@ -124,12 +126,79 @@ from ..raptor_paper import (
     summarize_paper_style_batch,
     tree_stats,
 )
-from .base import BaseSystem, RetrievedChunk
+from .base import BaseSystem, RetrievedChunk, _safe_item_filename
+
+if TYPE_CHECKING:
+    from ..eval.types import CorpusItem
 
 
 # Own namespace: the artifacts are not interchangeable with the legacy
 # RAPTOR/ substrate that M7 consumes.
 M4_SUBSTRATE_NAMESPACE = "M4_RAPTOR"
+
+# Separator between a parent's member items in the per-parent temp file.
+# Two newlines because `split_text_raptor` treats a newline RUN as a
+# sentence boundary that it then drops, so members never fuse into one
+# chunk mid-sentence, and `parsing.clean_text` collapses only runs of
+# THREE or more — so this survives the read-back unchanged.
+_PARENT_JOIN = "\n\n"
+
+
+def group_items_by_parent(
+    items: Sequence["CorpusItem"],
+) -> dict[str, list["CorpusItem"]]:
+    """Group CorpusItems by parent_id, first-appearance order preserved.
+
+    Order matters twice over: it fixes the temp-dir write order (and so
+    the collision-suffix assignment) and the order of the provenance
+    pairs on a chunk. Both must be a function of the input alone.
+    """
+    groups: dict[str, list["CorpusItem"]] = {}
+    for item in items:
+        groups.setdefault(item.parent_id, []).append(item)
+    return groups
+
+
+def build_parent_payload(
+    members: Sequence["CorpusItem"],
+) -> tuple[str, list[tuple[int, int, str]]]:
+    """Concatenate a multi-item parent, returning its text and member spans.
+
+    Returns (text, [(start_char, end_char, span_id), ...]) with offsets
+    into the returned text.
+
+    THE CLEANING TRAP, measured rather than assumed. `walk_corpus` does
+    not hand the chunker the file bytes — it hands it
+    `parsing.clean_text(bytes)`, which collapses ` \\t` runs and 3+
+    newlines and strips the ends. So chunk offsets live in CLEANED
+    coordinates, and naive raw-text offsets would be silently wrong by a
+    drifting amount. Worse, clean_text does NOT distribute over the
+    join: clean_text("abc  " + sep + "def") is "abc \\n\\ndef" while
+    joining the cleaned parts gives "abc\\n\\ndef".
+
+    So each member is cleaned FIRST and the spans are measured on the
+    joined result, which is then written to disk as-is. That is sound
+    only because clean_text is IDEMPOTENT (verified: collapsing runs
+    cannot create new runs), so reading the file back is a no-op and the
+    chunker sees exactly the string these offsets index. The caller
+    asserts that idempotence rather than trusting it.
+
+    Empty members are skipped: they contribute no text, so no chunk can
+    overlap them and no provenance is owed.
+    """
+    parts: list[str] = []
+    spans: list[tuple[int, int, str]] = []
+    cursor = 0
+    for item in members:
+        text = clean_text(item.text or "")
+        if not text:
+            continue
+        if parts:
+            cursor += len(_PARENT_JOIN)
+        parts.append(text)
+        spans.append((cursor, cursor + len(text), item.span_id))
+        cursor += len(text)
+    return _PARENT_JOIN.join(parts), spans
 
 REQUIRED_FILES = (
     "chunks.jsonl",
@@ -363,6 +432,135 @@ class RaptorSystem(BaseSystem):
         ).save(cdir.manifest_path)
 
         self._indexed = True
+
+    # --- per-parent corpus layout (M4-local) ------------------------------
+
+    def index_items(self, items: Sequence["CorpusItem"]) -> None:
+        """Write ONE file per parent, not per item, and derive provenance
+        from character offsets.
+
+        WHY M4 NEEDS THIS. The paper chunks "the retrieval corpus" into
+        contiguous 100-token pieces; the base `index_items` writes one
+        file per CorpusItem, so a chunk can never span two items and
+        every item boundary becomes a forced chunk boundary. On QASPER
+        that means paragraph-fragmented leaves; on HotpotQA's pooled
+        corpus it means paragraph-fragmented leaves too. Chunking the
+        document the items came from is the paper's behaviour.
+
+        WHY IT IS AN OVERRIDE AND NOT AN EDIT TO BaseSystem. `corpus_hash`
+        is computed over the temp directory this writes, so the layout is
+        a cache-key input for whichever systems use it. Changing the base
+        would move M2's, M3's and M9's substrate keys and discard their
+        warm bge-m3 caches — for no benefit, since none of them is
+        reproducing a paper that specifies contiguous document chunking.
+
+        THE SINGLE-ITEM RULE (rule B), and why it is not a special case
+        bolted on. A parent holding exactly one item is written with the
+        BASE's filename (derived from item_id) and the BASE's raw bytes,
+        so its file is byte-identical to what the base produces and the
+        corpus_hash does not move. Both halves are load-bearing and were
+        measured, not reasoned:
+
+          * the FILENAME matters because corpus_content_hash folds the
+            relative path, not just the bytes. MultiHop happens to have
+            item_id == parent_id so a parent-derived name would collide
+            harmlessly, but NarrativeQA and QuALITY use "{id}::<whole>"
+            against a bare parent id, so a parent-derived name would move
+            their hashes despite being 1:1.
+          * the RAW BYTES matter because clean_text is not the identity.
+            A multi-item parent is written PRE-CLEANED (see
+            build_parent_payload); doing that to a single-item parent
+            would change its bytes whenever its text contains a double
+            space, and move the hash that way instead.
+
+        A single-item parent also needs no offsets: every chunk of that
+        document belongs to that one item, which is exactly what the base
+        stamps. Offsets are only required where a parent holds several
+        items — and in that case the hash moves regardless.
+
+        SIDE EFFECT, recorded: `walk_corpus` drops documents shorter than
+        `min_chars_per_doc`, so concatenating a multi-item parent can
+        rescue items that would individually have been dropped. That is a
+        fidelity improvement (the paper chunks documents, not fragments)
+        rather than a bug, and it cannot affect a 1:1 benchmark.
+        """
+        groups = group_items_by_parent(items)
+        # filename -> (parent_id, spans | None, span_id_if_single)
+        layout: dict[str, tuple[str, list[tuple[int, int, str]] | None, str]] = {}
+
+        with tempfile.TemporaryDirectory(prefix=f"{self.system_id}_corpus_") as td:
+            td_path = Path(td)
+            for parent_id, members in groups.items():
+                if len(members) == 1:
+                    only = members[0]
+                    seed, payload = only.item_id, only.text
+                    spans, single_span = None, only.span_id
+                else:
+                    seed = parent_id
+                    payload, spans = build_parent_payload(members)
+                    single_span = ""
+                    if clean_text(payload) != payload:
+                        # The offsets in `spans` index `payload`, but the
+                        # chunker will see clean_text(payload). They are
+                        # the same string only while clean_text stays
+                        # idempotent; if that ever breaks, provenance
+                        # would drift silently across the document.
+                        raise RuntimeError(
+                            f"parsing.clean_text is no longer idempotent on "
+                            f"parent {parent_id!r}: the per-parent offsets "
+                            "would not match the text the chunker reads."
+                        )
+
+                filename = f"{_safe_item_filename(seed)}.txt"
+                if filename in layout:
+                    n = 1
+                    while f"{_safe_item_filename(seed)}_{n}.txt" in layout:
+                        n += 1
+                    filename = f"{_safe_item_filename(seed)}_{n}.txt"
+                (td_path / filename).write_text(payload, encoding="utf-8")
+                layout[filename] = (parent_id, spans, single_span)
+
+            self.index(td_path)
+
+        # walk_corpus sets ParsedDocument.doc_id to the path relative to
+        # the corpus root, which for this flat temp dir is the filename.
+        n_unmapped = 0
+        for chunk in self.chunks:
+            entry = layout.get(chunk.doc_id)
+            if entry is None:
+                continue  # defensive; should not happen
+            parent_id, spans, single_span = entry
+            if spans is None:
+                chunk.gold_provenance = ((parent_id, single_span),)
+                continue
+            lo = chunk.metadata.get("start_char")
+            hi = chunk.metadata.get("end_char")
+            if lo is None or hi is None:
+                raise RuntimeError(
+                    f"{self.system_id}: chunk {chunk.chunk_id!r} carries no "
+                    "start_char/end_char, so per-parent provenance cannot be "
+                    "derived. The raptor_100tok chunker supplies them; a "
+                    "chunker override that does not cannot be used with a "
+                    "multi-item parent."
+                )
+            # Half-open overlap. A chunk crossing an item boundary
+            # legitimately carries BOTH atoms — that is the whole point
+            # of contiguous chunking, and CK-2 scores it correctly.
+            hits = tuple(
+                (parent_id, span_id)
+                for start, end, span_id in spans
+                if start < hi and lo < end
+            )
+            if not hits:
+                n_unmapped += 1
+            chunk.gold_provenance = hits
+
+        if n_unmapped:
+            print(
+                f"[{self.system_id}] WARNING: {n_unmapped} chunks intersected "
+                "no source item and carry empty gold_provenance"
+            )
+        self._index_stats["n_chunks_without_gold_provenance"] = n_unmapped
 
     def _summariser_runtime(self) -> dict:
         from ..models import generator_identity
