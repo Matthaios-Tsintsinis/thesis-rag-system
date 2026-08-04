@@ -345,6 +345,30 @@ class M4Config:
     # None restores plain top_k_final selection.
     retrieval_budget_tokens: int | None = 2000
 
+    # --- DIAGNOSTIC TWIN: leaf-expanded retrieval (default OFF) ---
+    # Retrieved SUMMARY nodes carry an empty gold_provenance, so CK-2
+    # cannot credit them — a summary is abstractive text with no gold
+    # span. That is honest, and it has a consequence that must be
+    # reported rather than hidden: 18.5-57% of M4's retrieved units
+    # (paper App. I) are unscoreable BY CONSTRUCTION, so M4's retrieval
+    # F1 is not directly comparable to a system returning only leaves.
+    #
+    # Turning this on replaces each retrieved summary with its top-N
+    # descendant LEAVES (ranked against the query), which are scoreable,
+    # producing a diagnostic twin that quantifies exactly that gap.
+    #
+    # NEVER A REPORTED M4 NUMBER. Expansion is applied POST-SELECTION, so
+    # the retrieval decision is identical to real M4 — but the evidence
+    # text changes, so answers change too. A run with this on is a
+    # different system and its JSONL says so (every row carries
+    # metadata m4_summary_expansion=true).
+    #
+    # Query-time only: deliberately NOT in raptor_paper.
+    # paper_substrate_extra, so toggling it never moves the substrate key
+    # and the diagnostic twin reuses the same tree.
+    expand_summary_nodes: bool = False
+    summary_expansion_leaves: int = 3
+
     # --- component overrides (per-paper assignment) ---
     # Per-paper rule (professor-approved): each system uses the
     # components its own paper specifies. The RAPTOR paper uses

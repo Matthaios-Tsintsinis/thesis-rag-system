@@ -714,20 +714,118 @@ class RaptorSystem(BaseSystem):
             if budget is None and len(out) >= k:
                 break
 
+        if m4.expand_summary_nodes:
+            out = self._expand_summary_nodes(out, q_vec, m4.summary_expansion_leaves)
+
         self._last_trace = {
             "collapsed_top_node_types": dict(type_counter),
+            "summary_expansion": bool(m4.expand_summary_nodes),
             "paths_exercised": sorted(paths_exercised),
             "n_returned": len(out),
             "budget_tokens_used": budget_tokens if budget is not None else None,
             "budget_tokens_limit": budget,
             # The App. I fidelity gate, per query. Retrieval-only: it
             # needs no generation, so it is measurable in the cheap stage.
+            # Counted PRE-EXPANSION on purpose — the gate is a property
+            # of the paper's retrieval, not of the diagnostic twin's
+            # representation of it.
             "non_leaf_share": (
                 sum(v for kk, v in type_counter.items() if kk != "chunk")
                 / max(1, sum(type_counter.values()))
             ),
         }
         return out
+
+    def _expand_summary_nodes(
+        self,
+        retrieved: list[RetrievedChunk],
+        q_vec: np.ndarray,
+        n_leaves: int,
+    ) -> list[RetrievedChunk]:
+        """Replace each retrieved summary with its top-N descendant leaves.
+
+        THE DIAGNOSTIC, and what it is for. A summary node has no gold
+        span, so CK-2 scores it as nothing — which means M4's retrieval
+        F1 is measured on a set where a large minority of units cannot
+        contribute, and is therefore NOT comparable to a leaf-only
+        system's. This produces the twin that quantifies the gap: every
+        returned unit becomes a leaf carrying real `gold_provenance`, so
+        the same queries against the same tree yield a directly
+        comparable number.
+
+        POST-SELECTION BY DESIGN. Which nodes are retrieved — including
+        the paper's 2,000-token budget fill — is decided before this runs
+        and is untouched, so the twin measures the coverage of the
+        PAPER'S retrieval rather than of a different retriever. Only the
+        representation of the selected set changes.
+
+        `source_unit_type` deliberately keeps the ORIGINATING summary
+        tier rather than becoming "chunk": the unit was surfaced by a
+        summary and the App. I gate must still see that, even though the
+        text now carried is a leaf's.
+
+        Score is inherited from the parent summary, not recomputed from
+        the leaf. The selection score is the quantity that ordered the
+        result set, and substituting a different similarity would break
+        the descending-score invariant that rank-aware metrics assume.
+        Leaf ORDER within a summary is by query cosine, so the most
+        relevant descendants come first.
+        """
+        assert self._tree is not None
+        if self.chunk_embeddings is None:
+            return retrieved
+
+        out: list[RetrievedChunk] = []
+        seen: set[str] = set()
+
+        def _emit(chunk: Chunk, score: float, unit_type: str) -> None:
+            if chunk.chunk_id in seen:
+                # A leaf can be reached directly AND through a summary,
+                # or through two summaries. Keeping the first (best-rank)
+                # copy stops duplicates from deflating precision.
+                return
+            seen.add(chunk.chunk_id)
+            out.append(RetrievedChunk(
+                chunk=chunk, score=score, rank=len(out),
+                source_unit_type=unit_type,
+            ))
+
+        for item in retrieved:
+            if item.source_unit_type == "chunk":
+                _emit(item.chunk, item.score, "chunk")
+                continue
+            node = self._tree.nodes[item.chunk.chunk_id]
+            idxs = [i for i in node.leaf_indices if 0 <= i < len(self.chunks)]
+            if not idxs:
+                continue
+            sims = self.chunk_embeddings[idxs] @ q_vec[0]
+            best = sorted(range(len(idxs)), key=lambda p: -float(sims[p]))
+            for pos in best[:n_leaves]:
+                _emit(self.chunks[idxs[pos]], item.score, item.source_unit_type)
+
+        return out
+
+    def prepare(self, query: str, k: int | None = None):
+        """Attach M4's per-query diagnostics to the eval row.
+
+        The runner merges `AnswerResult.extra` into `ScoredQuery.metadata`
+        under the `m4_*` namespace convention, which is the only way the
+        App. I non-leaf-share gate and the diagnostic-mode flag reach the
+        JSONL — `retrieve()`'s trace is otherwise discarded per query.
+
+        `m4_summary_expansion` is the important one: it makes a
+        leaf-expanded diagnostic run impossible to mistake for a real M4
+        cell after the fact, at the row level rather than the filename
+        level.
+        """
+        prepared = super().prepare(query, k=k)
+        trace = self._last_trace
+        prepared.extra.update({
+            "m4_non_leaf_share": trace.get("non_leaf_share"),
+            "m4_budget_tokens_used": trace.get("budget_tokens_used"),
+            "m4_summary_expansion": bool(trace.get("summary_expansion")),
+        })
+        return prepared
 
     # answer() inherits the BaseSystem default: retrieved node TEXT —
     # summaries verbatim included — is concatenated into the evidence

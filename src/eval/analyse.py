@@ -34,6 +34,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
 
+from ..raptor_paper import PAPER_NON_LEAF_SHARE_BAND
 from .scorers import is_abstention
 
 
@@ -69,6 +70,42 @@ def _safe_stats(xs: list[float]) -> dict[str, float | int]:
         "std": statistics.pstdev(xs) if len(xs) > 1 else 0.0,
         "min": min(xs),
         "max": max(xs),
+    }
+
+
+def _non_leaf_summary(bucket: dict) -> dict[str, Any]:
+    """Non-leaf share of retrieved units — the RAPTOR App. I gate.
+
+    MICRO is the primary figure: total non-leaf units over total units,
+    which is what the paper's "18.5% to 57% of retrieved nodes" means.
+    It is computed from `retrieved_unit_types`, a field every eval row
+    has carried since CK-4 — so this gate reads correctly on JSONLs
+    banked long before the M4 diagnostics existed.
+
+    MACRO (the mean of per-query shares) comes from the newer
+    `m4_non_leaf_share` metadata and is reported alongside because the
+    two diverge when queries return different numbers of units; neither
+    is wrong, but only one is the paper's.
+
+    `in_band` is None rather than False for a system that retrieves no
+    summary units at all — a flat retriever is not failing a RAPTOR
+    gate, it is outside its scope, and printing FAIL against M2 would be
+    a category error.
+    """
+    counts = bucket["retrieved_unit_types_agg"]
+    total = sum(counts.values())
+    non_leaf = sum(v for k, v in counts.items() if k != "chunk")
+    micro = (non_leaf / total) if total else None
+    per_query = bucket["m4_non_leaf_share"]
+    lo, hi = PAPER_NON_LEAF_SHARE_BAND
+    return {
+        "micro": micro,
+        "macro": statistics.mean(per_query) if per_query else None,
+        "n_units": total,
+        "n_non_leaf": non_leaf,
+        "in_band": (lo <= micro <= hi) if (micro is not None and non_leaf) else None,
+        "band": [lo, hi],
+        "expansion_rows": bucket["m4_expansion_rows"],
     }
 
 
@@ -114,6 +151,14 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
             "mc_extraction_counts": defaultdict(int),
             "mc_abstained": 0,
             "mc_unparseable": 0,
+            # M4 RAPTOR diagnostics (metadata m4_* keys). The App. I
+            # non-leaf-share gate is derivable from retrieved_unit_types
+            # alone, which every row has always carried — so the gate
+            # also works on JSONLs banked BEFORE these keys existed. The
+            # per-query list is the finer-grained version, present only
+            # on newer rows.
+            "m4_non_leaf_share": [],
+            "m4_expansion_rows": 0,
         }
     )
 
@@ -198,6 +243,13 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
             bucket["m9_strips_kept"] += int(md.get("m9_n_strips_kept") or 0)
             bucket["m9_strips_total"] += int(md.get("m9_n_strips_total") or 0)
 
+        # M4 RAPTOR diagnostics (present only on M4 rows from commit 5 on).
+        m4_share = md.get("m4_non_leaf_share")
+        if m4_share is not None:
+            bucket["m4_non_leaf_share"].append(float(m4_share))
+        if md.get("m4_summary_expansion"):
+            bucket["m4_expansion_rows"] += 1
+
         qtype = r.get("question_type", "?")
         bucket["by_type_n"][qtype] += 1
         bucket["by_type_chunk_counts"][qtype].append(int(r.get("n_retrieved", 0)))
@@ -217,6 +269,7 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
             "input_tokens": _safe_stats(b["input_tokens"]),
             "retrieved_unit_types": dict(b["retrieved_unit_types_agg"]),
             "packed_unit_types": dict(b["packed_unit_types_agg"]),
+            "non_leaf": _non_leaf_summary(b),
             "retr_f1_mean": (statistics.mean(b["retr_f1"]) if b["retr_f1"] else None),
             "retr_recall_mean": (
                 statistics.mean(b["retr_recall"]) if b["retr_recall"] else None
@@ -457,6 +510,40 @@ def _print_text(rollup: dict[str, Any], *, by_type: bool) -> None:
         if ut:
             parts = ", ".join(f"{k}={v}" for k, v in sorted(ut.items()))
             print(f"  {sid}: {parts}")
+
+    # RAPTOR App. I gate: the non-leaf share of RETRIEVED nodes. Printed
+    # only for systems that actually return summary units — a flat
+    # retriever is outside the gate's scope, not failing it.
+    lo, hi = PAPER_NON_LEAF_SHARE_BAND
+    gated = [
+        (sid, rollup["systems"][sid]["non_leaf"])
+        for sid in rollup["systems"]
+        if (rollup["systems"][sid].get("non_leaf") or {}).get("n_non_leaf")
+    ]
+    if gated:
+        print(
+            f"\n  --- RAPTOR non-leaf share (paper App. I band "
+            f"{lo:.1%}-{hi:.1%}) ---"
+        )
+        for sid, nl in gated:
+            verdict = "IN BAND" if nl["in_band"] else "OUT OF BAND"
+            macro = (
+                f"  macro={nl['macro']:.1%}" if nl["macro"] is not None else ""
+            )
+            print(
+                f"  {sid}: micro={nl['micro']:.1%} "
+                f"({nl['n_non_leaf']}/{nl['n_units']} units){macro}  {verdict}"
+            )
+            if nl["expansion_rows"]:
+                # Loud, because a leaf-expanded run is NOT a reportable
+                # M4 cell: its evidence text is leaves, so its answers
+                # are a different system's.
+                print(
+                    f"  {sid}: *** DIAGNOSTIC TWIN - {nl['expansion_rows']} "
+                    "rows ran with summary expansion ON. Retrieval is "
+                    "comparable to a leaf-only system; ANSWERS are not a "
+                    "reportable M4 number. ***"
+                )
 
     if not by_type:
         return

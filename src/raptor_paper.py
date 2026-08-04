@@ -393,6 +393,14 @@ def split_text_raptor(
 
 PAPER_TREE_SCHEMA_VERSION = "raptor_paper_bottom_up_v1"
 
+# Paper App. I: across its benchmarks, between 18.5% and 57% of the nodes
+# RAPTOR retrieves are non-leaf (summary) nodes. This is the one fidelity
+# gate that is measurable only at QUERY time — the other two (children per
+# parent, mean summary length) are properties of the built tree and live in
+# `tree_stats`. Kept here so all three paper-derived bands sit together and
+# the analyser imports rather than restates them.
+PAPER_NON_LEAF_SHARE_BAND = (0.185, 0.57)
+
 # Reference cluster_utils.py module constant: RANDOM_SEED = 224.
 REFERENCE_RANDOM_SEED = 224
 
@@ -1313,6 +1321,7 @@ __all__ = [
     "REFERENCE_RANDOM_SEED",
     "RAPTOR_CHUNKER_VERSION",
     "PAPER_TREE_SCHEMA_VERSION",
+    "PAPER_NON_LEAF_SHARE_BAND",
     "TextSpan",
     "PaperNode",
     "PaperTree",
