@@ -609,6 +609,16 @@ class RaptorSystem(BaseSystem):
             "no_progress_trips": int(
                 self._tree.stats.get("no_progress_trips", 0)
             ),
+            # Guard (v). Non-zero means the BIC search ran over a REDUCED
+            # candidate set because some k could not be fitted — the tree
+            # is still valid, but the clustering was chosen from fewer
+            # options than the reference nominally considers. Report it.
+            "bic_fit_failures": int(
+                self._tree.stats.get("bic_fit_failures", 0)
+            ),
+            "gmm_final_fit_failures": int(
+                self._tree.stats.get("gmm_final_fit_failures", 0)
+            ),
         })
         return stats
 

@@ -384,6 +384,21 @@ def split_text_raptor(
 #      every node at that layer vanishes from the tree). Both guards are
 #      counted in `stats`.
 #
+#  (v) GMM FITS THAT RAISE ARE SKIPPED, not fatal. MEASURED at production
+#      params, and the reason this guard exists at all: a layer of 16 or
+#      of 25 nodes killed the build with "ill-defined empirical
+#      covariance", while 20, 30 and 40 survived. The sweep tries k up to
+#      n-1, and UMAP reducing few points into 10 components leaves tight
+#      local clumps that a high-k component collapses onto. NOT monotone
+#      in n and data-dependent, so passing at one corpus size proves
+#      nothing about another — which is why this shipped before any tree
+#      build rather than after one died. The reference crashes here and
+#      loses the entire tree, so this is impossibility class.
+#      `bic_fit_failures` counts skipped k in the sweep;
+#      `gmm_final_fit_failures` counts downward steps in the final fit.
+#      Non-zero is a FINDING to report, not noise: it means the BIC
+#      search was run over a reduced candidate set.
+#
 # The reference's SEED INCONSISTENCY is reproduced exactly, not fixed:
 # `random_state=224` for the BIC search, `random_state=0` for the final
 # fit. Noted as an observed oddity of the reference; the paper is silent,
@@ -562,14 +577,39 @@ def _get_optimal_clusters(
         # normally prevent.
         stats["empty_bic_range_trips"] = stats.get("empty_bic_range_trips", 0) + 1
         return 1
+    # GUARD (v): a component that collapses onto a single point has an
+    # ill-defined covariance and `fit` RAISES. Measured, not anticipated:
+    # at production params a layer of 16 or 25 nodes died this way, while
+    # 20/30/40 survived — the sweep runs k up to n-1, and UMAP's
+    # reduction of few points into 10 components leaves tight local
+    # clumps for the high-k fits to collapse onto. The reference has the
+    # same hole and simply crashes, losing the whole build.
+    #
+    # Impossibility class, so a guard is admissible; SKIPPING the failing
+    # k is the most conservative shape available. It leaves every k that
+    # CAN be fitted in contention, so the selected k is exactly the one
+    # the reference would have chosen had it not crashed — unless the
+    # reference's own argmin was a k that cannot be fitted, in which case
+    # there is no faithful answer to reproduce.
     bics: list[float] = []
+    fitted: list[int] = []
     for n in candidates:
         gm = GaussianMixture(
             n_components=int(n), random_state=params.bic_random_state
         )
-        gm.fit(embeddings)
+        try:
+            gm.fit(embeddings)
+        except ValueError:
+            stats["bic_fit_failures"] = stats.get("bic_fit_failures", 0) + 1
+            continue
         bics.append(float(gm.bic(embeddings)))
-    return int(candidates[int(np.argmin(bics))])
+        fitted.append(int(n))
+    if not fitted:
+        # Every k failed. One cluster is the only assignment left that is
+        # certainly well-defined.
+        stats["bic_all_fits_failed"] = stats.get("bic_all_fits_failed", 0) + 1
+        return 1
+    return fitted[int(np.argmin(bics))]
 
 
 def _gmm_cluster(
@@ -580,17 +620,37 @@ def _gmm_cluster(
     Reference seeds the final fit with random_state=0 while the BIC
     search above uses 224. The inconsistency is the reference's and is
     reproduced deliberately (ruling 3).
+
+    GUARD (v), second half. The seed mismatch means the final fit can
+    raise at a k the BIC sweep fitted happily under seed 224 — different
+    initialisation, different collapse. Walking k DOWNWARD keeps as much
+    structure as can actually be fitted, where falling straight to k=1
+    would silently turn a splittable layer into one parent. Terminates:
+    k=1 is a single component over every point and cannot be a singleton
+    collapse.
     """
     from sklearn.mixture import GaussianMixture
 
     n_clusters = _get_optimal_clusters(embeddings, params, stats)
-    gm = GaussianMixture(
-        n_components=n_clusters, random_state=params.gmm_random_state
-    )
-    gm.fit(embeddings)
-    probs = gm.predict_proba(embeddings)
-    labels = [np.where(p > params.gmm_threshold)[0] for p in probs]
-    return labels, n_clusters
+    for k in range(n_clusters, 0, -1):
+        gm = GaussianMixture(
+            n_components=k, random_state=params.gmm_random_state
+        )
+        try:
+            gm.fit(embeddings)
+        except ValueError:
+            stats["gmm_final_fit_failures"] = (
+                stats.get("gmm_final_fit_failures", 0) + 1
+            )
+            continue
+        probs = gm.predict_proba(embeddings)
+        labels = [np.where(p > params.gmm_threshold)[0] for p in probs]
+        return labels, k
+
+    # Unreachable in practice (k=1 always fits); the explicit fallback
+    # exists so a future sklearn cannot turn this into an UnboundLocal.
+    stats["gmm_all_fits_failed"] = stats.get("gmm_all_fits_failed", 0) + 1
+    return [np.array([0]) for _ in range(len(embeddings))], 1
 
 
 def _two_stage_labels(
