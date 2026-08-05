@@ -280,6 +280,77 @@ class TestNonLeafGateReporting(unittest.TestCase):
         self.assertEqual(tuple(nl["band"]), PAPER_NON_LEAF_SHARE_BAND)
 
 
+class TestDegenerateNoTreeIsLoud(unittest.TestCase):
+    """A corpus below the layer stop condition yields NO tree.
+
+    Measured boundary: <= 11 leaves breaks the layer loop on the first
+    iteration, so M4 becomes flat dense retrieval over the leaves. It
+    still retrieves, still answers, and still produces a plausible row.
+    HotpotQA's standard distractor setting gives ~10 paragraphs per
+    question, so this is about to happen thousands of times.
+    """
+
+    @staticmethod
+    def _tiny_tree(n_leaves: int):
+        from src.raptor_paper import build_paper_tree
+
+        texts = [f"leaf {i} text here." for i in range(n_leaves)]
+        embs = np.eye(n_leaves, EMB_DIM, dtype=np.float32)
+        return build_paper_tree(
+            texts, embs, params=PaperTreeParams(),
+            summarize_batch_fn=lambda cs: ["s"] * len(cs),
+            embed_fn=lambda ts: np.eye(len(ts), EMB_DIM, dtype=np.float32),
+        )
+
+    def test_flag_is_set_below_the_boundary(self):
+        tree = self._tiny_tree(8)
+        self.assertTrue(tree.stats["degenerate_no_tree"])
+        self.assertEqual(tree.n_layers, 1)
+        self.assertEqual(tree.summary_nodes(), [])
+
+    def test_flag_is_clear_above_the_boundary(self):
+        """Inert on a healthy build, or the flag stops meaning anything."""
+        tree = self._tiny_tree(40)
+        self.assertFalse(tree.stats["degenerate_no_tree"])
+        self.assertTrue(tree.summary_nodes())
+
+    def test_analyse_shouts_when_every_corpus_was_flat(self):
+        """The variant-A shape. A fully flat M4 retrieves ZERO summary
+        units, so it never reaches the App. I gate block — the warning
+        has to survive independently of it."""
+        rows = [
+            {
+                "system_id": "M4", "n_retrieved": 10,
+                "retrieved_unit_types": {"chunk": 10},
+                "retrieval": {"skipped": False, "f1": 0.4},
+                "answer": {"value": 0.3}, "predicted_answer": "x",
+                "question_type": "t",
+                "metadata": {"m4_tree_degenerate": True},
+            }
+            for _ in range(5)
+        ]
+        nl = _aggregate(rows)["systems"]["M4"]["non_leaf"]
+        self.assertEqual(nl["degenerate_rows"], 5)
+        self.assertIsNone(nl["in_band"], "no gate applies to a flat index")
+
+    def test_bic_failure_rows_are_counted(self):
+        """Guard (v) trips get hammered by thousands of tiny builds in
+        variant A; the rate has to be visible."""
+        rows = [
+            {
+                "system_id": "M4", "n_retrieved": 10,
+                "retrieved_unit_types": {"chunk": 8, "summary_low": 2},
+                "retrieval": {"skipped": False, "f1": 0.4},
+                "answer": {"value": 0.3}, "predicted_answer": "x",
+                "question_type": "t",
+                "metadata": {"m4_bic_fit_failures": 3 if i % 2 else 0},
+            }
+            for i in range(6)
+        ]
+        nl = _aggregate(rows)["systems"]["M4"]["non_leaf"]
+        self.assertEqual(nl["bic_failure_rows"], 3)
+
+
 class TestExpansionIsNotInTheCacheKey(unittest.TestCase):
     def test_toggling_expansion_does_not_move_the_substrate_key(self):
         """Query-time only: the twin must reuse the same tree, or running

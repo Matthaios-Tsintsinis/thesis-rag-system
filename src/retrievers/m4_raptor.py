@@ -343,6 +343,7 @@ class RaptorSystem(BaseSystem):
                 cdir.path / "collapsed_meta.json",
             )
             self._index_stats = self._collect_index_stats()
+            self._warn_if_degenerate()
             self._indexed = True
             return
 
@@ -412,6 +413,7 @@ class RaptorSystem(BaseSystem):
         )
 
         self._index_stats = self._collect_index_stats()
+        self._warn_if_degenerate()
         Manifest(
             system_id=M4_SUBSTRATE_NAMESPACE,
             cache_key=cdir.cache_key,
@@ -562,6 +564,24 @@ class RaptorSystem(BaseSystem):
             )
         self._index_stats["n_chunks_without_gold_provenance"] = n_unmapped
 
+    def _warn_if_degenerate(self) -> None:
+        """Announce a flat index on EVERY path, cache hits included.
+
+        `build_paper_tree` prints this when it builds one, but a cached
+        degenerate tree is loaded rather than built, and a warning that
+        only fires on the cold path is the same as no warning by the
+        second run.
+        """
+        if not self._index_stats.get("degenerate_no_tree"):
+            return
+        print(
+            f"[{self.system_id}] *** FLAT INDEX: "
+            f"{self._index_stats.get('n_leaves', 0)} leaves produced no "
+            "summary layer. M4 is running as flat dense retrieval on this "
+            "corpus (effectively M2 with mpnet). Its rows here are NOT a "
+            "RAPTOR result and must not be reported as one. ***"
+        )
+
     def _summariser_runtime(self) -> dict:
         from ..models import generator_identity
 
@@ -618,6 +638,14 @@ class RaptorSystem(BaseSystem):
             ),
             "gmm_final_fit_failures": int(
                 self._tree.stats.get("gmm_final_fit_failures", 0)
+            ),
+            # Structural, not a fault: a corpus at or below the layer
+            # stop condition yields layer 0 only, so M4 is flat dense
+            # retrieval on it. Carried per build AND per query (see
+            # prepare()) so it cannot vanish between the index log and
+            # the results table.
+            "degenerate_no_tree": bool(
+                self._tree.stats.get("degenerate_no_tree", False)
             ),
         })
         return stats
@@ -834,6 +862,16 @@ class RaptorSystem(BaseSystem):
             "m4_non_leaf_share": trace.get("non_leaf_share"),
             "m4_budget_tokens_used": trace.get("budget_tokens_used"),
             "m4_summary_expansion": bool(trace.get("summary_expansion")),
+            # Per-QUERY, not just per-build. With thousands of tiny
+            # corpora (HotpotQA standard distractor) the index logs
+            # scroll past and only the results table survives, so the
+            # flat-index fact has to be IN the results table.
+            "m4_tree_degenerate": bool(
+                self._index_stats.get("degenerate_no_tree", False)
+            ),
+            "m4_bic_fit_failures": int(
+                self._index_stats.get("bic_fit_failures", 0)
+            ),
         })
         return prepared
 

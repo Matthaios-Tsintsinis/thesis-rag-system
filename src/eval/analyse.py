@@ -105,7 +105,12 @@ def _non_leaf_summary(bucket: dict) -> dict[str, Any]:
         "n_non_leaf": non_leaf,
         "in_band": (lo <= micro <= hi) if (micro is not None and non_leaf) else None,
         "band": [lo, hi],
-        "expansion_rows": bucket["m4_expansion_rows"],
+        # .get() rather than [] so a partial bucket (a caller checking one
+        # field, or a rollup built under an older aggregate shape) reads
+        # as "no trips" instead of raising.
+        "expansion_rows": bucket.get("m4_expansion_rows", 0),
+        "degenerate_rows": bucket.get("m4_degenerate_rows", 0),
+        "bic_failure_rows": bucket.get("m4_bic_failure_rows", 0),
     }
 
 
@@ -159,6 +164,12 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
             # on newer rows.
             "m4_non_leaf_share": [],
             "m4_expansion_rows": 0,
+            # Flat-index rows: the corpus fell at or below the layer stop
+            # condition, so M4 ran as flat dense retrieval. Counted per
+            # QUERY because with thousands of tiny corpora the index logs
+            # scroll past and only this table survives.
+            "m4_degenerate_rows": 0,
+            "m4_bic_failure_rows": 0,
         }
     )
 
@@ -249,6 +260,10 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
             bucket["m4_non_leaf_share"].append(float(m4_share))
         if md.get("m4_summary_expansion"):
             bucket["m4_expansion_rows"] += 1
+        if md.get("m4_tree_degenerate"):
+            bucket["m4_degenerate_rows"] += 1
+        if int(md.get("m4_bic_fit_failures") or 0) > 0:
+            bucket["m4_bic_failure_rows"] += 1
 
         qtype = r.get("question_type", "?")
         bucket["by_type_n"][qtype] += 1
@@ -520,6 +535,24 @@ def _print_text(rollup: dict[str, Any], *, by_type: bool) -> None:
         for sid in rollup["systems"]
         if (rollup["systems"][sid].get("non_leaf") or {}).get("n_non_leaf")
     ]
+    degenerate_only = [
+        (sid, rollup["systems"][sid]["non_leaf"])
+        for sid in rollup["systems"]
+        if (rollup["systems"][sid].get("non_leaf") or {}).get("degenerate_rows")
+        and not (rollup["systems"][sid].get("non_leaf") or {}).get("n_non_leaf")
+    ]
+    for sid, nl in degenerate_only:
+        # Reached when EVERY corpus was flat: no summary units anywhere,
+        # so the gate block below skips the system entirely and the
+        # warning would have been lost with it.
+        print("")
+        print(
+            f"  {sid}: *** NOT A RAPTOR RESULT on {nl['degenerate_rows']} "
+            "rows - no tree was built on any corpus (all at or below the "
+            "layer stop condition). M4 ran as flat dense retrieval "
+            "throughout. ***"
+        )
+
     if gated:
         print(
             f"\n  --- RAPTOR non-leaf share (paper App. I band "
@@ -534,6 +567,23 @@ def _print_text(rollup: dict[str, Any], *, by_type: bool) -> None:
                 f"  {sid}: micro={nl['micro']:.1%} "
                 f"({nl['n_non_leaf']}/{nl['n_units']} units){macro}  {verdict}"
             )
+            if nl["degenerate_rows"]:
+                # The loudest thing in this report, deliberately. A flat
+                # M4 still retrieves, still answers, and still produces a
+                # plausible row -- it just is not RAPTOR. Silent
+                # degeneration in a results table is exactly the failure
+                # this exists to prevent.
+                print(
+                    f"  {sid}: *** NOT A RAPTOR RESULT on "
+                    f"{nl['degenerate_rows']} rows - the corpus was at or "
+                    "below the layer stop condition, so there was no tree "
+                    "and M4 ran as flat dense retrieval. ***"
+                )
+            if nl["bic_failure_rows"]:
+                print(
+                    f"  {sid}: {nl['bic_failure_rows']} rows came from a tree "
+                    "whose BIC search skipped an unfittable k (guard v)"
+                )
             if nl["expansion_rows"]:
                 # Loud, because a leaf-expanded run is NOT a reportable
                 # M4 cell: its evidence text is leaves, so its answers

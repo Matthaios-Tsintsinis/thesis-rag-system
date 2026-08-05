@@ -1105,6 +1105,28 @@ def build_paper_tree(
         stats=stats,
     )
     tree.stats.update(tree_stats(tree))
+
+    # DEGENERATE BUILD — no summary layer was ever produced, so this is
+    # not a RAPTOR tree, it is a flat list of chunks. The stop condition
+    # (`len(current) <= reduction_dimension + 1`) fires on the FIRST
+    # iteration for any corpus of <= 11 leaves, and the reference exits
+    # just as quietly.
+    #
+    # This must be loud. A silently flat M4 still retrieves, still
+    # answers, and still produces a plausible row in a results table --
+    # it just is not the system the row claims. It is a structural
+    # property of small corpora (HotpotQA's standard distractor setting
+    # gives ~10 paragraphs per question, i.e. ~8-12 leaves) rather than a
+    # bug, which is exactly why nothing else would ever flag it.
+    tree.stats["degenerate_no_tree"] = not tree.summary_nodes()
+    if tree.stats["degenerate_no_tree"]:
+        print(
+            f"[raptor_paper] *** NO TREE BUILT: {len(chunk_texts)} leaves is "
+            f"at or below the stop condition "
+            f"({params.reduction_dimension + 1}), so this index has layer 0 "
+            "ONLY. M4 degenerates to flat dense retrieval here and its "
+            "numbers are NOT a RAPTOR result. ***"
+        )
     return tree
 
 
