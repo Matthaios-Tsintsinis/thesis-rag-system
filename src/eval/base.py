@@ -84,6 +84,7 @@ class BenchmarkRunner:
         batch_size: int | None = None,
         resume: bool = False,
         max_padded_tokens: int | None = None,
+        verify_max_new_tokens: int | None = None,
     ) -> None:
         self.output_path = output_path
         self.verbose = verbose
@@ -110,6 +111,37 @@ class BenchmarkRunner:
         # answering wastes ~90% of throughput and generation is ~90% of
         # the cost.
         self.batch_size = batch_size
+        # When a generation cap is being asserted, CHECK IT. A probe that
+        # silently did not apply its cap produced a wrong number rather
+        # than an error once already; the caller should not have to be the
+        # one who notices. None disables the check entirely.
+        self.verify_max_new_tokens = verify_max_new_tokens
+        self._verify_tok = None
+
+    def _check_output_length(self, answer: str, query_id: str, model: str) -> None:
+        """Abort if a generated answer overran the cap that was requested.
+
+        The cap is re-measured from the DECODED text, so allow one token
+        of slack: decode -> strip -> re-encode is not an exact inverse of
+        generation (a leading space can vanish, a multi-byte glyph can
+        re-split). That slack is irrelevant to the failure this catches,
+        which is a cap of 1 producing a 100-token answer.
+        """
+        if self.verify_max_new_tokens is None:
+            return
+        if self._verify_tok is None:
+            from ..models import load_generator
+
+            self._verify_tok = load_generator(model)[0]
+        n = len(self._verify_tok(answer, add_special_tokens=False)["input_ids"])
+        if n > self.verify_max_new_tokens + 1:
+            raise RuntimeError(
+                f"generation cap NOT APPLIED: query {query_id!r} returned "
+                f"~{n} tokens against max_new_tokens="
+                f"{self.verify_max_new_tokens}. The run is measuring "
+                f"something other than what it claims. Answer began: "
+                f"{answer[:80]!r}"
+            )
 
     def _existing_query_ids(self) -> set[str]:
         """query_ids already banked in the output file, for --resume.
@@ -314,6 +346,9 @@ class BenchmarkRunner:
                     # cares about (MultiHop adds Hit@K / MAP@K / MRR).
                     # Independent of CK-4 packing — reads ar.retrieved
                     # (full ranking).
+                    self._check_output_length(
+                        ar.answer, q.query_id, system.config.generation.model
+                    )
                     retr = benchmark.score_retrieval(ar.retrieved, q)
                     ans = benchmark.score_answer(ar.answer, q)
 

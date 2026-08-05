@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from .. import paths
@@ -157,6 +158,35 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--max-new-tokens",
+        type=int,
+        default=None,
+        help=(
+            "Override the generation cap for this run. THIS IS THE LEVER "
+            "THAT ACTUALLY REACHES GENERATION. Rebinding "
+            "src.config.GEN_MAX_NEW_TOKENS in-process does NOT work and "
+            "fails SILENTLY: GenerationConfig.max_new_tokens takes that "
+            "constant as a dataclass field DEFAULT, which Python evaluates "
+            "once at class-definition time, so a later rebind changes "
+            "nothing the generator reads. This flag instead constructs the "
+            "GenerationConfig explicitly. When set, the runner VERIFIES "
+            "every emitted answer against the cap and aborts if the cap "
+            "did not apply -- a measurement that silently did not measure "
+            "what it claimed is the failure mode this exists to prevent."
+        ),
+    )
+    parser.add_argument(
+        "--prewarm",
+        action="store_true",
+        help=(
+            "Load the generator BEFORE the timed run and report the load "
+            "time separately. Without this the first system measured pays "
+            "a ~15GB download/load that later ones do not, which makes "
+            "cross-system timings meaningless -- observed: a probe where "
+            "M1 appeared slower than M2 purely because M1 ran first."
+        ),
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help=(
@@ -215,8 +245,40 @@ def main() -> None:
     if args.max_units is not None:
         print(f"[eval] max_units={args.max_units} (small-sample mode)")
 
-    system_cls = SYSTEM_REGISTRY[args.system]
-    system: BaseSystem = system_cls(config=HarnessConfig())
+    # Build the config EXPLICITLY rather than rebinding module constants.
+    # Only src.config.EVIDENCE_TOKEN_BUDGET is patchable that way (it is
+    # read through the module object at call time, deliberately); every
+    # other constant in src/config.py is baked into a dataclass field
+    # default at import and a rebind is silently ignored.
+    harness_cfg = HarnessConfig()
+    if args.max_new_tokens is not None:
+        if args.max_new_tokens < 1:
+            parser.error("--max-new-tokens must be >= 1")
+        harness_cfg = replace(
+            harness_cfg,
+            generation=replace(
+                harness_cfg.generation, max_new_tokens=args.max_new_tokens
+            ),
+        )
+        print(
+            f"[eval] generation cap OVERRIDDEN to "
+            f"{harness_cfg.generation.max_new_tokens} tokens (verified after "
+            "each answer)"
+        )
+
+    system: BaseSystem = system_cls(config=harness_cfg)
+
+    load_s = None
+    if args.prewarm:
+        t_load = time.perf_counter()
+        from ..models import load_generator
+
+        load_generator(
+            harness_cfg.generation.model, harness_cfg.generation.load_in_4bit
+        )
+        load_s = time.perf_counter() - t_load
+        print(f"[eval] prewarm: generator resident in {load_s:.1f}s "
+              "(EXCLUDED from the timings below)")
 
     benchmark_cls = BENCHMARK_REGISTRY[args.benchmark]
     benchmark = benchmark_cls()
@@ -227,6 +289,7 @@ def main() -> None:
         batch_size=args.batch_size,
         resume=args.resume,
         max_padded_tokens=args.max_padded_tokens,
+        verify_max_new_tokens=args.max_new_tokens,
     )
     n_scored = 0
     sum_retr_f1 = 0.0
@@ -266,6 +329,10 @@ def main() -> None:
         "generator": system.config.generation.model,
         "chunking_strategy": system.config.chunking.strategy,
         "evidence_budget": args.evidence_budget,
+        # Recorded so a probe artifact is self-describing. The 1-token
+        # probe that silently ran uncapped would have been caught here.
+        "max_new_tokens": harness_cfg.generation.max_new_tokens,
+        "prewarm_load_s": load_s,
         "git_commit": _git_commit_short(),
         "output_path": str(args.output),
         "timestamp": stamp,
