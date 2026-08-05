@@ -140,9 +140,6 @@ class TestCapVerification(unittest.TestCase):
 
     def test_an_overlong_answer_raises(self):
         r = self._runner(1)
-        r._verify_tok = lambda text, add_special_tokens=False: {
-            "input_ids": list(range(len(text.split())))
-        }
         with self.assertRaises(RuntimeError) as cm:
             r._check_output_length(
                 "this is a full length answer that ignored the cap entirely",
@@ -151,17 +148,14 @@ class TestCapVerification(unittest.TestCase):
         self.assertIn("NOT APPLIED", str(cm.exception))
 
     def test_one_token_of_slack_is_tolerated(self):
-        """decode -> strip -> re-encode is not an exact inverse of
-        generation, so an off-by-one must not abort a real run."""
+        """tiktoken and Qwen's BPE disagree by ~10-20% on the same text,
+        so a tight bound would abort real runs; the tolerance is
+        cap*1.25+2."""
         r = self._runner(1)
-        r._verify_tok = lambda text, add_special_tokens=False: {
-            "input_ids": list(range(len(text.split())))
-        }
-        r._check_output_length("two words", "q1", "model")  # 2 <= 1+1
+        r._check_output_length("hi", "q1", "model")  # within cap*1.25+2
 
     def test_disabled_by_default(self):
         r = self._runner(None)
-        r._verify_tok = None
         r._check_output_length("anything at all, arbitrarily long", "q", "m")
 
 

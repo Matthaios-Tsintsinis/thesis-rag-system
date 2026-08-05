@@ -266,6 +266,7 @@ def main() -> None:
             "each answer)"
         )
 
+    system_cls = SYSTEM_REGISTRY[args.system]
     system: BaseSystem = system_cls(config=harness_cfg)
 
     load_s = None

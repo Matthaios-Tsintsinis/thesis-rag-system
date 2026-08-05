@@ -116,25 +116,30 @@ class BenchmarkRunner:
         # than an error once already; the caller should not have to be the
         # one who notices. None disables the check entirely.
         self.verify_max_new_tokens = verify_max_new_tokens
-        self._verify_tok = None
 
     def _check_output_length(self, answer: str, query_id: str, model: str) -> None:
         """Abort if a generated answer overran the cap that was requested.
 
-        The cap is re-measured from the DECODED text, so allow one token
-        of slack: decode -> strip -> re-encode is not an exact inverse of
-        generation (a leading space can vanish, a multi-byte glyph can
-        re-split). That slack is irrelevant to the failure this catches,
-        which is a cap of 1 producing a 100-token answer.
+        Counted with the harness-wide tiktoken counter, NOT the
+        generator's own tokenizer. An earlier version called
+        `load_generator` for its tokenizer, which pulls ~15 GB of weights
+        into memory purely to count tokens — free when the generator is
+        already resident, and a surprise mid-run load when it is not
+        (retrieval-only passes, stubbed systems, any CPU host).
+
+        The cost of the substitution is that tiktoken and Qwen's BPE
+        disagree by roughly 10-20% on the same text, so the tolerance is
+        `cap * 1.25 + 2` rather than an exact bound. That is ample for
+        the failure this exists to catch, which is a cap of 1 emitting a
+        hundred tokens; it is deliberately NOT a precise assertion about
+        generation length.
         """
         if self.verify_max_new_tokens is None:
             return
-        if self._verify_tok is None:
-            from ..models import load_generator
+        from ..prompt_packing import count_tokens
 
-            self._verify_tok = load_generator(model)[0]
-        n = len(self._verify_tok(answer, add_special_tokens=False)["input_ids"])
-        if n > self.verify_max_new_tokens + 1:
+        n = count_tokens(answer)
+        if n > self.verify_max_new_tokens * 1.25 + 2:
             raise RuntimeError(
                 f"generation cap NOT APPLIED: query {query_id!r} returned "
                 f"~{n} tokens against max_new_tokens="
