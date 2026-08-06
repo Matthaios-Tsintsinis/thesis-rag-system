@@ -296,6 +296,12 @@ def main() -> None:
     sum_retr_f1 = 0.0
     sum_retr_skipped = 0
     sum_ans = 0.0
+    # Timed HERE, around runner.run only, so the prewarm load and every
+    # import sit outside it. Recorded in the summary because otherwise
+    # the only source of a timing is stdout, and reading a wall clock off
+    # a Colab cell is how the first 1-token probe ended up quoting model
+    # downloads as compute.
+    t_run = time.perf_counter()
     for scored in runner.run(
         system,
         benchmark,
@@ -309,6 +315,8 @@ def main() -> None:
         else:
             sum_retr_f1 += scored.retrieval.f1
         sum_ans += scored.answer.value
+
+    elapsed_s = time.perf_counter() - t_run
 
     # Aggregate summary alongside the JSONL.
     summary_path = args.output.with_suffix(".summary.json")
@@ -334,6 +342,16 @@ def main() -> None:
         # probe that silently ran uncapped would have been caught here.
         "max_new_tokens": harness_cfg.generation.max_new_tokens,
         "prewarm_load_s": load_s,
+        # Wall clock of runner.run() ALONE — model load excluded when
+        # --prewarm is used. s_per_query is the number every cost
+        # forecast in this project is built from, so it is recorded
+        # rather than re-derived by hand each time.
+        "elapsed_s": round(elapsed_s, 2),
+        "s_per_query": (
+            round(elapsed_s / n_scored, 4) if n_scored else None
+        ),
+        "batch_size": args.batch_size,
+        "max_padded_tokens": args.max_padded_tokens,
         "git_commit": _git_commit_short(),
         "output_path": str(args.output),
         "timestamp": stamp,
