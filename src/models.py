@@ -342,6 +342,7 @@ def token_budget_batches(
     *,
     max_padded_tokens: int,
     max_batch_size: int | None = None,
+    reserve_tokens_per_seq: int = 0,
 ) -> list[list[int]]:
     """Group pre-sorted indices so that n * longest <= max_padded_tokens.
 
@@ -375,9 +376,31 @@ def token_budget_batches(
     A single item wider than the budget gets its own batch rather than
     being dropped — the same "include it anyway" policy the context
     packer uses, for the same reason.
+
+    `reserve_tokens_per_seq` ADDS headroom per sequence for the tokens
+    generation is about to append. This is not cosmetic: the budget
+    bounds KV cache, and KV grows with EVERY DECODED TOKEN, not just with
+    the prompt. Ignoring that is harmless where prompts dwarf outputs
+    (index summaries: 800 in, 100 out) and dangerous where they do not.
+
+    M1 is the case that forces it. Its prompts are ~45 tokens, so a
+    20,000-token budget permits a batch of ~440 — and at ~320 generated
+    tokens each that is 440 x 365 x 57,344 B = 9.2 GB of KV on top of
+    15 GB of weights, i.e. an OOM on a 24 GB L4 from a budget that looks
+    conservative. Passing `reserve_tokens_per_seq=max_new_tokens` sizes
+    the batch on what it will actually hold.
+
+    DEFAULT 0, deliberately: a non-zero default would change batch
+    COMPOSITION on the summary path, and summaries are cached, so it
+    would alter cached artifacts without moving the key that names them —
+    the clustering landmine again. Callers opt in; the summary path does
+    not.
     """
     if max_padded_tokens < 1:
         raise ValueError("max_padded_tokens must be >= 1")
+    if reserve_tokens_per_seq < 0:
+        raise ValueError("reserve_tokens_per_seq must be >= 0")
+    lengths = [n + reserve_tokens_per_seq for n in lengths]
     batches: list[list[int]] = []
     current: list[int] = []
     current_max = 0

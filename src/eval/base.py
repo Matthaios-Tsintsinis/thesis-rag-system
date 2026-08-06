@@ -246,6 +246,11 @@ class BenchmarkRunner:
                 order, lengths,
                 max_padded_tokens=self.max_padded_tokens,
                 max_batch_size=self.batch_size,
+                # KV grows with every DECODED token too, and the budget
+                # bounds KV. Without this a short-prompt system (M1:
+                # ~45-token prompts) gets a batch of hundreds and OOMs
+                # while the budget still looks conservative.
+                reserve_tokens_per_seq=system.config.generation.max_new_tokens,
             )
         else:
             groups = [

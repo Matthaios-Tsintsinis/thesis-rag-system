@@ -182,5 +182,50 @@ class TestAllocatorConfig(unittest.TestCase):
             if prev is not None:
                 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = prev
 
+class TestGeneratedTokensAreReserved(unittest.TestCase):
+    """KV grows with every DECODED token, and the budget bounds KV.
+
+    M1 forces this. Its prompts are ~45 tokens, so a 20,000-token budget
+    permits a batch of ~440 -- and at ~320 generated tokens each that is
+    ~9 GB of KV on top of 15 GB of weights, an OOM on a 24 GB L4 from a
+    budget that looks conservative. Reserving the generation length sizes
+    the batch on what it will actually hold.
+    """
+
+    def test_short_prompts_long_outputs_are_bounded(self):
+        order, lengths = list(range(400)), [45] * 400
+        loose = token_budget_batches(order, lengths, max_padded_tokens=20000)
+        tight = token_budget_batches(
+            order, lengths, max_padded_tokens=20000,
+            reserve_tokens_per_seq=512,
+        )
+        self.assertEqual(max(len(b) for b in loose), 400)
+        self.assertLess(max(len(b) for b in tight), 50)
+
+    def test_default_is_zero_so_the_summary_path_is_unchanged(self):
+        """A non-zero DEFAULT would change batch composition on the
+        summary path -- and summaries are cached, so it would alter a
+        cached artifact without moving the key that names it. Callers
+        opt in."""
+        order, lengths = list(range(20)), [100] * 20
+        self.assertEqual(
+            token_budget_batches(order, lengths, max_padded_tokens=1000),
+            token_budget_batches(order, lengths, max_padded_tokens=1000,
+                                 reserve_tokens_per_seq=0),
+        )
+
+    def test_every_item_survives_reserving(self):
+        order, lengths = list(range(37)), [10 + i for i in range(37)]
+        batches = token_budget_batches(
+            order, lengths, max_padded_tokens=500, reserve_tokens_per_seq=100
+        )
+        self.assertEqual(sorted(i for b in batches for i in b), sorted(order))
+
+    def test_a_negative_reserve_is_rejected(self):
+        with self.assertRaises(ValueError):
+            token_budget_batches([0], [10], max_padded_tokens=100,
+                                 reserve_tokens_per_seq=-1)
+
+
 if __name__ == "__main__":
     unittest.main()
