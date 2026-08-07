@@ -24,10 +24,12 @@ import unittest
 
 from src.chunking import Chunk
 from src.eval.hotpotqa import (
+    SUBSAMPLE_SEED,
     HotpotQABenchmark,
     HotpotQAPooledBenchmark,
     _project_to_titles,
     _sentence_items,
+    subsample_indices,
 )
 from src.eval.types import EvalQuery, GoldAnswer
 from src.retrievers.base import RetrievedChunk
@@ -168,6 +170,56 @@ class TestVariantBPooling(unittest.TestCase):
         """A row must say which variant produced it; the two are not
         comparable to each other or to published numbers."""
         self.assertEqual(self.units[0].queries[0].metadata["variant"], "pooled")
+
+
+class TestSeededSubsample(unittest.TestCase):
+    """Seeded random, NOT the head of the file.
+
+    HotpotQA dev is not guaranteed randomly ordered — it can be grouped
+    by type and level — so a head slice risks skewing the sample on
+    exactly the bridge/comparison axis that justifies including the
+    benchmark.
+    """
+
+    def test_it_is_not_the_head(self):
+        idx = subsample_indices(7405, 1000)
+        self.assertNotEqual(idx, list(range(1000)))
+
+    def test_same_seed_is_reproducible(self):
+        self.assertEqual(subsample_indices(7405, 1000),
+                         subsample_indices(7405, 1000))
+
+    def test_a_different_seed_gives_a_different_sample(self):
+        self.assertNotEqual(subsample_indices(7405, 1000),
+                            subsample_indices(7405, 1000, seed=1))
+
+    def test_indices_are_sorted_unique_and_in_range(self):
+        """Sorted so the subsample keeps DATASET order — variant B's
+        shard boundaries must be a function of the sample, not of the
+        order sample() happened to emit."""
+        idx = subsample_indices(7405, 1000)
+        self.assertEqual(idx, sorted(idx))
+        self.assertEqual(len(idx), len(set(idx)))
+        self.assertEqual(len(idx), 1000)
+        self.assertTrue(all(0 <= i < 7405 for i in idx))
+
+    def test_both_variants_draw_the_SAME_sample(self):
+        """If A and B answered different questions, an A-vs-B comparison
+        would confound the pooling change with a change of question set —
+        and comparing them is the whole reason both exist."""
+        a = HotpotQABenchmark(max_questions=500)
+        b = HotpotQAPooledBenchmark(max_questions=500)
+        self.assertEqual(
+            subsample_indices(7405, a.max_questions),
+            subsample_indices(7405, b.max_questions),
+        )
+
+    def test_asking_for_everything_is_the_identity(self):
+        self.assertEqual(subsample_indices(50, 50), list(range(50)))
+        self.assertEqual(subsample_indices(50, 999), list(range(50)))
+
+    def test_the_seed_matches_the_project_convention(self):
+        self.assertEqual(SUBSAMPLE_SEED, 20260805)
 
 
 class TestTitleProjection(unittest.TestCase):

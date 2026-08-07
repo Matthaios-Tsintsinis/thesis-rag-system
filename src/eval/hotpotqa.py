@@ -108,6 +108,28 @@ _HF_SPLIT = "validation"
 # threshold for a second summary layer by a wide margin.
 SHARD_QUESTIONS = 100
 
+# SEEDED RANDOM SUBSAMPLE, not the head of the file.
+#
+# HotpotQA dev is not guaranteed to be randomly ordered — it can be
+# grouped by `type` and `level` — so taking the first N rows risks a
+# sample skewed on exactly the dimension that justifies including the
+# benchmark at all, the bridge/comparison split. A head slice would be
+# indefensible precisely where the benchmark is most interesting.
+#
+# Same seed convention as the M7 dev/test partition, so every
+# pre-registered split in this project traces to one dated constant.
+#
+# `random.Random(seed).sample` rather than `Dataset.shuffle(seed=...)`:
+# the datasets library's shuffle implementation is free to change
+# between versions, and this project has already been bitten by a
+# version-sensitive algorithm (UMAP) whose output a seed does not fully
+# pin. Python's Mersenne Twister is specified and stable.
+#
+# Indices are SORTED after sampling, so the subsample keeps dataset
+# order. That makes variant B's shard boundaries a function of the
+# sample alone, not of the order `sample()` happened to emit.
+SUBSAMPLE_SEED = 20260805
+
 # Rank-aware K grid. HotpotQA has exactly 2 gold paragraphs, so Hit@2 is
 # the directly interpretable "did it find both", and MAP@10 is
 # comparable in shape to what MultiHop reports.
@@ -116,6 +138,23 @@ RANK_K_VALUES = (1, 2, 5, 10)
 # The atom span_id used for TITLE-level projection in rank-aware
 # scoring. Distinct from any real sentence id.
 _TITLE_SPAN = "<title>"
+
+
+def subsample_indices(n_total: int, k: int, seed: int = SUBSAMPLE_SEED) -> list[int]:
+    """Seeded random indices, sorted. Pure, so it is testable and quotable.
+
+    BOTH VARIANTS MUST GET THE SAME SAMPLE. `seed` is a module constant
+    and both classes share this function through `_load`, so variant A
+    and variant B answer the SAME 1,000 questions. If they diverged, any
+    A-vs-B comparison would confound the pooling change with a change of
+    question set — and comparing the two variants is the entire reason
+    both are being built.
+    """
+    import random
+
+    if k >= n_total:
+        return list(range(n_total))
+    return sorted(random.Random(seed).sample(range(n_total), k))
 
 
 def _sentence_items(context: Any) -> list[CorpusItem]:
@@ -267,8 +306,8 @@ class HotpotQABenchmark:
             # Native Parquet: the default revision is the right one, and
             # refs/convert/parquet does not apply (see the HF_REPO note).
             ds = load_dataset(HF_REPO, HF_CONFIG, split=_HF_SPLIT)
-            if self.max_questions is not None:
-                ds = ds.select(range(min(self.max_questions, len(ds))))
+            if self.max_questions is not None and self.max_questions < len(ds):
+                ds = ds.select(subsample_indices(len(ds), self.max_questions))
             self._rows = ds
             self._measure(ds)
         return self._rows
@@ -296,12 +335,36 @@ class HotpotQABenchmark:
             round(tok_total / n_paras, 1) if n_paras else None)
         self.stats["n_distinct_titles"] = len(titles)
         self.stats["n_questions"] = len(ds)
+
+        # REALISED distribution of the two stratifying variables. The
+        # subsample is random rather than stratified, so nothing
+        # GUARANTEES it is balanced — printing the realised split is what
+        # makes a lopsided draw visible before it is spent, rather than
+        # discovered in a results table. bridge/comparison is the axis
+        # HotpotQA is distinctive for; level is its own difficulty label.
+        from collections import Counter
+
+        types = Counter(str(r.get("type") or "unknown") for r in ds)
+        levels = Counter(str(r.get("level") or "unknown") for r in ds)
+        self.stats["type_distribution"] = dict(types)
+        self.stats["level_distribution"] = dict(levels)
+        self.stats["subsample_seed"] = (
+            SUBSAMPLE_SEED if self.max_questions is not None else None)
+
+        n = max(1, len(ds))
+        fmt = lambda c: ", ".join(  # noqa: E731
+            f"{k}={v} ({v / n:.1%})" for k, v in sorted(c.items()))
         print(
             f"[hotpotqa/{self.variant}] {len(ds)} questions, "
             f"{len(titles)} distinct titles, mean paragraph "
             f"{self.stats['mean_paragraph_tokens']} tokens "
-            f"(sampled 200 questions for the token mean)"
+            f"(token mean sampled over 200 questions)"
         )
+        if self.max_questions is not None:
+            print(f"[hotpotqa/{self.variant}] SEEDED RANDOM subsample, "
+                  f"seed={SUBSAMPLE_SEED} (not the head of the file)")
+        print(f"[hotpotqa/{self.variant}] type:  {fmt(types)}")
+        print(f"[hotpotqa/{self.variant}] level: {fmt(levels)}")
 
     # --- units -----------------------------------------------------------
 
@@ -474,5 +537,7 @@ __all__ = [
     "HotpotQABenchmark",
     "HotpotQAPooledBenchmark",
     "SHARD_QUESTIONS",
+    "SUBSAMPLE_SEED",
     "RANK_K_VALUES",
+    "subsample_indices",
 ]
