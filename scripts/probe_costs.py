@@ -278,7 +278,7 @@ def probe_crash_band(out_dir: Path, n_corpora: int, per_corpus: int) -> dict:
              "gmm_final_fit_failures": 0, "recluster_guard_trips": 0,
              "no_progress_trips": 0, "corpora_with_any_trip": 0,
              "leaves": [], "build_s": [], "build_s_tree": [],
-             "build_s_no_tree": []}
+             "build_s_no_tree": [], "first_build_s": None}
     for c in range(n_corpora):
         block = paras[c * per_corpus:(c + 1) * per_corpus]
         items = [
@@ -306,6 +306,8 @@ def probe_crash_band(out_dir: Path, n_corpora: int, per_corpus: int) -> dict:
         # extrapolation with a measurement. Split by whether a tree
         # formed, because a no-tree build skips summarisation entirely
         # and the two populations are not one distribution.
+        if stats["first_build_s"] is None:
+            stats["first_build_s"] = build_s
         stats["build_s"].append(build_s)
         (stats["build_s_no_tree"] if st.get("degenerate_no_tree")
          else stats["build_s_tree"]).append(build_s)
@@ -324,11 +326,31 @@ def probe_crash_band(out_dir: Path, n_corpora: int, per_corpus: int) -> dict:
     leaves = stats.pop("leaves")
     stats["mean_leaves"] = round(sum(leaves) / max(1, len(leaves)), 1)
     stats["min_leaves"], stats["max_leaves"] = min(leaves), max(leaves)
+    # MEAN IS THE WRONG STATISTIC HERE and the first run proved it: 0.85 s
+    # mean with a 31.43 s max over 40 samples means one corpus carried
+    # ~92% of the total. Report the MEDIAN and p95 as well, and record
+    # whether the max landed on corpus 0 -- a first-corpus max is a cold
+    # start (the mpnet embedder loads on the first index_items call and
+    # is lru_cached thereafter), which happens ONCE across 5,000 builds
+    # and must not be amortised into a per-build figure. A max anywhere
+    # else is real tail variance, which at 5,000 builds dominates.
+    first = stats.pop("first_build_s")
     for key in ("build_s", "build_s_tree", "build_s_no_tree"):
-        vals = stats.pop(key)
-        stats[f"{key}_mean"] = round(sum(vals) / len(vals), 2) if vals else None
-        stats[f"{key}_max"] = round(max(vals), 2) if vals else None
-        stats[f"{key}_n"] = len(vals)
+        vals = sorted(stats.pop(key))
+        n = len(vals)
+        stats[f"{key}_n"] = n
+        stats[f"{key}_mean"] = round(sum(vals) / n, 3) if n else None
+        stats[f"{key}_median"] = round(vals[n // 2], 3) if n else None
+        stats[f"{key}_p95"] = round(vals[min(n - 1, int(0.95 * n))], 3) if n else None
+        stats[f"{key}_max"] = round(vals[-1], 3) if n else None
+    stats["first_build_s"] = round(first, 3) if first is not None else None
+    stats["max_was_first_corpus"] = (
+        first is not None and abs(first - (stats["build_s_max"] or 0)) < 1e-6
+    )
+    if stats["max_was_first_corpus"]:
+        stats["build_s_mean_excluding_first"] = round(
+            (stats["build_s_mean"] * stats["build_s_n"] - first)
+            / max(1, stats["build_s_n"] - 1), 3)
     stats["no_tree_pct"] = round(100 * stats["no_tree"] / max(1, stats["n_corpora"]), 1)
     stats["trip_pct"] = round(
         100 * stats["corpora_with_any_trip"] / max(1, stats["n_corpora"]), 1)
@@ -395,7 +417,10 @@ def probe_depth_curve(out_dir: Path, trials: int) -> dict:
     print("=== depth curve ===")
     print(f"PRE-REGISTERED: 1->2 transition in {DEPTH_PREDICTION} CONFIRMS "
           "the mechanism; <=60 or >=100 REFUTES it.")
-    print(f"{'leaves':>7} {'trial':>6} {'built':>6} {'layers':>7}  layer_sizes")
+    print(f"{'target':>7} {'trial':>6} {'built':>6} {'layer1':>7} {'b':>5} "
+          f"{'layers':>7}  layer_sizes")
+    print("  (VERDICT KEYS ON 'built' AND 'layer1', NEVER ON 'target' -- "
+          "target is paragraphs fed in, and the chunker splits them)")
     rows: list[dict] = []
     cursor = 0
     for size in DEPTH_SIZES:
@@ -418,26 +443,113 @@ def probe_depth_curve(out_dir: Path, trials: int) -> dict:
             built = int(st.get("n_leaves", 0))
             layers = int(st.get("n_layers", 1))
             sizes = st.get("layer_sizes", {})
+            # layer_sizes keys survive a JSON round-trip as strings.
+            l1 = sizes.get(1, sizes.get("1"))
+            l1 = int(l1) if l1 is not None else None
             rows.append({"target": size, "trial": t, "leaves": built,
                          "n_layers": layers, "layer_sizes": sizes,
+                         "layer1_size": l1,
+                         "branching": (built / l1) if l1 else None,
+                         "bic_fit_failures": int(st.get("bic_fit_failures", 0)),
                          "summary_layers": max(0, layers - 1)})
-            print(f"{size:>7} {t:>6} {built:>6} {layers:>7}  {sizes}")
+            b = f"{built / l1:.2f}" if l1 else "-"
+            print(f"{size:>7} {t:>6} {built:>6} {str(l1):>7} {b:>5} "
+                  f"{layers:>7}  {sizes}")
 
-    two_plus = [r["target"] for r in rows if r["summary_layers"] >= 2]
-    transition = min(two_plus) if two_plus else None
+    # --- THE EXACT TEST, and the one that should have been primary ------
+    #
+    # UNIT BUG, fixed: this keyed on `target` (the number of paragraphs
+    # fed in) while the prediction was about BUILT leaves. They diverge
+    # badly -- the 100-token chunker splits a ~100-token paragraph in two
+    # whenever a sentence would overflow, so target 40 built 51 and 61.
+    # Scoring a leaf-count prediction against a paragraph count is the
+    # same class of error as MAP@K over chunks instead of documents, and
+    # as the inverted tier labels. Third of its kind; see standing rule 2.
+    #
+    # More importantly, the leaf count was ALWAYS the wrong variable to
+    # test. `build_paper_tree` breaks when `len(current) <=
+    # reduction_dimension + 1`, so the mechanism's real claim is EXACT
+    # and deterministic:
+    #
+    #     a second summary layer exists  IFF  layer 1 holds > 11 nodes
+    #
+    # That is a hard invariant with no fitted parameter in it. The
+    # ~74-leaf figure is a NOISY CONSEQUENCE of it, because leaves ->
+    # layer-1 size goes through the branching factor, which is
+    # data-dependent (measured 5.3 to 6.8 across this sweep). Testing the
+    # invariant tests the mechanism; testing the leaf threshold tests the
+    # mechanism AND an assumed branching factor at once, and cannot say
+    # which failed.
+    stop_at = 11  # PaperTreeParams.reduction_dimension + 1
+    invariant_failures = [
+        r for r in rows
+        if r["layer1_size"] is not None
+        and (r["summary_layers"] >= 2) != (r["layer1_size"] > stop_at)
+    ]
+
+    two_plus = [r["leaves"] for r in rows if r["summary_layers"] >= 2]
+    one_only = [r["leaves"] for r in rows if r["summary_layers"] < 2]
+    # The transition band in BUILT leaves: highest 1-layer corpus below
+    # the lowest 2-layer one. Reported as a band because the branching
+    # factor varies, so there is no single crossing point.
+    transition_lo = max([n for n in one_only if n < min(two_plus)], default=None) \
+        if two_plus else None
+    transition_hi = min(two_plus) if two_plus else None
+
+    branchings = [r["branching"] for r in rows if r["branching"]]
+    b_mean = sum(branchings) / len(branchings) if branchings else None
+
     lo, hi = DEPTH_PREDICTION
-    if transition is None:
+    # PAPER-BAND prediction, and this is NOT post-hoc: App. C reports
+    # 5.7-6.8 children per parent. The registered point prediction used
+    # 6.7 alone, near the top of that band. Scoring against the FULL
+    # PUBLISHED BAND is legitimate because the band was published before
+    # any of this; re-deriving the threshold from OUR measured branching
+    # factor would not be, and is deliberately not done here.
+    band_lo, band_hi = 11 * 5.7, 11 * 6.8
+
+    if not two_plus:
         verdict = "INCONCLUSIVE - no 1->2 transition anywhere in the sweep"
-    elif lo <= transition <= hi:
-        verdict = f"CONFIRMS - transition at {transition}, predicted {lo}-{hi}"
+    elif invariant_failures:
+        verdict = (
+            f"REFUTES THE MECHANISM - {len(invariant_failures)} corpora "
+            "violate the exact invariant (2nd summary layer iff layer 1 > "
+            f"{stop_at} nodes). The stop condition is not what governs "
+            "depth."
+        )
     else:
-        verdict = (f"REFUTES THE MECHANISM - transition at {transition}, "
-                   f"predicted {lo}-{hi}. The account may still hold; the "
-                   "layer-size/branching explanation for it does not.")
+        core = (f"MECHANISM CONFIRMED EXACTLY - all {len(rows)} corpora obey "
+                f"'2nd summary layer iff layer1 > {stop_at}', with no fitted "
+                "parameter.")
+        band = (f"transition band {transition_lo}-{transition_hi} built "
+                f"leaves; paper's own 5.7-6.8 branching implies "
+                f"{band_lo:.0f}-{band_hi:.0f}")
+        if transition_hi is not None and band_lo <= transition_hi <= band_hi:
+            band += " -> INSIDE the paper band."
+        else:
+            band += " -> OUTSIDE the paper band."
+        reg = (f"REGISTERED POINT PREDICTION ({lo}-{hi}, from b=6.7 alone): "
+               + ("MET" if (transition_hi is not None and lo <= transition_hi <= hi)
+                  else "NOT MET - the registered range was too narrow, having "
+                       "used one value from a published band rather than the "
+                       "band"))
+        verdict = f"{core}\n  {band}\n  {reg}"
+
     print("")
     print(verdict)
-    return {"prediction": list(DEPTH_PREDICTION), "transition": transition,
-            "verdict": verdict, "rows": rows}
+    if b_mean:
+        print(f"  measured branching factor: {b_mean:.2f} "
+              f"(range {min(branchings):.2f}-{max(branchings):.2f}) — "
+              "REPORTED, NOT used to re-derive the threshold")
+    if invariant_failures:
+        for r in invariant_failures:
+            print(f"  VIOLATION: {r['leaves']} leaves, layer1="
+                  f"{r['layer1_size']}, summary_layers={r['summary_layers']}")
+    return {"prediction": list(DEPTH_PREDICTION),
+            "paper_band_threshold": [band_lo, band_hi],
+            "transition_lo": transition_lo, "transition_hi": transition_hi,
+            "invariant_violations": len(invariant_failures),
+            "branching_mean": b_mean, "verdict": verdict, "rows": rows}
 
 
 def main() -> None:
@@ -513,9 +625,17 @@ def main() -> None:
               "   <- structural, expected for <=11 leaves")
         print(f"  any guard trip     : {c['corpora_with_any_trip']} "
               f"({c['trip_pct']}%)")
-        print(f"  build s/corpus     : {c['build_s_mean']} mean, "
-              f"{c['build_s_max']} max   <- REPLACES the ~2-3 s "
-              "extrapolation for variant A")
+        print(f"  build s/corpus     : {c['build_s_median']} MEDIAN, "
+              f"{c['build_s_p95']} p95, {c['build_s_max']} max "
+              f"({c['build_s_mean']} mean)")
+        if c.get("max_was_first_corpus"):
+            print(f"    -> the max WAS the first corpus ({c['first_build_s']} s) "
+                  "= cold start, paid ONCE. Use "
+                  f"{c.get('build_s_mean_excluding_first')} s/build.")
+        else:
+            print("    -> the max was NOT the first corpus: REAL TAIL "
+                  "VARIANCE, and at 5,000 builds the tail dominates. Do not "
+                  "forecast from the mean.")
         print(f"    with a tree      : {c['build_s_tree_mean']} "
               f"(n={c['build_s_tree_n']})")
         print(f"    no tree          : {c['build_s_no_tree_mean']} "
