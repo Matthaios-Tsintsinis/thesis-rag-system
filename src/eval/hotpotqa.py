@@ -8,15 +8,22 @@ VARIANT A — `hotpotqa` — standard distractor.
     One EvalUnit per question, corpus = that question's 10 paragraphs
     (2 gold + 8 TF-IDF distractors). The published setting.
 
-    ⚠ M4 HAS NO TREE HERE, AND THAT IS STRUCTURAL. Ten paragraphs is
-    ~9-14 leaves, at or under `reduction_dimension + 1` = 11, so
-    `build_paper_tree` halts at layer 0 and M4 degenerates to flat dense
-    retrieval — effectively M2 with mpnet. MEASURED: a 40-corpus probe
-    at this shape produced NO tree in 40/40 cases. M4's rows here must
-    NEVER be presented as a RAPTOR result; the runner enforces this
-    (`m4_tree_degenerate` per row, a banner in `analyse`). M7 inherits
-    it when it joins — with no hierarchy, its multi-branch axis is inert
-    and it is a two-axis system on this variant.
+    ⚠ CORRECTED 2026-08-05 — M4 DOES BUILD A TREE HERE. An earlier note
+    in this file predicted a flat index, on the assumption that a
+    HotpotQA paragraph is ~70 tokens. MEASURED: **127.7 tokens**, so ten
+    paragraphs give **15-20 leaves**, above the stop condition of 11.
+    Observed on the first smoke: 15 leaves -> 3 layer-1 nodes, 17 -> 4,
+    20 -> 4. Variant A therefore has ONE summary layer, the same depth
+    as a QASPER-scale corpus, and the flat-index banner correctly never
+    fired.
+
+    ⚠ WHAT IS STILL TRUE, and it is the reason variant A carries no
+    primary comparison: a 15-20 leaf corpus against top-15 retrieval
+    means EVERY retrieval system returns essentially the whole corpus.
+    Variant A cannot discriminate retrievers — it is a READER benchmark,
+    which is what the standard distractor setting was designed to be.
+    What it CAN separate is M1 (no evidence) from the rest, and M4 (whose
+    context carries summary nodes) from the flat systems.
 
 VARIANT B — `hotpotqa_pooled` — pooled shards.
     Paragraphs pooled across `SHARD_QUESTIONS` questions into one shared
@@ -336,12 +343,21 @@ class HotpotQABenchmark:
         self.stats["n_distinct_titles"] = len(titles)
         self.stats["n_questions"] = len(ds)
 
-        # REALISED distribution of the two stratifying variables. The
+        # REALISED distribution of the stratifying variables. The
         # subsample is random rather than stratified, so nothing
         # GUARANTEES it is balanced — printing the realised split is what
         # makes a lopsided draw visible before it is spent, rather than
-        # discovered in a results table. bridge/comparison is the axis
-        # HotpotQA is distinctive for; level is its own difficulty label.
+        # discovered in a results table.
+        #
+        # `type` (bridge / comparison) is the real axis: MEASURED 79.9% /
+        # 20.1% across the full 7,405-question dev split, and it is the
+        # dimension HotpotQA is distinctive for.
+        #
+        # `level` IS NOT A USABLE SLICE. Measured 100% "hard" across the
+        # entire dev-distractor split — the easy/medium examples live in
+        # train only. It is still printed, because a printed 100% is what
+        # tells the next reader the slice is unavailable rather than
+        # merely unused, but no analysis may condition on it.
         from collections import Counter
 
         types = Counter(str(r.get("type") or "unknown") for r in ds)
