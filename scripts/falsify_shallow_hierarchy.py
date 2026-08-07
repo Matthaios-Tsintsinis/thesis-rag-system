@@ -1,5 +1,17 @@
 """Falsification test for docs/FINDING_SHALLOW_HIERARCHY.md. Read-only.
 
+⚠ THIS TEST WAS MIS-SPECIFIED IN ITS FIRST FORM AND RETURNED A FALSE
+FALSIFICATION. Read docs/FINDING_SHALLOW_HIERARCHY.md §0 first.
+
+The tier labels are INVERTED between the two M4 eras. Old top-down M4
+maps depth 0-1 (the BROADEST, shallowest nodes) to `summary_high`; new
+bottom-up M4 maps the TOP layer to `summary_high`. So `summary_high` in
+a pre-rebuild cell is evidence FOR a shallow tree, and the original
+prediction read it as evidence against. This script now REFUSES to judge
+pre-rebuild rows rather than inverting them silently -- an era-detection
+bug that produced a plausible verdict is exactly what it exists to
+prevent.
+
 THE ACCOUNT. On document-scale corpora a faithful RAPTOR build produces
 exactly ONE summary layer: ~70-90 leaves cluster to ~10-14 parents, which
 already satisfies the stop condition (`layer <= reduction_dimension + 1`
@@ -66,6 +78,7 @@ def main() -> int:
     # (benchmark, system) -> unit-type totals
     cells: dict[tuple[str, str], dict[str, int]] = defaultdict(
         lambda: defaultdict(int))
+    pre_rebuild: set[tuple[str, str]] = set()
     n_rows = 0
     for f in files:
         for line in f.read_text(encoding="utf-8").splitlines():
@@ -78,12 +91,30 @@ def main() -> int:
             bench = (r.get("benchmark") or "").lower()
             if bench not in PER_DOCUMENT:
                 continue
+            sid = r.get("system_id", "?")
+            md = r.get("metadata") or {}
+            # ERA GATE. The m4_* diagnostics landed with the rebuilt M4
+            # (commit 5). An M4 row without them predates the rebuild, so
+            # its tier labels carry the OPPOSITE orientation and the
+            # prediction below does not apply to it.
+            if sid == "M4" and "m4_tree_degenerate" not in md:
+                pre_rebuild.add((bench, sid))
+                continue
             n_rows += 1
-            key = (bench, r.get("system_id", "?"))
+            key = (bench, sid)
             for ut, n in (r.get("retrieved_unit_types") or {}).items():
                 cells[key][ut] += int(n)
 
-    print(f"scanned {len(files)} files, {n_rows} rows from {PER_DOCUMENT}")
+    print(f"scanned {len(files)} files, {n_rows} eligible rows from "
+          f"{PER_DOCUMENT}")
+    if pre_rebuild:
+        print("")
+        print("SKIPPED as PRE-REBUILD M4 (inverted tier labels; the "
+              "prediction does not apply):")
+        for bench, sid in sorted(pre_rebuild):
+            print(f"  {bench}/{sid}")
+        print("  -> see docs/FINDING_SHALLOW_HIERARCHY.md §0 and §7. Those "
+              "cells are stale anyway (their substrate key moved).")
     if not cells:
         print("\nINCONCLUSIVE: no QASPER or QuALITY rows found. The test "
               "did not run.\nPoint it at the banked cells, e.g.:\n"
