@@ -239,17 +239,47 @@ class TestNonLeafGateReporting(unittest.TestCase):
         ]
 
     def test_micro_share_comes_from_unit_types_alone(self):
-        """So the gate reads correctly on JSONLs banked before the m4_*
-        metadata existed."""
+        """The gate reads correctly on JSONLs banked before the m4_*
+        metadata existed — it just reports them under the PRE-REBUILD
+        bucket, because an M4 row without m4_* diagnostics predates the
+        rebuild and its tier labels are inverted. The non-leaf SHARE is
+        orientation-independent ("not chunk"), so the gate still applies;
+        only the tier BREAKDOWN would be misleading if pooled."""
         roll = _aggregate(self._rows("M4", {"chunk": 6, "summary_low": 4}))
-        nl = roll["systems"]["M4"]["non_leaf"]
+        nl = roll["systems"]["M4[pre-rebuild]"]["non_leaf"]
         self.assertAlmostEqual(nl["micro"], 0.4)
         self.assertIsNone(nl["macro"])
         self.assertTrue(nl["in_band"])
 
     def test_out_of_band_is_flagged(self):
         roll = _aggregate(self._rows("M4", {"chunk": 99, "summary_low": 1}))
-        self.assertFalse(roll["systems"]["M4"]["non_leaf"]["in_band"])
+        self.assertFalse(
+            roll["systems"]["M4[pre-rebuild]"]["non_leaf"]["in_band"])
+
+    def test_the_two_m4_eras_are_never_pooled(self):
+        """The live hazard: both eras in one directory. Tier labels are
+        INVERTED across the rebuild, so a merged unit-type distribution
+        is wrong in a way no reader can detect from the table."""
+        rows = (self._rows("M4", {"chunk": 10, "summary_high": 5}, n=3)
+                + self._rows("M4", {"chunk": 10, "summary_low": 5},
+                             share=0.33, n=3))
+        systems = _aggregate(rows)["systems"]
+        self.assertIn("M4", systems)
+        self.assertIn("M4[pre-rebuild]", systems)
+        self.assertEqual(
+            systems["M4[pre-rebuild]"]["retrieved_unit_types"],
+            {"chunk": 30, "summary_high": 15},
+        )
+        self.assertEqual(
+            systems["M4"]["retrieved_unit_types"],
+            {"chunk": 30, "summary_low": 15},
+        )
+
+    def test_non_m4_systems_are_never_era_split(self):
+        """Only M4 has the inverted-tier problem; splitting M2 would
+        invent a distinction that does not exist."""
+        systems = _aggregate(self._rows("M2", {"chunk": 10}))["systems"]
+        self.assertEqual(list(systems), ["M2"])
 
     def test_a_leaf_only_system_is_out_of_scope_not_failing(self):
         """Printing FAIL against M2 would be a category error: a flat

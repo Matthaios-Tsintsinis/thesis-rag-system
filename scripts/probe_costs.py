@@ -335,6 +335,111 @@ def probe_crash_band(out_dir: Path, n_corpora: int, per_corpus: int) -> dict:
     return stats
 
 
+# --- probe 5: the depth curve, the decisive test of the 74-leaf threshold -
+
+
+# PRE-REGISTERED PREDICTION. Written before the sweep runs so it cannot
+# be fitted afterwards. docs/FINDING_SHALLOW_HIERARCHY.md derives, from
+# the reference stop condition (a layer of <= reduction_dimension + 1 =
+# 11 halts the build) and the paper's ~6.7 children per parent:
+#
+#     first leaf count with TWO summary layers = 11 * 6.7 = ~74
+#
+# CONFIRMS  : the 1 -> 2 transition falls in [70, 85].
+# REFUTES   : it falls at <= 60 or >= 100. The ACCOUNT (shallow trees on
+#             document-scale corpora) would survive either way -- what
+#             dies is the MECHANISM, i.e. that layer size and branching
+#             factor are what set the depth. A jump at 50 would mean
+#             something else governs it.
+# INCONCLUSIVE: no transition anywhere in 40-140, or a non-monotone one
+#             (depth rising then falling), which would mean the build is
+#             data-dependent enough that a single sweep cannot answer it.
+DEPTH_PREDICTION = (70, 85)
+
+# Dense THROUGH the predicted threshold, sparse outside it. The claim is
+# a step function, so the resolution has to be finer than the effect --
+# sampling every 20 leaves could straddle the step and see nothing.
+DEPTH_SIZES = (40, 50, 60, 65, 70, 75, 80, 85, 90, 100, 120, 140)
+
+
+def probe_depth_curve(out_dir: Path, trials: int) -> dict:
+    """Build real corpora at controlled leaf counts; read n_layers off each.
+
+    Reports EVERY corpus, never a mean. Averaging across a step function
+    describes neither side of it.
+
+    Two trials per size by default because the clustering is
+    data-dependent (the GMM crash band is non-monotone in n), so a single
+    corpus per size cannot distinguish a threshold from a coincidence.
+    """
+    from src.eval.multihop import MultiHopBenchmark
+    from src.eval.types import CorpusItem
+    from src.retrievers.m4_raptor import RaptorSystem
+
+    unit = next(iter(MultiHopBenchmark().iter_eval_units(
+        split="validation", max_units=1)))
+    # ~100-token paragraphs, so one item == one leaf and the leaf count
+    # is controlled rather than inferred.
+    paras: list[str] = []
+    for item in unit.corpus:
+        words = (item.text or "").split()
+        for i in range(0, len(words), 75):
+            block = " ".join(words[i:i + 75])
+            if len(block.split()) >= 60:
+                paras.append(block)
+    need = max(DEPTH_SIZES) * trials
+    if len(paras) < need:
+        raise ProbeFailure(f"depth_curve: need {need} paragraphs, have {len(paras)}")
+
+    print("")
+    print("=== depth curve ===")
+    print(f"PRE-REGISTERED: 1->2 transition in {DEPTH_PREDICTION} CONFIRMS "
+          "the mechanism; <=60 or >=100 REFUTES it.")
+    print(f"{'leaves':>7} {'trial':>6} {'built':>6} {'layers':>7}  layer_sizes")
+    rows: list[dict] = []
+    cursor = 0
+    for size in DEPTH_SIZES:
+        for t in range(trials):
+            block = paras[cursor:cursor + size]
+            cursor = (cursor + size) % (len(paras) - max(DEPTH_SIZES))
+            items = [
+                CorpusItem(item_id=f"d{size}_{t}_{j}", parent_id=f"d{size}_{t}_{j}",
+                           span_id="<whole>", text=x)
+                for j, x in enumerate(block)
+            ]
+            sysm = RaptorSystem()
+            try:
+                sysm.index_items(items)
+            except Exception as e:
+                raise ProbeFailure(
+                    f"depth_curve: {size} leaves RAISED {type(e).__name__}: {e}"
+                ) from e
+            st = sysm.index_stats
+            built = int(st.get("n_leaves", 0))
+            layers = int(st.get("n_layers", 1))
+            sizes = st.get("layer_sizes", {})
+            rows.append({"target": size, "trial": t, "leaves": built,
+                         "n_layers": layers, "layer_sizes": sizes,
+                         "summary_layers": max(0, layers - 1)})
+            print(f"{size:>7} {t:>6} {built:>6} {layers:>7}  {sizes}")
+
+    two_plus = [r["target"] for r in rows if r["summary_layers"] >= 2]
+    transition = min(two_plus) if two_plus else None
+    lo, hi = DEPTH_PREDICTION
+    if transition is None:
+        verdict = "INCONCLUSIVE - no 1->2 transition anywhere in the sweep"
+    elif lo <= transition <= hi:
+        verdict = f"CONFIRMS - transition at {transition}, predicted {lo}-{hi}"
+    else:
+        verdict = (f"REFUTES THE MECHANISM - transition at {transition}, "
+                   f"predicted {lo}-{hi}. The account may still hold; the "
+                   "layer-size/branching explanation for it does not.")
+    print("")
+    print(verdict)
+    return {"prediction": list(DEPTH_PREDICTION), "transition": transition,
+            "verdict": verdict, "rows": rows}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--out", type=Path, required=True)
@@ -344,11 +449,12 @@ def main() -> None:
     ap.add_argument("--build-units", type=int, default=20)
     ap.add_argument("--m9-queries", type=int, default=50)
     ap.add_argument("--crash-corpora", type=int, default=40)
+    ap.add_argument("--depth-trials", type=int, default=2)
     ap.add_argument("--crash-per-corpus", type=int, default=10)
     # m9 skipped by DEFAULT as of 2026-08-05: the budget constraint was
     # lifted, so +-6 units is noise and the probe is not worth the GPU.
     ap.add_argument("--skip", nargs="*", default=["m9"],
-                    choices=["m1", "build", "m9", "crash_band"])
+                    choices=["m1", "build", "m9", "crash_band", "depth_curve"])
     args = ap.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
 
@@ -361,6 +467,7 @@ def main() -> None:
         ("m9", lambda: probe_m9(args.out, args.m9_queries)),
         ("crash_band", lambda: probe_crash_band(
             args.out, args.crash_corpora, args.crash_per_corpus)),
+        ("depth_curve", lambda: probe_depth_curve(args.out, args.depth_trials)),
     ]:
         if name in args.skip:
             continue

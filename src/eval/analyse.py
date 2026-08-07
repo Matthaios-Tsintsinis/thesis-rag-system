@@ -61,6 +61,33 @@ def _expand_inputs(inputs: list[str]) -> list[Path]:
     return [p for p in out if p.is_file()]
 
 
+# M4's retrieval-unit TIER LABELS ARE INVERTED across the paper-fidelity
+# rebuild, so pooling the two eras averages opposite meanings:
+#
+#   old top-down  (raptor.py:152)  depth 0-1  -> summary_high  (BROADEST)
+#   new bottom-up (m4_raptor)      top layer  -> summary_high  (BROADEST)
+#
+# Both name the broadest tier "high", but top-down puts broad nodes at
+# SMALL depth numbers and bottom-up at LARGE layer numbers. A merged
+# unit-type distribution is therefore not merely noisy, it is wrong in a
+# way no reader can detect from the table.
+#
+# Detected by the m4_* per-query diagnostics, which landed WITH the
+# rebuild: an M4 row without them predates it. Non-M4 systems retrieve no
+# summary units at all, so the question does not arise for them.
+PRE_REBUILD_SUFFIX = "[pre-rebuild]"
+
+
+def _row_bucket_key(record: dict) -> str:
+    sid = record.get("system_id", "?")
+    if sid != "M4":
+        return sid
+    md = record.get("metadata") or {}
+    if any(k.startswith("m4_") for k in md):
+        return sid
+    return f"{sid}{PRE_REBUILD_SUFFIX}"
+
+
 def _safe_stats(xs: list[float]) -> dict[str, float | int]:
     if not xs:
         return {"n": 0}
@@ -176,7 +203,7 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
     n_total = 0
     for r in records:
         n_total += 1
-        sid = r.get("system_id", "?")
+        sid = _row_bucket_key(r)
         bucket = by_system[sid]
 
         bucket["chunk_counts"].append(int(r.get("n_retrieved", 0)))
@@ -511,6 +538,25 @@ def _print_text(rollup: dict[str, Any], *, by_type: bool) -> None:
                 f"  {sid}: abstained={mc['abstained_rate']:.1%}  "
                 f"unparseable={mc['unparseable_rate']:.1%}"
             )
+
+    # ERA SPLIT WARNING. Reaching this means the caller passed JSONLs from
+    # both sides of the M4 rebuild in one invocation. They are already
+    # bucketed apart by _row_bucket_key; this says WHY, because a reader
+    # who sees two M4 rows and assumes a duplicate would pool them by hand.
+    if any(
+        k + PRE_REBUILD_SUFFIX in rollup["systems"] for k in rollup["systems"]
+    ):
+        print("")
+        print("  *** TWO M4 ERAS IN ONE INPUT SET - reported SEPARATELY, "
+              "never pooled. ***")
+        print("  Retrieval-unit tier labels are INVERTED across the rebuild "
+              "(old top-down: depth 0-1 = summary_high, the BROADEST; new "
+              "bottom-up: TOP layer = summary_high).")
+        print("  Averaging them is WRONG, not merely noisy, and the error is "
+              "invisible in the table.")
+        print("  The pre-rebuild cells are STALE anyway - their substrate key "
+              "moved. Stash them rather than reading both.")
+        print("  See docs/FINDING_SHALLOW_HIERARCHY.md sections 0 and 7.")
 
     # Unit-type distribution (per-system).
     print("\n  --- retrieved unit-type distribution ---")
