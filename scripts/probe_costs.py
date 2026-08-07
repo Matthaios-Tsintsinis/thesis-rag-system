@@ -62,6 +62,7 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -276,7 +277,8 @@ def probe_crash_band(out_dir: Path, n_corpora: int, per_corpus: int) -> dict:
     stats = {"n_corpora": 0, "no_tree": 0, "bic_fit_failures": 0,
              "gmm_final_fit_failures": 0, "recluster_guard_trips": 0,
              "no_progress_trips": 0, "corpora_with_any_trip": 0,
-             "leaves": []}
+             "leaves": [], "build_s": [], "build_s_tree": [],
+             "build_s_no_tree": []}
     for c in range(n_corpora):
         block = paras[c * per_corpus:(c + 1) * per_corpus]
         items = [
@@ -285,6 +287,7 @@ def probe_crash_band(out_dir: Path, n_corpora: int, per_corpus: int) -> dict:
             for j, t in enumerate(block)
         ]
         sysm = RaptorSystem()
+        t0 = time.perf_counter()
         try:
             sysm.index_items(items)
         except Exception as e:
@@ -292,8 +295,20 @@ def probe_crash_band(out_dir: Path, n_corpora: int, per_corpus: int) -> dict:
                 f"crash_band: corpus {c} RAISED {type(e).__name__}: {e}. "
                 "The guard did not hold — do NOT run a thousand of these."
             ) from e
+        build_s = time.perf_counter() - t0
         st = sysm.index_stats
         stats["n_corpora"] += 1
+        # THE POINT OF TIMING HERE. Variant A's per-build cost was
+        # extrapolated from QASPER's measured 19.59 s by arguing that
+        # both dominant terms -- summary calls and the BIC sweep -- scale
+        # with leaf count, giving ~2-3 s at ~12 leaves. This is the same
+        # corpus shape through the same code path, so it replaces that
+        # extrapolation with a measurement. Split by whether a tree
+        # formed, because a no-tree build skips summarisation entirely
+        # and the two populations are not one distribution.
+        stats["build_s"].append(build_s)
+        (stats["build_s_no_tree"] if st.get("degenerate_no_tree")
+         else stats["build_s_tree"]).append(build_s)
         stats["leaves"].append(int(st.get("n_leaves", 0)))
         tripped = False
         for key in ("bic_fit_failures", "gmm_final_fit_failures",
@@ -309,6 +324,11 @@ def probe_crash_band(out_dir: Path, n_corpora: int, per_corpus: int) -> dict:
     leaves = stats.pop("leaves")
     stats["mean_leaves"] = round(sum(leaves) / max(1, len(leaves)), 1)
     stats["min_leaves"], stats["max_leaves"] = min(leaves), max(leaves)
+    for key in ("build_s", "build_s_tree", "build_s_no_tree"):
+        vals = stats.pop(key)
+        stats[f"{key}_mean"] = round(sum(vals) / len(vals), 2) if vals else None
+        stats[f"{key}_max"] = round(max(vals), 2) if vals else None
+        stats[f"{key}_n"] = len(vals)
     stats["no_tree_pct"] = round(100 * stats["no_tree"] / max(1, stats["n_corpora"]), 1)
     stats["trip_pct"] = round(
         100 * stats["corpora_with_any_trip"] / max(1, stats["n_corpora"]), 1)
@@ -386,6 +406,13 @@ def main() -> None:
               "   <- structural, expected for <=11 leaves")
         print(f"  any guard trip     : {c['corpora_with_any_trip']} "
               f"({c['trip_pct']}%)")
+        print(f"  build s/corpus     : {c['build_s_mean']} mean, "
+              f"{c['build_s_max']} max   <- REPLACES the ~2-3 s "
+              "extrapolation for variant A")
+        print(f"    with a tree      : {c['build_s_tree_mean']} "
+              f"(n={c['build_s_tree_n']})")
+        print(f"    no tree          : {c['build_s_no_tree_mean']} "
+              f"(n={c['build_s_no_tree_n']})")
         print(f"  bic_fit_failures   : {c['bic_fit_failures']}")
         print(f"  gmm_final_failures : {c['gmm_final_fit_failures']}")
         if c["trip_pct"] > 20:
