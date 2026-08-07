@@ -34,6 +34,7 @@ from ..retrievers.m6_hipporag import HippoRAGSystem
 from ..retrievers.m7_three_axis import ThreeAxisSystem
 from ..retrievers.m9_corrective import CorrectiveRAGSystem
 from .base import BenchmarkRunner
+from .hotpotqa import HotpotQABenchmark, HotpotQAPooledBenchmark
 from .multihop import MultiHopBenchmark
 from .narrativeqa import NarrativeQABenchmark
 from .qasper import QasperBenchmark
@@ -55,6 +56,13 @@ BENCHMARK_REGISTRY: dict[str, type] = {
     "multihop_rag": MultiHopBenchmark,
     "quality": QualityBenchmark,
     "narrativeqa": NarrativeQABenchmark,
+    # HotpotQA ships as TWO benchmarks, not one flag: variant A is the
+    # comparable headline, variant B is where a hierarchy exists. They
+    # produce different corpora and different unit counts, so a shared
+    # entry with a mode switch would make every downstream table
+    # ambiguous about which was run.
+    "hotpotqa": HotpotQABenchmark,
+    "hotpotqa_pooled": HotpotQAPooledBenchmark,
 }
 
 
@@ -91,7 +99,10 @@ def main() -> None:
         "--benchmark",
         required=True,
         choices=sorted(BENCHMARK_REGISTRY),
-        help="Benchmark id (qasper, multihop_rag, quality, narrativeqa).",
+        help="Benchmark id. hotpotqa = standard distractor (one corpus "
+        "per question; M4 has NO TREE there and its rows are not a RAPTOR "
+        "result). hotpotqa_pooled = shards of 100 questions (a real tree, "
+        "but NOT comparable to published HotpotQA).",
     )
     parser.add_argument(
         "--split",

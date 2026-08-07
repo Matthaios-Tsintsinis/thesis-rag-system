@@ -51,7 +51,7 @@ WHAT IT MEASURES
 
 USAGE (Colab, after `pip install -r requirements.txt` and Drive mount):
 
-    python -m scripts.probe_costs --out /content/probes
+    python -m scripts.probe_costs      # writes to <OUTPUT_DIR>/probes
 
 Add --skip m9 (etc.) to run a subset. Total ~15-20 min on an L4.
 """
@@ -278,7 +278,8 @@ def probe_crash_band(out_dir: Path, n_corpora: int, per_corpus: int) -> dict:
              "gmm_final_fit_failures": 0, "recluster_guard_trips": 0,
              "no_progress_trips": 0, "corpora_with_any_trip": 0,
              "leaves": [], "build_s": [], "build_s_tree": [],
-             "build_s_no_tree": [], "first_build_s": None}
+             "build_s_no_tree": [], "first_build_s": None,
+             "per_corpus": []}
     for c in range(n_corpora):
         block = paras[c * per_corpus:(c + 1) * per_corpus]
         items = [
@@ -308,6 +309,7 @@ def probe_crash_band(out_dir: Path, n_corpora: int, per_corpus: int) -> dict:
         # and the two populations are not one distribution.
         if stats["first_build_s"] is None:
             stats["first_build_s"] = build_s
+        stats["per_corpus"].append(build_s)
         stats["build_s"].append(build_s)
         (stats["build_s_no_tree"] if st.get("degenerate_no_tree")
          else stats["build_s_tree"]).append(build_s)
@@ -335,6 +337,7 @@ def probe_crash_band(out_dir: Path, n_corpora: int, per_corpus: int) -> dict:
     # and must not be amortised into a per-build figure. A max anywhere
     # else is real tail variance, which at 5,000 builds dominates.
     first = stats.pop("first_build_s")
+    per_corpus = stats.pop("per_corpus")
     for key in ("build_s", "build_s_tree", "build_s_no_tree"):
         vals = sorted(stats.pop(key))
         n = len(vals)
@@ -344,6 +347,11 @@ def probe_crash_band(out_dir: Path, n_corpora: int, per_corpus: int) -> dict:
         stats[f"{key}_p95"] = round(vals[min(n - 1, int(0.95 * n))], 3) if n else None
         stats[f"{key}_max"] = round(vals[-1], 3) if n else None
     stats["first_build_s"] = round(first, 3) if first is not None else None
+    # PER-CORPUS, IN ORDER. A mean and a max cannot distinguish a cold
+    # start from real tail variance, and those need opposite forecasting
+    # treatment at 5,000 builds. The full series is small and settles it
+    # without a re-run.
+    stats["build_s_series"] = [round(v, 3) for v in per_corpus]
     stats["max_was_first_corpus"] = (
         first is not None and abs(first - (stats["build_s_max"] or 0)) < 1e-6
     )
@@ -554,7 +562,15 @@ def probe_depth_curve(out_dir: Path, trials: int) -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--out", type=Path, required=True)
+        # DRIVE-BACKED BY DEFAULT. A runtime restart has now destroyed probe
+    # output twice, because /content is ephemeral. paths.output_dir()
+    # resolves to Drive when it is mounted and falls back to local only
+    # when it is not, so the default survives a restart wherever it can.
+    ap.add_argument(
+        "--out", type=Path, default=None,
+        help="Where to write probe artifacts. Default: "
+             "<OUTPUT_DIR>/probes, which is Drive-backed when mounted. "
+             "Pass an explicit path only if you accept losing it.")
     ap.add_argument("--m1-queries", type=int, default=200)
     ap.add_argument("--m1-batch-size", type=int, default=32)
     ap.add_argument("--m1-padded-tokens", type=int, default=20000)
@@ -568,6 +584,12 @@ def main() -> None:
     ap.add_argument("--skip", nargs="*", default=["m9"],
                     choices=["m1", "build", "m9", "crash_band", "depth_curve"])
     args = ap.parse_args()
+    if args.out is None:
+        from src import paths
+
+        args.out = paths.output_dir() / "probes"
+        print(f"[probe] writing to {args.out} (Drive-backed if mounted; "
+              "a runtime restart has destroyed /content output twice)")
     args.out.mkdir(parents=True, exist_ok=True)
 
     report: dict = {}
