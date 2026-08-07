@@ -280,6 +280,18 @@ def main() -> None:
     system_cls = SYSTEM_REGISTRY[args.system]
     system: BaseSystem = system_cls(config=harness_cfg)
 
+    # BENCHMARK FIRST, AND PREFLIGHT BEFORE PREWARM. A HotpotQA run once
+    # died on an unresolvable dataset id at the first iter_eval_units
+    # call -- after --prewarm had already pulled 15 GB of Qwen into VRAM.
+    # Cheap preconditions get checked before expensive ones are paid.
+    # `preflight` is optional: a benchmark without one is simply not
+    # checked, and any benchmark can add the same two-second guard.
+    benchmark_cls = BENCHMARK_REGISTRY[args.benchmark]
+    benchmark = benchmark_cls()
+    preflight = getattr(benchmark, "preflight", None)
+    if callable(preflight):
+        preflight()
+
     load_s = None
     if args.prewarm:
         t_load = time.perf_counter()
@@ -291,9 +303,6 @@ def main() -> None:
         load_s = time.perf_counter() - t_load
         print(f"[eval] prewarm: generator resident in {load_s:.1f}s "
               "(EXCLUDED from the timings below)")
-
-    benchmark_cls = BENCHMARK_REGISTRY[args.benchmark]
-    benchmark = benchmark_cls()
 
     runner = BenchmarkRunner(
         output_path=args.output,

@@ -82,9 +82,20 @@ from .types import (
 )
 
 
-HF_REPO = "hotpot_qa"
+# NAMESPACED REPO ID, and both halves of this matter.
+#
+# `hotpot_qa` (bare) is the legacy name and modern huggingface_hub
+# REJECTS it: "Repository id must be 'namespace/name'". That was the
+# first failure.
+#
+# DO NOT PIN AN OLDER REVISION to work around anything here. The repo was
+# converted to Parquet in early 2025; before that it was loader-script
+# based and the script fetched from curtis.ml.cmu.edu, which has been
+# OFFLINE SINCE MAY 2025. A script-era revision therefore cannot load at
+# all, with or without the right repo id — the Parquet conversion is what
+# makes this dataset usable, so track the default revision.
+HF_REPO = "hotpotqa/hotpot_qa"
 HF_CONFIG = "distractor"
-HF_REVISION = "refs/convert/parquet"
 
 # HotpotQA ships train + validation; the test labels are not public, so
 # `validation` is the only usable split and both harness split names map
@@ -210,18 +221,52 @@ class HotpotQABenchmark:
             "n_distinct_titles": 0,
         }
 
+    # --- preflight -------------------------------------------------------
+
+    def preflight(self) -> None:
+        """Resolve the dataset BEFORE anything expensive is loaded.
+
+        The bare-repo-id failure surfaced at the first `iter_eval_units`
+        call — AFTER `--prewarm` had already pulled 15 GB of Qwen into
+        VRAM. A two-second metadata check would have failed in two
+        seconds instead of two minutes. Same class as the API-key guard:
+        validate the cheap precondition before paying the expensive one.
+
+        Deliberately a METADATA call, not a load. It resolves the repo id
+        and confirms the config exists, which is exactly the pair of
+        things that were wrong, without downloading rows.
+        """
+        from datasets import get_dataset_config_names
+
+        try:
+            configs = get_dataset_config_names(HF_REPO)
+        except Exception as e:
+            raise RuntimeError(
+                f"HotpotQA preflight FAILED: cannot resolve dataset "
+                f"{HF_REPO!r} ({type(e).__name__}: {e}). "
+                "The repo id must be namespace/name — the bare legacy name "
+                "'hotpot_qa' is rejected by modern huggingface_hub. Do NOT "
+                "pin an older revision as a workaround: pre-2025 revisions "
+                "are loader-script based and fetch from curtis.ml.cmu.edu, "
+                "which is offline."
+            ) from e
+        if HF_CONFIG not in configs:
+            raise RuntimeError(
+                f"HotpotQA preflight FAILED: config {HF_CONFIG!r} not in "
+                f"{sorted(configs)} for {HF_REPO!r}."
+            )
+        print(f"[hotpotqa/{self.variant}] preflight OK: {HF_REPO} "
+              f"config={HF_CONFIG}")
+
     # --- loading ---------------------------------------------------------
 
     def _load(self) -> Any:
         if self._rows is None:
             from datasets import load_dataset
 
-            try:
-                ds = load_dataset(
-                    HF_REPO, HF_CONFIG, revision=HF_REVISION, split=_HF_SPLIT)
-            except Exception:
-                # Branch absent (native-parquet repo) — default revision.
-                ds = load_dataset(HF_REPO, HF_CONFIG, split=_HF_SPLIT)
+            # Native Parquet: the default revision is the right one, and
+            # refs/convert/parquet does not apply (see the HF_REPO note).
+            ds = load_dataset(HF_REPO, HF_CONFIG, split=_HF_SPLIT)
             if self.max_questions is not None:
                 ds = ds.select(range(min(self.max_questions, len(ds))))
             self._rows = ds

@@ -202,6 +202,48 @@ class TestRunnerMain(_CliCase):
         with self.assertRaises(SystemExit):
             self._run("--max-new-tokens", "0")
 
+    def test_preflight_runs_before_the_generator_is_loaded(self):
+        """Cheap preconditions before expensive ones.
+
+        A HotpotQA run died on an unresolvable dataset id at the first
+        iter_eval_units call -- AFTER --prewarm had pulled 15 GB of Qwen
+        into VRAM. A two-second metadata check would have failed in two
+        seconds. This pins the ORDER, because a later refactor that moves
+        benchmark construction back below prewarm would silently restore
+        the two-minute failure.
+        """
+        order: list[str] = []
+
+        class _Preflighting(_TinyBenchmark):
+            def preflight(self):
+                order.append("preflight")
+
+        def _fake_load(*a, **kw):
+            order.append("load_generator")
+            return (None, None)
+
+        with mock.patch.dict(runner_mod.BENCHMARK_REGISTRY,
+                             {"tiny": _Preflighting}), \
+                mock.patch("src.models.load_generator", _fake_load):
+            self._run("--prewarm")
+
+        self.assertEqual(order, ["preflight", "load_generator"])
+
+    def test_a_failing_preflight_aborts_before_anything_expensive(self):
+        class _Doomed(_TinyBenchmark):
+            def preflight(self):
+                raise RuntimeError("dataset id unresolvable")
+
+        with mock.patch.dict(runner_mod.BENCHMARK_REGISTRY, {"tiny": _Doomed}):
+            with self.assertRaises(RuntimeError):
+                self._run()
+
+    def test_a_benchmark_without_preflight_still_runs(self):
+        """The hook is optional: benchmarks that have not added one are
+        simply not checked, never broken."""
+        self.assertFalse(hasattr(_TinyBenchmark, "preflight"))
+        self.assertTrue(self._run().exists())
+
 
 class TestAnalyseMain(_CliCase):
     def test_analyse_main_reads_the_runner_output(self):
