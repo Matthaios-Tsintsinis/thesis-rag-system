@@ -38,7 +38,23 @@ WHAT IT MEASURES
   3. M9 vs M2 on identical queries. SKIPPED BY DEFAULT -- kept only
      because it is nearly free to re-enable with --skip (nothing).
 
-  4. THE GMM CRASH BAND at variant-A corpus shape, and the one that
+  4. RETIRED 2026-08-06 — THE GMM CRASH BAND PROBE IS DELETED.
+
+     It asked whether the GMM guard holds on 12-30 leaf corpora. That
+     question is still live (HotpotQA variant A builds 15-20 leaf
+     corpora), but a synthetic fixture is the wrong instrument and
+     MISLED TWICE: its paragraph size was taken from an ASSUMED ~70
+     tokens, the same assumption the prediction came from, so it could
+     only ever agree. Real paragraphs are 127.7 tokens.
+
+     The matrix answers it better, on real data: 1,000 variant-A builds
+     with the guard in place and `m4_bic_fit_failures` carried per row
+     into the results table. Removing the instrument is safer than
+     trusting a third version of it.
+
+     Historic description follows.
+
+     ~~THE GMM CRASH BAND at variant-A corpus shape, and the one that
      matters most now. HotpotQA variant A builds ~10-paragraph corpora,
      i.e. ~10-14 leaves, which is inside the 12-30 band where the BIC
      sweep was MEASURED to raise -- and it is about to do that a
@@ -47,7 +63,7 @@ WHAT IT MEASURES
      REAL corpora through the REAL M4 path and reports the guard trip
      rate and the no-tree rate. The failure is data-dependent and
      non-monotone in n, so passing at one size proves nothing about
-     another.
+     another.~~
 
 USAGE (Colab, after `pip install -r requirements.txt` and Drive mount):
 
@@ -223,146 +239,6 @@ def probe_m9(out_dir: Path, n: int) -> dict:
         "ratio": round(m9["s_per_query"] / m2["s_per_query"], 2),
         "n_queries": m2["n_queries_scored"],
     }
-
-
-# --- probe 4: the GMM crash band, at variant-A corpus shape ---------------
-
-
-def probe_crash_band(out_dir: Path, n_corpora: int, per_corpus: int) -> dict:
-    """Build many TINY real corpora and count guard trips.
-
-    WHY THE QASPER BUILD PROBE DOES NOT ANSWER THIS. A QASPER paper is
-    ~50+ chunks, comfortably above the 12-30 leaf band where the BIC
-    sweep was measured to raise. HotpotQA variant A is ~10 paragraphs
-    per question, i.e. ~10-14 leaves — squarely inside it, and about to
-    be built a thousand times over. So the crash band needs its own
-    probe at the right SHAPE, with real text and real embeddings,
-    because the failure is data-dependent and non-monotone in n: passing
-    at one size proves nothing about another.
-
-    Text comes from the MultiHop corpus (already cached) chopped into
-    paragraph-sized items, which is the closest available stand-in for
-    HotpotQA's Wikipedia intros. This runs the REAL M4 index path, so
-    what it reports is what a variant-A run will do.
-
-    Reports, per corpus: whether a tree formed at all, and the guard
-    trip counters. A high no-tree rate is expected and is a documented
-    structural property; a high trip rate is a FINDING about the
-    clustering, and either way it is better known before a thousand
-    builds than after.
-    """
-    from src.eval.multihop import MultiHopBenchmark
-    from src.eval.types import CorpusItem
-    from src.retrievers.m4_raptor import RaptorSystem
-
-    unit = next(iter(MultiHopBenchmark().iter_eval_units(
-        split="validation", max_units=1)))
-    # Chop article bodies into ~70-token paragraph-sized items, matching
-    # HotpotQA's intro-paragraph scale rather than MultiHop's articles.
-    paras: list[str] = []
-    for item in unit.corpus:
-        words = (item.text or "").split()
-        for i in range(0, len(words), 55):
-            chunk = " ".join(words[i:i + 55])
-            if len(chunk.split()) >= 30:
-                paras.append(chunk)
-        if len(paras) >= n_corpora * per_corpus:
-            break
-    if len(paras) < n_corpora * per_corpus:
-        raise ProbeFailure(
-            f"crash_band: only {len(paras)} paragraphs available for "
-            f"{n_corpora}x{per_corpus}"
-        )
-
-    stats = {"n_corpora": 0, "no_tree": 0, "bic_fit_failures": 0,
-             "gmm_final_fit_failures": 0, "recluster_guard_trips": 0,
-             "no_progress_trips": 0, "corpora_with_any_trip": 0,
-             "leaves": [], "build_s": [], "build_s_tree": [],
-             "build_s_no_tree": [], "first_build_s": None,
-             "per_corpus": []}
-    for c in range(n_corpora):
-        block = paras[c * per_corpus:(c + 1) * per_corpus]
-        items = [
-            CorpusItem(item_id=f"p{c}_{j}", parent_id=f"p{c}_{j}",
-                       span_id="<whole>", text=t)
-            for j, t in enumerate(block)
-        ]
-        sysm = RaptorSystem()
-        t0 = time.perf_counter()
-        try:
-            sysm.index_items(items)
-        except Exception as e:
-            raise ProbeFailure(
-                f"crash_band: corpus {c} RAISED {type(e).__name__}: {e}. "
-                "The guard did not hold — do NOT run a thousand of these."
-            ) from e
-        build_s = time.perf_counter() - t0
-        st = sysm.index_stats
-        stats["n_corpora"] += 1
-        # THE POINT OF TIMING HERE. Variant A's per-build cost was
-        # extrapolated from QASPER's measured 19.59 s by arguing that
-        # both dominant terms -- summary calls and the BIC sweep -- scale
-        # with leaf count, giving ~2-3 s at ~12 leaves. This is the same
-        # corpus shape through the same code path, so it replaces that
-        # extrapolation with a measurement. Split by whether a tree
-        # formed, because a no-tree build skips summarisation entirely
-        # and the two populations are not one distribution.
-        if stats["first_build_s"] is None:
-            stats["first_build_s"] = build_s
-        stats["per_corpus"].append(build_s)
-        stats["build_s"].append(build_s)
-        (stats["build_s_no_tree"] if st.get("degenerate_no_tree")
-         else stats["build_s_tree"]).append(build_s)
-        stats["leaves"].append(int(st.get("n_leaves", 0)))
-        tripped = False
-        for key in ("bic_fit_failures", "gmm_final_fit_failures",
-                    "recluster_guard_trips", "no_progress_trips"):
-            v = int(st.get(key, 0))
-            stats[key] += v
-            tripped = tripped or v > 0
-        if st.get("degenerate_no_tree"):
-            stats["no_tree"] += 1
-        if tripped:
-            stats["corpora_with_any_trip"] += 1
-
-    leaves = stats.pop("leaves")
-    stats["mean_leaves"] = round(sum(leaves) / max(1, len(leaves)), 1)
-    stats["min_leaves"], stats["max_leaves"] = min(leaves), max(leaves)
-    # MEAN IS THE WRONG STATISTIC HERE and the first run proved it: 0.85 s
-    # mean with a 31.43 s max over 40 samples means one corpus carried
-    # ~92% of the total. Report the MEDIAN and p95 as well, and record
-    # whether the max landed on corpus 0 -- a first-corpus max is a cold
-    # start (the mpnet embedder loads on the first index_items call and
-    # is lru_cached thereafter), which happens ONCE across 5,000 builds
-    # and must not be amortised into a per-build figure. A max anywhere
-    # else is real tail variance, which at 5,000 builds dominates.
-    first = stats.pop("first_build_s")
-    per_corpus = stats.pop("per_corpus")
-    for key in ("build_s", "build_s_tree", "build_s_no_tree"):
-        vals = sorted(stats.pop(key))
-        n = len(vals)
-        stats[f"{key}_n"] = n
-        stats[f"{key}_mean"] = round(sum(vals) / n, 3) if n else None
-        stats[f"{key}_median"] = round(vals[n // 2], 3) if n else None
-        stats[f"{key}_p95"] = round(vals[min(n - 1, int(0.95 * n))], 3) if n else None
-        stats[f"{key}_max"] = round(vals[-1], 3) if n else None
-    stats["first_build_s"] = round(first, 3) if first is not None else None
-    # PER-CORPUS, IN ORDER. A mean and a max cannot distinguish a cold
-    # start from real tail variance, and those need opposite forecasting
-    # treatment at 5,000 builds. The full series is small and settles it
-    # without a re-run.
-    stats["build_s_series"] = [round(v, 3) for v in per_corpus]
-    stats["max_was_first_corpus"] = (
-        first is not None and abs(first - (stats["build_s_max"] or 0)) < 1e-6
-    )
-    if stats["max_was_first_corpus"]:
-        stats["build_s_mean_excluding_first"] = round(
-            (stats["build_s_mean"] * stats["build_s_n"] - first)
-            / max(1, stats["build_s_n"] - 1), 3)
-    stats["no_tree_pct"] = round(100 * stats["no_tree"] / max(1, stats["n_corpora"]), 1)
-    stats["trip_pct"] = round(
-        100 * stats["corpora_with_any_trip"] / max(1, stats["n_corpora"]), 1)
-    return stats
 
 
 # --- probe 5: the depth curve, the decisive test of the 74-leaf threshold -
@@ -582,7 +458,7 @@ def main() -> None:
     # m9 skipped by DEFAULT as of 2026-08-05: the budget constraint was
     # lifted, so +-6 units is noise and the probe is not worth the GPU.
     ap.add_argument("--skip", nargs="*", default=["m9"],
-                    choices=["m1", "build", "m9", "crash_band", "depth_curve"])
+                    choices=["m1", "build", "m9", "depth_curve"])
     args = ap.parse_args()
     if args.out is None:
         from src import paths
@@ -599,8 +475,6 @@ def main() -> None:
                                 args.m1_batch_size, args.m1_padded_tokens)),
         ("build", lambda: probe_build(args.out, args.build_units)),
         ("m9", lambda: probe_m9(args.out, args.m9_queries)),
-        ("crash_band", lambda: probe_crash_band(
-            args.out, args.crash_corpora, args.crash_per_corpus)),
         ("depth_curve", lambda: probe_depth_curve(args.out, args.depth_trials)),
     ]:
         if name in args.skip:
@@ -636,38 +510,6 @@ def main() -> None:
             print(f"  note: {r['answers_changed_pct']}% of answers differ "
                   "between batched and sequential (expected; batch "
                   "composition can move argmax on near-ties)")
-
-    if "crash_band" in report:
-        c = report["crash_band"]
-        print("")
-        print(f"crash band: {c['n_corpora']} corpora, "
-              f"{c['min_leaves']}-{c['max_leaves']} leaves "
-              f"(mean {c['mean_leaves']})")
-        print(f"  no tree            : {c['no_tree']} ({c['no_tree_pct']}%)"
-              "   <- structural, expected for <=11 leaves")
-        print(f"  any guard trip     : {c['corpora_with_any_trip']} "
-              f"({c['trip_pct']}%)")
-        print(f"  build s/corpus     : {c['build_s_median']} MEDIAN, "
-              f"{c['build_s_p95']} p95, {c['build_s_max']} max "
-              f"({c['build_s_mean']} mean)")
-        if c.get("max_was_first_corpus"):
-            print(f"    -> the max WAS the first corpus ({c['first_build_s']} s) "
-                  "= cold start, paid ONCE. Use "
-                  f"{c.get('build_s_mean_excluding_first')} s/build.")
-        else:
-            print("    -> the max was NOT the first corpus: REAL TAIL "
-                  "VARIANCE, and at 5,000 builds the tail dominates. Do not "
-                  "forecast from the mean.")
-        print(f"    with a tree      : {c['build_s_tree_mean']} "
-              f"(n={c['build_s_tree_n']})")
-        print(f"    no tree          : {c['build_s_no_tree_mean']} "
-              f"(n={c['build_s_no_tree_n']})")
-        print(f"  bic_fit_failures   : {c['bic_fit_failures']}")
-        print(f"  gmm_final_failures : {c['gmm_final_fit_failures']}")
-        if c["trip_pct"] > 20:
-            print("  *** the guard is carrying a large fraction of these "
-                  "builds. Report the rate as a finding about the "
-                  "clustering, not as noise. ***")
 
     (args.out / "probe_report.json").write_text(
         json.dumps({"report": report, "failures": failures}, indent=2)

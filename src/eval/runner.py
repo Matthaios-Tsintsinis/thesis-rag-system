@@ -249,6 +249,27 @@ def main() -> None:
         args.output = out_root / (
             f"{args.benchmark}_{args.system}_{args.split}{suffix}_{stamp}.jsonl"
         )
+    elif not args.output.is_absolute():
+        # A RELATIVE --output resolves against the CURRENT DIRECTORY, not
+        # against OUTPUT_DIR. On Colab that is the cloned repo under
+        # /content, which a runtime restart DELETES.
+        #
+        # Worse than losing the file: `--resume` reads the JSONL at this
+        # path to decide what to skip, and when the file is gone it finds
+        # nothing and opens in "w" mode. A resume aimed at a vanished
+        # path therefore TRUNCATES and silently restarts from zero, which
+        # is exactly the situation resume exists to prevent.
+        resolved = args.output.resolve()
+        print(
+            "[eval] *** WARNING: --output is a RELATIVE path. It resolves "
+            f"to {resolved}\n"
+            "    which is NOT under OUTPUT_DIR and is EPHEMERAL on Colab "
+            "(a runtime restart deletes /content).\n"
+            f"    Drive-backed location would be: "
+            f"{paths.output_dir() / args.output}\n"
+            "    Pass an ABSOLUTE path for anything you intend to keep, "
+            "especially matrix cells you may need to --resume. ***"
+        )
 
     print(
         f"[eval] {args.system} x {args.benchmark} x {args.split} -> {args.output}"
