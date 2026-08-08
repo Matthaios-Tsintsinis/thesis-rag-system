@@ -100,6 +100,50 @@ def _safe_stats(xs: list[float]) -> dict[str, float | int]:
     }
 
 
+def _m9_discrimination(bucket: dict) -> dict[str, Any] | None:
+    """Does M9's action label actually track retrieval quality?
+
+    The pre-registered transfer check compares the realised action MIX
+    against the derivation-time mix, but the mix alone is not diagnostic:
+    corpus difficulty and miscalibration produce the identical signature.
+    This reports the two things that ARE diagnostic.
+
+    DISCRIMINATION — Cohen's d between CORRECT and AMBIGUOUS on
+    retrieval F1, over ANSWERABLE queries only. Large d means the
+    evaluator is tracking relevance and a mix shift is corpus difficulty.
+    Small d means the threshold sits at an arbitrary point.
+
+    ANSWERABILITY — the AMBIGUOUS rate among NULL (no-gold) queries
+    against the rate among answerable ones. These are DIFFERENT
+    abilities, and MultiHop separates them starkly: the evaluator put
+    99% of no-gold queries in AMBIGUOUS while barely separating retrieval
+    quality among the rest. An evaluator can be good at "nothing here"
+    and useless at "how good is this".
+    """
+    by_action = bucket.get("m9_f1_by_action") or {}
+    correct, ambiguous = by_action.get("correct", []), by_action.get("ambiguous", [])
+    if len(correct) < 20 or len(ambiguous) < 20:
+        return None
+    mc, ma = statistics.mean(correct), statistics.mean(ambiguous)
+    sd = statistics.pstdev(correct + ambiguous) or 1e-9
+    d = (mc - ma) / sd
+    nulls = bucket.get("m9_null_by_action") or {}
+    n_null = sum(nulls.values())
+    n_ans = len(correct) + len(ambiguous)
+    return {
+        "n_answerable": n_ans,
+        "n_null": n_null,
+        "f1_correct": mc,
+        "f1_ambiguous": ma,
+        "delta_f1": mc - ma,
+        "cohens_d": d,
+        "discriminates": bool(d >= 0.2),
+        "ambiguous_rate_answerable": len(ambiguous) / n_ans,
+        "ambiguous_rate_null": (
+            nulls.get("ambiguous", 0) / n_null if n_null else None),
+    }
+
+
 def _non_leaf_summary(bucket: dict) -> dict[str, Any]:
     """Non-leaf share of retrieved units — the RAPTOR App. I gate.
 
@@ -175,6 +219,15 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
             "m9_max_conf": [],
             "m9_strips_kept": 0,
             "m9_strips_total": 0,
+            # DISCRIMINATION, per cell. The action MIX alone cannot
+            # distinguish corpus difficulty from miscalibration -- both
+            # predict more queries clearing tau_high. What separates them
+            # is whether the action still tracks retrieval quality. And
+            # the ANSWERABLE/NULL split is a second axis entirely: an
+            # evaluator can be excellent at "there is nothing here" while
+            # useless at ranking quality among queries that do have gold.
+            "m9_f1_by_action": defaultdict(list),
+            "m9_null_by_action": defaultdict(int),
             # Multiple-choice extraction stats (QuALITY; answer.metadata
             # "extraction" key). Per SYSTEM: one system landing
             # disproportionately in token_f1/unparseable means its
@@ -280,6 +333,11 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
                 bucket["m9_max_conf"].append(float(max_conf))
             bucket["m9_strips_kept"] += int(md.get("m9_n_strips_kept") or 0)
             bucket["m9_strips_total"] += int(md.get("m9_n_strips_total") or 0)
+            if retr.get("skipped"):
+                bucket["m9_null_by_action"][m9_action] += 1
+            else:
+                bucket["m9_f1_by_action"][m9_action].append(
+                    float(retr.get("f1", 0.0)))
 
         # M4 RAPTOR diagnostics (present only on M4 rows from commit 5 on).
         m4_share = md.get("m4_non_leaf_share")
@@ -312,6 +370,7 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
             "retrieved_unit_types": dict(b["retrieved_unit_types_agg"]),
             "packed_unit_types": dict(b["packed_unit_types_agg"]),
             "non_leaf": _non_leaf_summary(b),
+            "m9_discrimination": _m9_discrimination(b),
             "retr_f1_mean": (statistics.mean(b["retr_f1"]) if b["retr_f1"] else None),
             "retr_recall_mean": (
                 statistics.mean(b["retr_recall"]) if b["retr_recall"] else None
@@ -557,6 +616,40 @@ def _print_text(rollup: dict[str, Any], *, by_type: bool) -> None:
         print("  The pre-rebuild cells are STALE anyway - their substrate key "
               "moved. Stash them rather than reading both.")
         print("  See docs/FINDING_SHALLOW_HIERARCHY.md sections 0 and 7.")
+
+    # M9 DISCRIMINATION — printed for every M9 cell, not once. Whether
+    # the action label tracks retrieval quality is a property of the
+    # CORPUS, so MultiHop's answer does not generalise to NarrativeQA or
+    # HotpotQA and must be read per cell.
+    for sid in rollup["systems"]:
+        disc = rollup["systems"][sid].get("m9_discrimination")
+        if not disc:
+            continue
+        print("")
+        print(f"  --- {sid} corrective-action DISCRIMINATION ---")
+        print(f"  answerable n={disc['n_answerable']}  "
+              f"retr_f1 correct={disc['f1_correct']:.4f} "
+              f"ambiguous={disc['f1_ambiguous']:.4f}  "
+              f"delta={disc['delta_f1']:+.4f}  d={disc['cohens_d']:+.2f}")
+        if disc["discriminates"]:
+            print("  VERDICT: the action TRACKS retrieval quality (d >= 0.2). "
+                  "A mix shift here is corpus difficulty, and an M9-M3 delta "
+                  "may be read as detect-and-repair.")
+        else:
+            print("  VERDICT: the action does NOT track retrieval quality "
+                  "(d < 0.2). An M9-M3 delta on this cell CANNOT be "
+                  "attributed to detecting poor retrieval - only to running "
+                  "a second pass on a set selected by something else.")
+        if disc["ambiguous_rate_null"] is not None:
+            print(f"  ANSWERABILITY: ambiguous rate {disc['ambiguous_rate_null']:.1%} "
+                  f"on NULL (no-gold) queries vs "
+                  f"{disc['ambiguous_rate_answerable']:.1%} on answerable "
+                  f"(n_null={disc['n_null']})")
+            if disc["ambiguous_rate_null"] > 0.8:
+                print("  -> the evaluator IS discriminating, but on "
+                      "ANSWERABILITY rather than on retrieval quality. "
+                      "Those are different abilities and only the second "
+                      "is what CRAG's corrective step claims.")
 
     # Unit-type distribution (per-system).
     print("\n  --- retrieved unit-type distribution ---")
