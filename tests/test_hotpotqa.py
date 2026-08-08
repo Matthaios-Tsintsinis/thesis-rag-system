@@ -24,6 +24,7 @@ import unittest
 
 from src.chunking import Chunk
 from src.eval.hotpotqa import (
+    PREREGISTERED_Q,
     SUBSAMPLE_SEED,
     HotpotQABenchmark,
     HotpotQAPooledBenchmark,
@@ -220,6 +221,20 @@ class TestSeededSubsample(unittest.TestCase):
 
     def test_the_seed_matches_the_project_convention(self):
         self.assertEqual(SUBSAMPLE_SEED, 20260805)
+
+    def test_the_registered_sample_is_the_DEFAULT_not_a_flag(self):
+        """The runner constructs benchmarks with NO arguments. If the
+        subsample only fired when max_questions was passed, no real run
+        would ever subsample, and --max-units 1000 would silently take
+        the first 1,000 of 7,405 — the head slice the seeding exists to
+        avoid, reintroduced through a different door."""
+        for cls in (HotpotQABenchmark, HotpotQAPooledBenchmark):
+            with self.subTest(cls=cls.__name__):
+                self.assertEqual(cls().max_questions, PREREGISTERED_Q)
+        self.assertEqual(PREREGISTERED_Q, 1000)
+
+    def test_the_full_split_is_still_reachable_explicitly(self):
+        self.assertIsNone(HotpotQABenchmark(max_questions=None).max_questions)
 
 
 class TestTitleProjection(unittest.TestCase):

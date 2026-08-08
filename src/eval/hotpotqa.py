@@ -137,6 +137,22 @@ SHARD_QUESTIONS = 100
 # sample alone, not of the order `sample()` happened to emit.
 SUBSAMPLE_SEED = 20260805
 
+# THE PRE-REGISTERED SAMPLE SIZE, as a DEFAULT rather than a CLI flag.
+#
+# The runner constructs benchmarks with no arguments, so a subsample that
+# only happens when `max_questions` is passed would never happen in a
+# real run -- and `--max-units 1000` would silently take the FIRST 1,000
+# of 7,405 rows, which is precisely the head slice the seeding exists to
+# avoid. Defaulting here makes the registered sample the thing you get
+# unless you deliberately ask for otherwise.
+#
+# `--max-units` remains a separate GATE knob: it caps units WITHIN the
+# subsample, so `--max-units 2` is a two-question smoke of the registered
+# sample rather than a different sample.
+#
+# Pass max_questions=None explicitly for the full 7,405-question split.
+PREREGISTERED_Q = 1000
+
 # Rank-aware K grid. HotpotQA has exactly 2 gold paragraphs, so Hit@2 is
 # the directly interpretable "did it find both", and MAP@10 is
 # comparable in shape to what MultiHop reports.
@@ -252,7 +268,7 @@ class HotpotQABenchmark:
     name = "hotpotqa"
     variant = "distractor"
 
-    def __init__(self, max_questions: int | None = None) -> None:
+    def __init__(self, max_questions: int | None = PREREGISTERED_Q) -> None:
         self._rows: Any = None
         self.max_questions = max_questions
         self.stats: dict[str, Any] = {
@@ -490,7 +506,7 @@ class HotpotQAPooledBenchmark(HotpotQABenchmark):
 
     def __init__(
         self,
-        max_questions: int | None = None,
+        max_questions: int | None = PREREGISTERED_Q,
         shard_questions: int = SHARD_QUESTIONS,
     ) -> None:
         super().__init__(max_questions=max_questions)
@@ -554,6 +570,7 @@ __all__ = [
     "HotpotQAPooledBenchmark",
     "SHARD_QUESTIONS",
     "SUBSAMPLE_SEED",
+    "PREREGISTERED_Q",
     "RANK_K_VALUES",
     "subsample_indices",
 ]
