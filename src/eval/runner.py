@@ -187,6 +187,28 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--generator",
+        type=str,
+        default=None,
+        help=(
+            "Run this cell under a DIFFERENT model. Sets the READER "
+            "(HarnessConfig.generation.model) AND the INDEX-TIME "
+            "SUMMARISER (M4/M7 summary_model) together, because the "
+            "matrix design is FULL INDEPENDENT REPLICATION: each column "
+            "builds its own trees with its own summariser and reads them "
+            "with the same model. "
+            "Rebinding src.config.GENERATOR_MODEL or JUDGE_MODEL "
+            "in-process does NOT work -- both are dataclass field "
+            "defaults evaluated once at class-definition time. "
+            "VERIFIED: changing this moves M4's and M7's substrate cache "
+            "keys, so a Llama cell cannot silently hit a Qwen tree. "
+            "M2/M3/M9 keys do NOT move, which is CORRECT -- their "
+            "substrate contains no LLM output, so it is a "
+            "model-independent artifact and rebuilding it would produce "
+            "byte-identical files."
+        ),
+    )
+    parser.add_argument(
         "--prewarm",
         action="store_true",
         help=(
@@ -283,6 +305,29 @@ def main() -> None:
     # other constant in src/config.py is baked into a dataclass field
     # default at import and a rebind is silently ignored.
     harness_cfg = HarnessConfig()
+    if args.generator is not None:
+        # READER AND SUMMARISER TOGETHER. The matrix is a full
+        # independent replication: each column builds its own trees with
+        # its own summariser and reads them with the same model. Setting
+        # only the reader would produce a column whose trees came from
+        # the other model, which is the confound this design exists to
+        # avoid on M1/M2/M3/M9 and cannot avoid on M4.
+        harness_cfg = replace(
+            harness_cfg,
+            generation=replace(harness_cfg.generation, model=args.generator),
+            m4=replace(harness_cfg.m4, summary_model=args.generator),
+            m7=replace(harness_cfg.m7, summary_model=args.generator),
+        )
+        print(
+            f"[eval] GENERATOR OVERRIDE: {args.generator}\n"
+            f"    reader           = {harness_cfg.generation.model}\n"
+            f"    index summariser = {harness_cfg.m4.summary_model}\n"
+            "    M4/M7 substrate cache keys MOVE with this, so this cell "
+            "builds its own trees and cannot hit the other column's.\n"
+            "    M2/M3/M9 keys do NOT move — their substrate has no LLM "
+            "in it, so a cache hit there reuses a model-INDEPENDENT "
+            "artifact, not the other column's work."
+        )
     if args.max_new_tokens is not None:
         if args.max_new_tokens < 1:
             parser.error("--max-new-tokens must be >= 1")
@@ -377,6 +422,11 @@ def main() -> None:
         # generator field is what keeps Qwen-era and gpt-4o-mini-era
         # numbers from ever conflating in one table.
         "generator": system.config.generation.model,
+        # The INDEX-TIME LLM, recorded separately from the reader. Under
+        # full independent replication they are the same model, but they
+        # are distinct roles and a row must say which model built the
+        # trees it read -- that is precisely the M4 confound.
+        "index_llm": system.config.m4.summary_model,
         "chunking_strategy": system.config.chunking.strategy,
         "evidence_budget": args.evidence_budget,
         # Recorded so a probe artifact is self-describing. The 1-token

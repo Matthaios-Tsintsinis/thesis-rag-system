@@ -45,17 +45,26 @@ RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
 # Measured on an L4: fp16, 15.2 GB after load, 0.52 req/s at 4k-in
 # batch 8 (batch 12 OOMs), 2.07 req/s at 800-in batch 32.
 #
-# A SECOND reader (Llama-3.1-8B-Instruct) is supported as a config value
-# and may run later as a separate pass. Under the pinned-summariser
-# design that pass would be a READER comparison — same retrieval, same
-# trees, different model reading them — NOT a generator comparison.
+# ⚠ THE READER-COMPARISON FRAMING IS DEAD (reversed 2026-08-06).
+# Llama-3.1-8B-Instruct now runs the FULL MATRIX as a second, wholly
+# INDEPENDENT replication: its own trees, its own summaries, its own
+# caches. Nothing model-dependent is shared with the Qwen column.
+# The consequence, stated rather than dropped: M4's two columns differ in
+# TWO variables (who summarised and who read), so an M4 Qwen-vs-Llama
+# difference cannot be attributed to either alone. M1/M2/M3/M9 have no
+# index-time LLM, so they are unconfounded. See
+# docs/PREREGISTRATION.md and the audit.
 GENERATOR_MODEL = "Qwen/Qwen2.5-7B-Instruct"
-# Index-time LLM (RAPTOR tree summaries; retired-M6 OpenIE). PINNED to
-# Qwen2.5-7B PERMANENTLY, and that pin is load-bearing rather than
-# incidental: it is in M4's substrate cache key, so M4's trees are always
-# built by this model and a later second-reader pass REUSES them instead
-# of forking a second tree set. That is what makes the later pass a
-# reader comparison and keeps every column varying exactly one thing.
+# Index-time LLM (RAPTOR tree summaries; retired-M6 OpenIE).
+#
+# ⚠ THE PERMANENT PIN IS REVERSED (2026-08-06). It read: pinned to
+# Qwen2.5-7B permanently, so a later second-reader pass would REUSE M4's
+# trees and vary exactly one thing. The design is now FULL INDEPENDENT
+# REPLICATION, so each column builds its own trees with its own
+# summariser. Set per run with `--generator`, which moves this AND the
+# reader together; it is in M4's substrate key, so the columns cannot
+# collide. The cost of the reversal is the M4 two-variable confound,
+# which is accepted and documented, not mitigated.
 #
 # KNOWN LIMITATION, recorded rather than mitigated: if this summariser's
 # output is systematically poor, M4 is handicapped identically in every
