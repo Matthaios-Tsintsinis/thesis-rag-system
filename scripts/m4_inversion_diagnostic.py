@@ -129,11 +129,51 @@ def main() -> int:
     print(f"\nevidence tokens: M4 {ev_m4:.0f} vs baseline {ev_b:.0f} "
           f"({ev_m4/max(1.0, ev_b):.0%} of baseline)  -> mechanism C's size")
 
+    # MECHANISM D, DECOMPOSED BY ANSWERABILITY. A raw abstention gap
+    # cannot say whether abstaining is CORRECT behaviour or a lost
+    # answer. On a null query, abstaining is the right answer and scores
+    # well; on an answerable one it is a forfeited point. If M4's answer
+    # advantage is concentrated in the nulls, D is the whole story and C
+    # is incidental. If it also holds on answerable queries, C is doing
+    # real work and the two must be reported separately.
     from src.eval.scorers import is_abstention
-    ab_m4 = sum(is_abstention(M[q].get("predicted_answer", "")) for q in shared)
-    ab_b = sum(is_abstention(B[q].get("predicted_answer", "")) for q in shared)
-    print(f"abstention: M4 {ab_m4/len(shared):.1%} vs baseline "
-          f"{ab_b/len(shared):.1%}  -> mechanism D")
+
+    nulls = [q for q in shared if (M[q].get("retrieval") or {}).get("skipped")]
+    answerable = [q for q in shared if q not in set(nulls)]
+    print(f"\nMECHANISM D, split by answerability "
+          f"(nulls {len(nulls)}, answerable {len(answerable)}):")
+    print(f"{'group':<12} {'n':>6} {'M4 abst':>9} {'base abst':>10} "
+          f"{'M4 ans':>8} {'base ans':>9} {'paired d':>9}")
+    print("-" * 68)
+    for label, qs in (("NULL", nulls), ("answerable", answerable),
+                      ("all", shared)):
+        if not qs:
+            continue
+        am = sum(is_abstention(M[q].get("predicted_answer", "")) for q in qs)
+        ab = sum(is_abstention(B[q].get("predicted_answer", "")) for q in qs)
+        print(f"{label:<12} {len(qs):>6} {am/len(qs):>8.1%} {ab/len(qs):>9.1%} "
+              f"{_mean([_ans(M[q]) for q in qs]):>8.4f} "
+              f"{_mean([_ans(B[q]) for q in qs]):>9.4f} "
+              f"{_mean(paired(qs)):>+9.4f}")
+
+    if nulls and answerable:
+        d_null, d_ans = _mean(paired(nulls)), _mean(paired(answerable))
+        share = (d_null * len(nulls)) / (
+            d_null * len(nulls) + d_ans * len(answerable)) if (
+            d_null * len(nulls) + d_ans * len(answerable)) else None
+        print()
+        if share is not None and share > 0.7:
+            print(f"  -> D DOMINATES: ~{share:.0%} of the total advantage "
+                  "comes from the NULL queries, where abstaining is the "
+                  "correct answer. C is incidental.")
+        elif d_ans > 0 and d_null > 0:
+            print("  -> BOTH LIVE: the advantage appears on answerable "
+                  "queries too, so it is not only abstention accounting. "
+                  "Report C and D separately.")
+        else:
+            print("  -> MIXED SIGNS: the advantage on one group offsets a "
+                  "deficit on the other. Report both; the pooled mean hides "
+                  "it.")
 
     print()
     if abs(gap) >= 0.2:

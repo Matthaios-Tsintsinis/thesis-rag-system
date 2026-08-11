@@ -82,7 +82,11 @@ from pathlib import Path
 import numpy as np
 
 
-SYSTEMS = ("M1", "M2", "M3", "M4", "M9")
+# ROSTER, 2026-08-06: M9 was removed from the matrix. A permanent
+# MISSING line for a system that will never be present is noise that
+# trains a reader to ignore the output, which is the opposite of what
+# a diagnostic is for. Pass --systems to override.
+SYSTEMS = ("M1", "M2", "M3", "M4")
 # QASPER and QuALITY are being dropped from the matrix, but their banked
 # cells are included deliberately: they are where the tightest orderings
 # were read off (QASPER 0.338-0.343, QuALITY 0.723-0.735 across four
@@ -95,7 +99,10 @@ SYSTEMS = ("M1", "M2", "M3", "M4", "M9")
 # test handles that correctly and degenerate-free — on binary paired
 # data it reduces to an exact McNemar test, which is the textbook-right
 # choice. A t-test on {-1,0,+1} would not be.
-BENCHMARKS = ("multihop_rag", "narrativeqa", "qasper", "quality")
+# QASPER and QuALITY are DROPPED from the suite; HotpotQA ships as two
+# benchmarks. Same reasoning as SYSTEMS: only enumerate what can exist.
+BENCHMARKS = ("multihop_rag", "narrativeqa", "hotpotqa",
+              "hotpotqa_pooled")
 METRICS = ("retrieval", "answer")
 
 N_BOOT = 10_000
@@ -106,11 +113,28 @@ SEED = 12345
 
 
 def _find(root: Path, benchmark: str, system: str, split: str) -> Path | None:
+    """Resolve a cell, newest naming convention FIRST.
+
+    THE MATRIX CONVENTION IS UNSTAMPED AND SPLIT-LESS: `{benchmark}_{system}
+    .jsonl`. Output names were fixed that way so a `--resume` re-run
+    overwrites cleanly instead of accumulating a new stamped file each
+    time. This resolver only knew the older gate-era patterns, so it found
+    NOTHING in the matrix directory and reported every cell MISSING.
+
+    Ordered newest-first so a matrix cell always wins over a stale gate
+    artifact sitting in the same directory.
+    """
+    matrix = root / f"{benchmark}_{system}.jsonl"
+    if matrix.exists():
+        return matrix
     exact = root / f"{benchmark}_{system}_{split}.jsonl"
     if exact.exists():
         return exact
     stamped = sorted(root.glob(f"{benchmark}_{system}_{split}_*.jsonl"))
-    return stamped[-1] if stamped else None
+    if stamped:
+        return stamped[-1]
+    loose = sorted(root.glob(f"{benchmark}_{system}_*.jsonl"))
+    return loose[-1] if loose else None
 
 
 def load_scores(path: Path) -> dict[str, dict[str, float]]:
@@ -200,6 +224,8 @@ def main() -> None:
     systems = [s.strip() for s in args.systems.split(",") if s.strip()]
     rng = np.random.default_rng(SEED)
 
+    n_cells_total = 0
+    n_pairs_total = 0
     for benchmark in BENCHMARKS:
         loaded: dict[str, dict] = {}
         for s in systems:
@@ -208,6 +234,7 @@ def main() -> None:
                 print(f"[{benchmark}] MISSING cell for {s} — pairs skipped")
                 continue
             loaded[s] = load_scores(p)
+        n_cells_total += len(loaded)
         if len(loaded) < 2:
             print(f"[{benchmark}] fewer than two cells present; skipping\n")
             continue
@@ -233,6 +260,7 @@ def main() -> None:
                       "(no gold evidence for this benchmark?)\n")
                 continue
 
+            n_pairs_total += len(rows)
             adj = holm([r["p"] for r in rows])
             for r, a_ in zip(rows, adj):
                 r["p_holm"] = a_
@@ -267,8 +295,31 @@ def main() -> None:
                 "at 80% power as a single pre-registered comparison."
             )
 
+    # THE VACUOUS PASS, again. Before this, a scan that found ZERO cells
+    # printed MISSING lines and then the tidy closing note below --
+    # explaining how to read Holm-adjusted verdicts, as though something
+    # had been tested. Nothing had. A diagnostic that tested nothing must
+    # exit non-zero and say so, or it trains the reader to skim past the
+    # one line that mattered.
+    if n_pairs_total == 0:
+        print(
+            f"\nNOTHING WAS TESTED. {n_cells_total} cells found, 0 pairs "
+            f"compared, under {root}."
+        )
+        print(
+            "  Matrix cells are named {benchmark}_{system}.jsonl - unstamped "
+            "and split-less. If this reports zero against a directory that "
+            "visibly contains cells, the resolver and the naming convention "
+            "have diverged again; check _find() before trusting any later "
+            "run."
+        )
+        raise SystemExit(2)
+
     print(
-        "\nNOTE: 'SUPPORTED' = Holm-adjusted permutation p < alpha AND the "
+        f"\n{n_cells_total} cells, {n_pairs_total} pairs tested."
+    )
+    print(
+        "NOTE: 'SUPPORTED' = Holm-adjusted permutation p < alpha AND the "
         "bootstrap CI excludes zero. 'marginal' = one of the two only. "
         "Retrieval deltas are generator-independent; answer deltas are "
         "gpt-4o-mini-era and must be re-measured under the local generators."

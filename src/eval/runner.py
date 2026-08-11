@@ -209,6 +209,27 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--expand-summary-nodes",
+        action="store_true",
+        help=(
+            "M4 DIAGNOSTIC TWIN. Replace each retrieved summary node with "
+            "its top-N descendant LEAVES, which DO carry gold_provenance, "
+            "so CK-2 can score them. Exists to quantify how much of M4's "
+            "retrieval deficit is a MEASUREMENT ARTIFACT: summary nodes "
+            "are unscoreable by construction, so a share of M4's returned "
+            "units cannot contribute to recall no matter how good they "
+            "are. Query-time only -- the substrate cache key does NOT "
+            "move, so the tree is reused rather than rebuilt. "
+            "NEVER A REPORTABLE M4 CELL: the evidence text becomes leaves, "
+            "so the answers are a different system's. Write it to a "
+            "separate directory; every row carries "
+            "metadata.m4_summary_expansion and analyse prints a banner. "
+            "Pair with --max-new-tokens 1: the twin exists for RETRIEVAL "
+            "scores, and retrieval is generator-independent, so paying for "
+            "full answers buys nothing."
+        ),
+    )
+    parser.add_argument(
         "--prewarm",
         action="store_true",
         help=(
@@ -328,6 +349,16 @@ def main() -> None:
             "in it, so a cache hit there reuses a model-INDEPENDENT "
             "artifact, not the other column's work."
         )
+    if args.expand_summary_nodes:
+        harness_cfg = replace(
+            harness_cfg,
+            m4=replace(harness_cfg.m4, expand_summary_nodes=True),
+        )
+        print("[eval] M4 LEAF-EXPANDED DIAGNOSTIC TWIN enabled.")
+        print("    Retrieval becomes CK-2-comparable to a leaf-only system.")
+        print("    Substrate key is UNMOVED, so the tree is reused.")
+        print("    *** NOT a reportable M4 cell - answers are a different "
+              "system's. Keep this out of the matrix directory. ***")
     if args.max_new_tokens is not None:
         if args.max_new_tokens < 1:
             parser.error("--max-new-tokens must be >= 1")
