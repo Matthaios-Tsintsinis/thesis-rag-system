@@ -61,10 +61,19 @@ VARIANT B — `hotpotqa_pooled` — pooled shards.
 #    not a system failure. RANK-AWARE AT TITLE LEVEL IS PRIMARY.
 #
 # 4. Gold is SENTENCE-LEVEL (ruling (ii)), for both variants. Each
-#    sentence is a CorpusItem under its title; M4's per-parent
+#    sentence is a CorpusItem under its title; the shared per-parent
 #    `index_items` reassembles the paragraph and derives provenance by
 #    char-span intersection, so a chunk spanning three sentences
 #    correctly carries three atoms.
+#
+#    THE RETRIEVAL UNIT IS THE PARAGRAPH FOR EVERY SYSTEM (2026-08-12).
+#    The per-parent layout was M4-local until it was promoted to
+#    BaseSystem; before that, M2/M3/M7/M9 indexed one SENTENCE per file
+#    and `walk_corpus(min_chars_per_doc=200)` dropped most of them
+#    (~124 chars each), which crashed M2 at unit 41 and M3 at unit 42.
+#    Recorded as a dated amendment in docs/PREREGISTRATION.md
+#    (ADDENDUM 4) because it is a benchmark-definition change; it landed
+#    before any HotpotQA cell was reported.
 #
 # 5. Dev split only — HotpotQA test labels are not public. Reported as
 #    a single-split asymmetry, the same one MultiHop carries.
@@ -185,10 +194,11 @@ def _sentence_items(context: Any) -> list[CorpusItem]:
 
     Sentence granularity is ruling (ii): HotpotQA's supporting facts are
     (title, sent_id) pairs, so anything coarser discards the annotation
-    the benchmark is distinctive for. M4's per-parent `index_items`
+    the benchmark is distinctive for. `BaseSystem.index_items`
     concatenates a title's sentences back into the paragraph before
     chunking, so nothing is fragmented at retrieval time — the fine
-    granularity buys provenance, not smaller chunks.
+    granularity buys provenance, not smaller chunks. That reassembly is
+    shared by every system as of 2026-08-12; see deviation 4.
     """
     titles = list(context["title"])
     sentence_lists = list(context["sentences"])
