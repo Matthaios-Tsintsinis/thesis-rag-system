@@ -73,12 +73,29 @@ def _chunk_doc_word_window(
     chunk_words: int,
     overlap_words: int,
 ) -> list[Chunk]:
+    """Fixed-size word window with overlap.
+
+    `start_char` / `end_char` land in `Chunk.metadata` — offsets into
+    `doc.text`, spanning from the first character of the window's first
+    word to the last character of its last word. `index_items` consumes
+    them to derive gold_provenance by span intersection when a parent
+    holds several CorpusItems; without them that path raises rather than
+    stamping empty provenance.
+
+    The chunk TEXT is unchanged by their addition, and deliberately so:
+    `re.finditer(r"\\S+")` yields exactly the sequence `str.split()`
+    yields (both split on whitespace runs and drop them), so the joined
+    window is byte-identical to what this function produced before, and
+    cached chunk sets stay valid. `Chunk.metadata` is not a cache-key
+    input, so nothing here moves a substrate hash.
+    """
     if chunk_words <= 0:
         raise ValueError("chunk_words must be positive")
     if overlap_words < 0 or overlap_words >= chunk_words:
         raise ValueError("overlap_words must be in [0, chunk_words)")
 
-    words = doc.text.split()
+    spans = [(m.start(), m.end()) for m in re.finditer(r"\S+", doc.text)]
+    words = [doc.text[a:b] for a, b in spans]
     if not words:
         return []
 
@@ -88,12 +105,17 @@ def _chunk_doc_word_window(
         window = words[start : start + chunk_words]
         if not window:
             break
+        last = min(start + chunk_words, len(words)) - 1
         chunks.append(Chunk(
             chunk_id=f"{doc.doc_id}::{position:04d}",
             doc_id=doc.doc_id,
             text=" ".join(window),
             n_words=len(window),
             position=position,
+            metadata={
+                "start_char": spans[start][0],
+                "end_char": spans[last][1],
+            },
         ))
         if start + chunk_words >= len(words):
             break
