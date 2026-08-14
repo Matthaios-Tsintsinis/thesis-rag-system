@@ -82,7 +82,12 @@ class _TinyBenchmark:
         )
         yield EvalUnit(corpus_id="tiny", corpus=corpus, queries=queries)
 
-    def score_retrieval(self, retrieved, query):
+    def score_retrieval(self, retrieved, query, scoring_ranking=None):
+        # P6: the Benchmark protocol takes the fixed-depth scoring
+        # ranking alongside the reader context. A stub that did not
+        # accept it would let the runner pass a protocol it does not
+        # implement, which is what this end-to-end test exists to catch.
+        self.saw_scoring_ranking = scoring_ranking is not None
         return RetrievalScore(skipped=False, recall=1.0, precision=1.0, f1=1.0,
                               n_gold=1, n_covered=1, n_retrieved_atoms=1)
 

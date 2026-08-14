@@ -59,6 +59,7 @@ class Benchmark(Protocol):
         self,
         retrieved: list[RetrievedChunk],
         query: EvalQuery,
+        scoring_ranking: list[RetrievedChunk] | None = None,
     ) -> RetrievalScore: ...
 
 
@@ -359,7 +360,11 @@ class BenchmarkRunner:
                     self._check_output_length(
                         ar.answer, q.query_id, system.config.generation.model
                     )
-                    retr = benchmark.score_retrieval(ar.retrieved, q)
+                    retr = benchmark.score_retrieval(
+                        ar.retrieved, q,
+                        scoring_ranking=getattr(
+                            ar, "scoring_ranking", None) or None,
+                    )
                     ans = benchmark.score_answer(ar.answer, q)
 
                     # CK-4: collect unit-type distributions for analysis.

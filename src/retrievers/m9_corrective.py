@@ -127,6 +127,7 @@ from ..components import (
     resolve_components,
 )
 from ..config import (
+    SCORING_RANKING_DEPTH,
     BASE_ANSWER_SYSTEM_PROMPT,
     DEFAULT_CONFIG,
     EVIDENCE_TOKEN_BUDGET_TOKENIZER,
@@ -436,7 +437,18 @@ class CorrectiveRAGSystem(BaseSystem):
         cfg = self.config.corrective
         t0 = self._now()
 
-        retrieved, meta = self._corrective_retrieve(query, k=k)
+        # ONE corrective pass, cut twice. The corrective DECISION reads a
+        # fixed natural top-15 pool and does not depend on k_final, which
+        # only sets the final cut after reranker ordering — so asking for
+        # a deeper cut returns the SAME branch's ranking, uncut. Calling
+        # the pipeline again for the scoring ranking would instead pay a
+        # second reranker pass and a second rewrite LLM call, and could
+        # land on a different branch if the rewrite were not bit-stable.
+        scoring_ranking, meta = self._corrective_retrieve(
+            query, k=SCORING_RANKING_DEPTH
+        )
+        k_reader = k or self.config.retrieval.top_k
+        retrieved = scoring_ranking[:k_reader]
 
         to_pack: list[RetrievedChunk] = retrieved
         if cfg.refine and retrieved:
@@ -478,6 +490,7 @@ class CorrectiveRAGSystem(BaseSystem):
             query=query,
             retrieved=retrieved,
             packed=packed,
+            scoring_ranking=scoring_ranking,
             system_prompt=BASE_ANSWER_SYSTEM_PROMPT,
             user_prompt=user_prompt,
             evidence_tokens=evidence_tokens,

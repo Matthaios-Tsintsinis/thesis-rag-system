@@ -92,7 +92,8 @@ class FakeBenchmark:
         )
         yield EvalUnit(corpus_id="unit0", corpus=corpus, queries=queries)
 
-    def score_retrieval(self, retrieved, query) -> RetrievalScore:
+    def score_retrieval(self, retrieved, query,
+                        scoring_ranking=None) -> RetrievalScore:
         return RetrievalScore(skipped=False, f1=float(len(retrieved)))
 
     def score_answer(self, predicted, query) -> AnswerScore:

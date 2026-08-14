@@ -382,6 +382,7 @@ class QasperBenchmark:
         self,
         retrieved: list[RetrievedChunk],
         query: EvalQuery,
+        scoring_ranking: list[RetrievedChunk] | None = None,
     ) -> RetrievalScore:
         """QASPER: paragraph-level CK-2 set-F1, max over annotators.
 

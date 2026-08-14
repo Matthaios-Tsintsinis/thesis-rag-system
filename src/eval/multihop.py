@@ -62,6 +62,14 @@ from .types import (
 
 HF_REPO = "yixuantt/MultiHopRAG"
 
+# K grid. K=4 is here so ONE column is the paper's Hits@4 (Tang & Yang
+# 2024 report Hits@4, Hits@10, MAP@10, MRR@10). K=1 and K=5 are extra
+# diagnostic columns the paper does not report. Every SYSTEM is measured
+# at the same K on this benchmark, which is what comparability requires;
+# HotpotQA uses its own grid because its two-gold-title structure makes
+# Hit@2 the directly interpretable number there.
+RANK_K_VALUES = (1, 4, 5, 10)
+
 
 def _load_files() -> tuple[list[dict], list[dict]]:
     """Download MultiHopRAG.json + corpus.json from HF. Cached locally."""
@@ -214,18 +222,19 @@ class MultiHopBenchmark:
         self,
         retrieved: list[RetrievedChunk],
         query: EvalQuery,
+        scoring_ranking: list[RetrievedChunk] | None = None,
     ) -> RetrievalScore:
         """MultiHop: CK-2 set-F1 + rank-aware (Hit@K, MAP@K, MRR).
 
         Merges:
           - score_retrieval_ck2 over (url, "<whole>") atoms — gives F1
             consistent with QASPER's scoring shape.
-          - score_retrieval_rank_aware at K=(1, 5, 10). DEVIATION FROM
-            PAPER: MultiHop-RAG (Tang & Yang 2024, arXiv:2401.15391)
-            reports Hits@4, Hits@10, MAP@10, MRR@10 (K in {4,10}; MAP/MRR
-            at K=10 only). Our grid uses K=(1,5,10): K=10 matches the
-            paper directly; K=5 substitutes for the paper's K=4; K=1 is an
-            extra diagnostic column the paper does not report. MRR here is
+          - score_retrieval_rank_aware at K=(1, 4, 5, 10) over the
+            FIXED-DEPTH SCORING RANKING (SCORING_RANKING_DEPTH=50), not
+            over the reader's top-15. K=4 and K=10 are the paper's own
+            Hits@4 / Hits@10; K=1 and K=5 are extra diagnostic columns.
+            DEVIATION FROM PAPER: MAP and MRR are reported at the same
+            grid rather than at K=10 only, and MRR is uncapped. MRR here is
             uncapped (first relevant doc over the full ranking), equal to
             the paper's MRR@10 unless the first relevant doc sits at
             rank >10 (rare under top-15). Matrix tables must NOT be read
@@ -236,9 +245,14 @@ class MultiHopBenchmark:
         contract); CK-2 also returns skipped=True. Answer-side
         abstention scorer handles those queries.
         """
+        # SET-LEVEL over the READER CONTEXT: it measures what the
+        # generator actually saw. RANK-AWARE over the fixed-depth
+        # SCORING RANKING: it measures retrieval quality at one depth for
+        # every system. Two depths, one table; the caption says so.
         ck2 = score_retrieval_ck2(retrieved, query.gold_passage_sets)
         gold = query.gold_passage_sets[0] if query.gold_passage_sets else frozenset()
-        rank = score_retrieval_rank_aware(retrieved, gold, k_values=(1, 5, 10))
+        ranked = scoring_ranking if scoring_ranking is not None else retrieved
+        rank = score_retrieval_rank_aware(ranked, gold, k_values=RANK_K_VALUES)
         if rank.get("skipped"):
             return ck2
         # Merge — extend CK-2 score with rank-aware fields.

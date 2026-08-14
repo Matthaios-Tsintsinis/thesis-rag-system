@@ -20,10 +20,15 @@ different token stream from the published evaluator. That was a
 MISLABELLED deviation, not a documented one, and correcting it is what
 lets the deviations table claim HotpotQA matches its official metric.
 
-Unicode NFKC is applied FIRST, before lowercasing, so curly and straight
-apostrophes produce identical tokens. This is an addition to the official
-pipeline, applied uniformly to all three live benchmarks, and it cannot
-change any answer that was already ASCII.
+STATED DIVERGENCE FROM THE PUBLISHED NORMALISER: this implementation
+adds Unicode NFKC plus a non-ASCII punctuation fold that the official
+evaluators do NOT perform, so that Unicode-variant tokens ("don't" vs
+"don't") cannot score differently from their ASCII forms. It is a
+deliberate, principled extension rather than the mislabelled inversion it
+replaced, it is applied uniformly to all three live benchmarks, and it is
+provably inert on ASCII input. The deviations table records this as
+"official normaliser + documented NFKC/Unicode extension", not as an
+unqualified match.
 
 IMPORTANT — what the official QASPER scorer actually does with multiple
 extractive spans: it JOINS an annotator's spans into ONE reference

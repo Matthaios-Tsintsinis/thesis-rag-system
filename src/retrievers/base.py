@@ -41,6 +41,7 @@ from ..config import (
     BASE_ANSWER_SYSTEM_PROMPT,
     DEFAULT_CONFIG,
     EVIDENCE_TOKEN_BUDGET_TOKENIZER,
+    SCORING_RANKING_DEPTH,
     HarnessConfig,
 )
 from ..parsing import clean_text
@@ -77,6 +78,9 @@ class AnswerResult:
     # EVIDENCE_TOKEN_BUDGET. Equal to `retrieved` for M1 (no retrieval)
     # and for any system whose retrieved set already fits in budget.
     packed: list[RetrievedChunk] = field(default_factory=list)
+    # P6: fixed-depth ranking for rank-aware scoring. Empty for systems
+    # that do not retrieve (M1). NOT generator input.
+    scoring_ranking: list[RetrievedChunk] = field(default_factory=list)
     latency_s: float = 0.0
     n_retrieval_calls: int = 0
     # CK-4: full prompt tokens fed to the generator (system + question
@@ -191,6 +195,9 @@ class PreparedQuery:
     query: str
     retrieved: list[RetrievedChunk]
     packed: list[RetrievedChunk]
+    # P6: the ranking rank-aware metrics are measured over, at a FIXED
+    # depth for every system. Never fed to the generator.
+    scoring_ranking: list[RetrievedChunk]
     system_prompt: str
     user_prompt: str
     evidence_tokens: int
@@ -268,6 +275,26 @@ class BaseSystem(ABC):
         )
         return self.finish(prepared, ans)
 
+    def retrieve_for_scoring(
+        self, query: str, depth: int = SCORING_RANKING_DEPTH
+    ) -> list[RetrievedChunk]:
+        """The ranking rank-aware metrics are MEASURED over.
+
+        Separate from the reader context on purpose. With K counted over
+        documents surfaced by the reader's 15 chunks, the ranking depth
+        varied per query and per system, so Hit@10 could mean "within 4
+        candidates" for one system and "within 10" for another. Measuring
+        every system at one depth is what makes the numbers comparable to
+        each other and to published Hit@K.
+
+        The default asks the system for a deeper cut of the SAME
+        retrieval it would otherwise do. That costs one extra vector or
+        BM25 search per query and no LLM call. A system whose pipeline is
+        expensive or decision-dependent overrides this instead of paying
+        it twice — see M9.
+        """
+        return self.retrieve(query, k=depth)
+
     def prepare(self, query: str, k: int | None = None) -> PreparedQuery:
         """PHASE A: retrieve, pack, assemble the prompt. No generation.
 
@@ -290,6 +317,7 @@ class BaseSystem(ABC):
         # the professor-aligned "don't expand baselines" guarantee —
         # M2/M3/M4/M6 feed their original top-15 unchanged.
         retrieved = self.retrieve(query, k=k)
+        scoring_ranking = self.retrieve_for_scoring(query)
         # token_budget=None (default) -> packer reads
         # src.config.EVIDENCE_TOKEN_BUDGET at call time. None by
         # default = no enforcement (baselines unconstrained, per
@@ -309,6 +337,7 @@ class BaseSystem(ABC):
             query=query,
             retrieved=retrieved,
             packed=packed,
+            scoring_ranking=scoring_ranking,
             system_prompt=BASE_ANSWER_SYSTEM_PROMPT,
             user_prompt=user_prompt,
             evidence_tokens=evidence_tokens,
@@ -337,6 +366,7 @@ class BaseSystem(ABC):
             answer=answer_text,
             retrieved=prepared.retrieved,
             packed=prepared.packed,
+            scoring_ranking=prepared.scoring_ranking,
             latency_s=prepared.prepare_s + generate_s,
             n_retrieval_calls=prepared.n_retrieval_calls,
             n_input_tokens=prepared.n_input_tokens,

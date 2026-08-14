@@ -242,6 +242,7 @@ class NarrativeQABenchmark:
         self,
         retrieved: list[RetrievedChunk],
         query: EvalQuery,
+        scoring_ranking: list[RetrievedChunk] | None = None,
     ) -> RetrievalScore:
         """No gold passages in NarrativeQA — retrieval is never scored.
 

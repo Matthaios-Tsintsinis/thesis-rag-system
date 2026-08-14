@@ -118,6 +118,20 @@ EVIDENCE_TOKEN_BUDGET_TOKENIZER = "gpt-4o-mini"
 # extends the tail; the head of the ranking is unchanged.
 RETRIEVAL_RANKING_DEPTH = 50
 
+# DEPTH AT WHICH RETRIEVAL IS *MEASURED*, decoupled from what the reader
+# sees. Rank-aware metrics used to be computed over whatever documents
+# happened to surface in the reader's top-15 CHUNKS, so the document
+# ranking's depth varied per query and per system: a system whose 15
+# chunks collapsed into 4 articles was scored at Hit@10 over 4
+# candidates, while one spreading over 15 got 10. That is not the
+# published Hit@K, and it penalised M4 twice over, since its summary
+# nodes carry no provenance and rank no document at all.
+#
+# Every system now returns a ranking of this depth FOR SCORING ONLY.
+# Generation input is untouched: the reader still gets top-15
+# (M2/M3/M9) or M4's 2,000-token budget fill.
+SCORING_RANKING_DEPTH = 50
+
 
 # --- Chunking -------------------------------------------------------------
 # Two strategies, selected per HarnessConfig.chunking.strategy:

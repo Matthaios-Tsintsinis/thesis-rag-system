@@ -53,7 +53,14 @@ VARIANT B — `hotpotqa_pooled` — pooled shards.
 #    `sp_coverage_f1` in metadata under a DELIBERATELY DIFFERENT NAME.
 #    Never report it as `sp_f1`.
 #
-# 3. SET-F1 IS PRECISION-CAPPED BY CONSTRUCTION, so it is SECONDARY.
+# 3. RETRIEVAL IS MEASURED AT DEPTH 50, GENERATION AT TOP-15 / BUDGET.
+#    Rank-aware metrics run over a fixed-depth scoring ranking so K
+#    counts the same number of candidate documents for every system;
+#    set-level R/P/F1 stay over the reader context, because they measure
+#    what the generator actually saw. Two depths in one table, stated
+#    here and in the results caption.
+#
+# 3b. SET-F1 IS PRECISION-CAPPED BY CONSTRUCTION, so it is SECONDARY.
 #    With 2-3 gold sentences and top-15 chunks covering 45-75
 #    sentences, precision is bounded near 0.05 and F1 near 0.1; on
 #    variant B, with 2 gold paragraphs in a ~800-paragraph haystack,
@@ -435,6 +442,7 @@ class HotpotQABenchmark:
         self,
         retrieved: list[RetrievedChunk],
         query: EvalQuery,
+        scoring_ranking: list[RetrievedChunk] | None = None,
     ) -> RetrievalScore:
         """Set-F1 at SENTENCE level + rank-aware at TITLE level.
 
@@ -452,9 +460,13 @@ class HotpotQABenchmark:
         if not gold:
             return base
 
+        # Set-level over the reader context (above); rank-aware over the
+        # fixed-depth scoring ranking, so K counts the same number of
+        # candidate documents for every system.
         title_gold = frozenset((t, _TITLE_SPAN) for t, _ in gold)
+        ranked = scoring_ranking if scoring_ranking is not None else retrieved
         rank = score_retrieval_rank_aware(
-            _project_to_titles(retrieved), title_gold, k_values=RANK_K_VALUES)
+            _project_to_titles(ranked), title_gold, k_values=RANK_K_VALUES)
         return dc_replace(
             base,
             hit_at_k=rank.get("hit_at_k", {}),

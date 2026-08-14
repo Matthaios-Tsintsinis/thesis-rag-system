@@ -289,6 +289,7 @@ class QualityBenchmark:
         self,
         retrieved: list[RetrievedChunk],
         query: EvalQuery,
+        scoring_ranking: list[RetrievedChunk] | None = None,
     ) -> RetrievalScore:
         """QuALITY has no gold passages — retrieval is never scored.
 

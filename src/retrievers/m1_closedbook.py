@@ -79,6 +79,9 @@ class ClosedBookSystem(BaseSystem):
             query=query,
             retrieved=[],
             packed=[],
+            # Closed-book: nothing is retrieved, so nothing is ranked.
+            # Its retrieval rows are skipped by every benchmark anyway.
+            scoring_ranking=[],
             system_prompt=CLOSED_BOOK_SYSTEM_PROMPT,
             user_prompt=query,
             evidence_tokens=0,  # no retrieval, no evidence block
