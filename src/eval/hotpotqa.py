@@ -86,6 +86,7 @@ from typing import Any, Iterable
 
 from ..retrievers.base import RetrievedChunk
 from .alignment import score_retrieval_ck2, score_retrieval_rank_aware
+from .sampling import SUBSAMPLE_SEED, subsample_indices
 from .scorers.extractive import (
     assert_gold_not_empty,
     normalize_qasper_answer,
@@ -134,22 +135,12 @@ SHARD_QUESTIONS = 100
 # HotpotQA dev is not guaranteed to be randomly ordered — it can be
 # grouped by `type` and `level` — so taking the first N rows risks a
 # sample skewed on exactly the dimension that justifies including the
-# benchmark at all, the bridge/comparison split. A head slice would be
-# indefensible precisely where the benchmark is most interesting.
+# benchmark at all, the bridge/comparison split.
 #
-# Same seed convention as the M7 dev/test partition, so every
-# pre-registered split in this project traces to one dated constant.
-#
-# `random.Random(seed).sample` rather than `Dataset.shuffle(seed=...)`:
-# the datasets library's shuffle implementation is free to change
-# between versions, and this project has already been bitten by a
-# version-sensitive algorithm (UMAP) whose output a seed does not fully
-# pin. Python's Mersenne Twister is specified and stable.
-#
-# Indices are SORTED after sampling, so the subsample keeps dataset
-# order. That makes variant B's shard boundaries a function of the
-# sample alone, not of the order `sample()` happened to emit.
-SUBSAMPLE_SEED = 20260805
+# The seed and the sampler now live in `src/eval/sampling.py` and are
+# SHARED with NarrativeQA, so the two benchmarks cannot drift into two
+# conventions. Re-exported here because this module's public surface
+# already carried them.
 
 # THE PRE-REGISTERED SAMPLE SIZE, as a DEFAULT rather than a CLI flag.
 #
@@ -175,23 +166,6 @@ RANK_K_VALUES = (1, 2, 5, 10)
 # The atom span_id used for TITLE-level projection in rank-aware
 # scoring. Distinct from any real sentence id.
 _TITLE_SPAN = "<title>"
-
-
-def subsample_indices(n_total: int, k: int, seed: int = SUBSAMPLE_SEED) -> list[int]:
-    """Seeded random indices, sorted. Pure, so it is testable and quotable.
-
-    BOTH VARIANTS MUST GET THE SAME SAMPLE. `seed` is a module constant
-    and both classes share this function through `_load`, so variant A
-    and variant B answer the SAME 1,000 questions. If they diverged, any
-    A-vs-B comparison would confound the pooling change with a change of
-    question set — and comparing the two variants is the entire reason
-    both are being built.
-    """
-    import random
-
-    if k >= n_total:
-        return list(range(n_total))
-    return sorted(random.Random(seed).sample(range(n_total), k))
 
 
 def _sentence_items(context: Any) -> list[CorpusItem]:

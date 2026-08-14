@@ -61,6 +61,7 @@ from __future__ import annotations
 from typing import Any, Iterable
 
 from ..retrievers.base import RetrievedChunk
+from .sampling import SUBSAMPLE_SEED, subsample_indices
 from .scorers import (
     assert_gold_not_empty,
     extractive_max_f1,
@@ -100,6 +101,8 @@ class NarrativeQABenchmark:
             "n_refs_total": 0,
             "n_gutenberg": 0,
             "n_movie": 0,
+            "subsample_seed": None,
+            "sampled_story_ids": [],
         }
 
     def _load_split(self, split: str) -> Any:
@@ -156,15 +159,29 @@ class NarrativeQABenchmark:
                 ((row.get("question") or {}).get("text") or "", answers)
             )
 
-        n_questions = sum(len(s["qa"]) for s in stories.values())
+        # SEEDED SAMPLE, not the head of the split (P7). The 40-story
+        # subsample used to be `order[:40]`, which is a head slice of the
+        # 115 validation stories — indefensible next to HotpotQA's seeded
+        # draw, and under the same objection: dataset order is not
+        # guaranteed random, so a prefix can be skewed on any dimension
+        # the ordering happens to carry.
+        if max_units is not None and max_units < len(order):
+            picked = subsample_indices(len(order), max_units)
+            order = [order[i] for i in picked]
+        self.stats["subsample_seed"] = SUBSAMPLE_SEED
+        # RECORDED so the draw is reproducible AND inspectable: the run
+        # summary carries benchmark stats verbatim, so the exact stories
+        # behind a cell are in its provenance rather than re-derivable
+        # only by rerunning the sampler.
+        self.stats["sampled_story_ids"] = list(order)
+
+        n_questions = sum(len(s["qa"]) for s in stories.values() if True)
         print(
             f"[narrativeqa] split {split!r}: {len(order)} stories, "
             f"{n_questions} questions (full-text variant)"
         )
 
-        for n_done, did in enumerate(order):
-            if max_units is not None and n_done >= max_units:
-                break
+        for did in order:
             story = stories[did]
             kind = story["kind"]
             if kind == "gutenberg":
