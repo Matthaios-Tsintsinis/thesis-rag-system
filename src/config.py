@@ -160,6 +160,20 @@ ChunkingStrategy = Literal["semantic", "word_window", "raptor_100tok"]
 # --- Generation -----------------------------------------------------------
 
 GEN_MAX_NEW_TOKENS = 512
+
+# THE ONE BATCH SIZE, used by every cell in the matrix.
+#
+# Batch COMPOSITION can change generated text at temperature 0 — padding
+# plus batched-matmul reduction order can flip an argmax on a near-tie,
+# measured once at 8e-5 on a MultiHop answer mean. That is small, but it
+# is only harmless while it is CONSTANT: cells generated at different
+# batch sizes are not strictly comparable to each other. Fixing it here
+# rather than passing it per invocation is what makes "the same batch
+# size in every cell" a property of the code instead of a habit.
+#
+# 16 is the value the banked M1 cell used and the value the L4 headroom
+# measurements were taken at; --batch-size still overrides for probes.
+MATRIX_BATCH_SIZE = 16
 GEN_TEMPERATURE = 0.0
 GEN_TOP_P = 1.0
 # fp16, NOT 4-bit. This default was True and it is the b6e35c6 failure

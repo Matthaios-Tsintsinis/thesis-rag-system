@@ -66,6 +66,61 @@ BENCHMARK_REGISTRY: dict[str, type] = {
 }
 
 
+def _environment_provenance() -> dict:
+    """Lockfile hash, GPU model, python and the pinned versions.
+
+    The GPU string is here because the reproducibility target is
+    same-lockfile-SAME-GPU-CLASS: a tree that reproduces on an L4 is not
+    thereby claimed to reproduce on another accelerator, and a row that
+    does not say which GPU produced it cannot support either claim.
+    """
+    try:
+        from pathlib import Path as _Path
+
+        from scripts.pin_environment import environment_provenance
+
+        return environment_provenance(_Path("requirements.lock"))
+    except Exception as e:  # never fatal: provenance must not kill a run
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def _model_revisions(system) -> dict:
+    """Resolved model ids for the three roles, with HF revision hashes.
+
+    An id alone does not pin a model: a repo can move. The revision is
+    what makes "the same embedder" checkable rather than assumed. Absent
+    revisions degrade to None rather than failing the run — this is
+    provenance, not a gate.
+    """
+    out: dict = {}
+    try:
+        resolved = getattr(system, "resolved_components", None)
+        if resolved is not None:
+            out["embedder"] = getattr(resolved, "embedder_id", None)
+            out["reranker"] = getattr(resolved, "reranker_id", None)
+            out["index_llm"] = getattr(resolved, "index_llm_id", None)
+        out["generator"] = system.config.generation.model
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+    revisions: dict = {}
+    try:
+        from huggingface_hub import HfApi
+
+        api = HfApi()
+        for role, model_id in list(out.items()):
+            if not model_id or "/" not in str(model_id):
+                continue
+            try:
+                revisions[role] = api.model_info(str(model_id)).sha
+            except Exception:
+                revisions[role] = None
+    except Exception:
+        pass
+    out["revisions"] = revisions
+    return out
+
+
 def _tree_build_env() -> str | None:
     """The resolved topology stack, recorded per cell. None if raptor_paper
     is not importable (no tree-building system in this run)."""
@@ -516,6 +571,11 @@ def main() -> None:
         "max_padded_tokens": args.max_padded_tokens,
         # Cold-tree provenance. None for systems with no tree; False on
         # the P10 pass means the lever took and the tree was rebuilt.
+        # P9: which environment produced this row. Recorded per CELL, not
+        # per session — a matrix assembled over several sessions must be
+        # able to say which stack produced which row.
+        "environment": _environment_provenance(),
+        "model_revisions": _model_revisions(system),
         "tree_cache_hit": getattr(system, "tree_cache_hit", None),
         "tree_build_env": _tree_build_env(),
         "git_commit": _git_commit_short(),

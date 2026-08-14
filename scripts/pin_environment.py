@@ -1,0 +1,201 @@
+"""P9: write and verify the environment lockfile that M4's topology needs.
+
+WHY A LOCKFILE AT ALL. UMAP + GMM output is version-sensitive even when
+seeded, so an M4 tree is reproducible against a PINNED stack rather than
+absolutely. Without a lockfile "reproducible" is a claim nobody can
+check; with one it is a command.
+
+WHY THIS IS WRITTEN ON THE RUN HOST, NOT COMMITTED BY HAND. The stack
+that matters is the one the matrix runs on — Colab — and a lockfile
+transcribed from a developer laptop would pin the wrong versions with
+full confidence. `write` snapshots the environment it is executed in;
+`check` compares a later environment against that snapshot.
+
+THE ACCEPTANCE TEST IS OPERATOR-EXECUTED, not agent-verified: build a
+fresh environment from the lockfile, on the SAME GPU CLASS, and confirm
+one M4 unit's tree node count reproduces exactly. It cannot be run from a
+machine without the GPU, and it is recorded as an operator line for the
+same reason the tree-cache preflight is.
+
+    python -m scripts.pin_environment write --out requirements.lock
+    python -m scripts.pin_environment check --lockfile requirements.lock
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+
+# Pinned exactly, because they determine M4 tree topology or the numbers
+# that flow from it. A drift here invalidates trees; a drift elsewhere
+# does not, which is why the cold-tree cache lever keys on the first
+# three of these rather than on the whole file.
+TOPOLOGY_CRITICAL = (
+    "umap-learn",
+    "scikit-learn",
+    "numpy",
+    "numba",
+    "llvmlite",
+    "pynndescent",
+    "torch",
+    "transformers",
+    "sentence-transformers",
+    "faiss-cpu",
+    "faiss-gpu",
+    "rank-bm25",
+    "tiktoken",
+    "datasets",
+    "huggingface-hub",
+)
+
+
+def _installed() -> dict[str, str]:
+    from importlib.metadata import distributions
+
+    out: dict[str, str] = {}
+    for dist in distributions():
+        name = (dist.metadata["Name"] or "").strip()
+        if name:
+            out[name.lower()] = dist.version
+    return out
+
+
+def lockfile_hash(text: str) -> str:
+    """Hash of the REQUIREMENT LINES only, so a comment or a reordering
+    does not read as an environment change."""
+    lines = sorted(
+        ln.strip() for ln in text.splitlines()
+        if ln.strip() and not ln.strip().startswith("#")
+    )
+    return hashlib.sha256("\n".join(lines).encode("utf-8")).hexdigest()[:16]
+
+
+def gpu_model() -> str:
+    """The GPU string, recorded because the reproducibility target is
+    same-lockfile-SAME-GPU-CLASS. A tree that reproduces on an L4 is not
+    thereby claimed to reproduce on an A100."""
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return str(torch.cuda.get_device_name(0))
+        return "cpu"
+    except Exception:
+        return "unknown"
+
+
+def write_lockfile(out: Path) -> int:
+    installed = _installed()
+    lines = [
+        "# Environment lock for the thesis RAG matrix.",
+        "# Written by scripts/pin_environment.py ON THE RUN HOST.",
+        "# M4 tree topology is reproducible against THIS stack, on the",
+        "# same GPU class, and is not claimed to reproduce against another.",
+        f"# gpu={gpu_model()}",
+        f"# python={sys.version.split()[0]}",
+        "",
+    ]
+    missing: list[str] = []
+    for pkg in TOPOLOGY_CRITICAL:
+        version = installed.get(pkg)
+        if version is None:
+            missing.append(pkg)
+            continue
+        lines.append(f"{pkg}=={version}")
+    if missing:
+        lines.append("")
+        lines.append("# absent in the environment that wrote this file:")
+        lines.extend(f"#   {pkg}" for pkg in missing)
+
+    text = "\n".join(lines) + "\n"
+    out.write_text(text, encoding="utf-8")
+    print(f"wrote {out}")
+    print(f"[pin] lockfile_hash={lockfile_hash(text)}")
+    print(f"[pin] gpu={gpu_model()}")
+    if missing:
+        print(f"[pin] NOTE: {len(missing)} package(s) absent here: "
+              f"{', '.join(missing)}")
+    return 0
+
+
+def check_lockfile(lockfile: Path) -> int:
+    text = lockfile.read_text(encoding="utf-8")
+    installed = _installed()
+    mismatches: list[str] = []
+    checked = 0
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "==" not in line:
+            continue
+        pkg, _, want = line.partition("==")
+        have = installed.get(pkg.strip().lower())
+        checked += 1
+        if have is None:
+            mismatches.append(f"{pkg}: locked {want}, ABSENT")
+        elif have != want:
+            mismatches.append(f"{pkg}: locked {want}, installed {have}")
+
+    print(f"[pin] lockfile_hash={lockfile_hash(text)}")
+    print(f"[pin] gpu={gpu_model()}")
+    print(f"[pin] checked {checked} pinned package(s)")
+    if mismatches:
+        print("[pin] MISMATCH:")
+        for m in mismatches:
+            print(f"  - {m}")
+        print("[pin] FAILED — this environment is not the locked one. M4 "
+              "tree topology is not claimed to reproduce here.")
+        return 1
+    print("[pin] OK — environment matches the lockfile.")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    w = sub.add_parser("write", help="snapshot THIS environment")
+    w.add_argument("--out", type=Path, default=Path("requirements.lock"))
+
+    c = sub.add_parser("check", help="compare this environment to a lockfile")
+    c.add_argument("--lockfile", type=Path, default=Path("requirements.lock"))
+
+    j = sub.add_parser("json", help="emit the provenance block the runner records")
+    j.add_argument("--lockfile", type=Path, default=Path("requirements.lock"))
+
+    args = ap.parse_args(argv)
+    if args.cmd == "write":
+        return write_lockfile(args.out)
+    if args.cmd == "check":
+        return check_lockfile(args.lockfile)
+    print(json.dumps(environment_provenance(args.lockfile), indent=2))
+    return 0
+
+
+def environment_provenance(lockfile: Path | None = None) -> dict:
+    """The block every run summary carries.
+
+    Recorded per CELL rather than per session: a matrix assembled from
+    several sessions must be able to say which environment produced which
+    row, and a session-level note cannot.
+    """
+    lock_hash = None
+    if lockfile is not None and Path(lockfile).exists():
+        lock_hash = lockfile_hash(Path(lockfile).read_text(encoding="utf-8"))
+    installed = _installed()
+    return {
+        "lockfile_hash": lock_hash,
+        "gpu": gpu_model(),
+        "python": sys.version.split()[0],
+        "versions": {
+            pkg: installed.get(pkg) for pkg in TOPOLOGY_CRITICAL
+            if installed.get(pkg) is not None
+        },
+    }
+
+
+if __name__ == "__main__":
+    sys.exit(main())
