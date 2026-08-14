@@ -24,7 +24,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from .. import paths
-from ..config import DEFAULT_CONFIG, HarnessConfig
+from ..config import DEFAULT_CONFIG, MATRIX_BATCH_SIZE, HarnessConfig
 from ..retrievers.base import BaseSystem
 from ..retrievers.m1_closedbook import ClosedBookSystem
 from ..retrievers.m2_flat_dense import FlatDenseSystem
@@ -204,11 +204,19 @@ def main() -> None:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=None,
+        default=MATRIX_BATCH_SIZE,
         help=(
-            "Enable TWO-PHASE answering: retrieve every query in a unit "
+            f"Generation batch size. DEFAULTS TO config.MATRIX_BATCH_SIZE "
+            f"({MATRIX_BATCH_SIZE}) so every matrix cell batches "
+            "identically WITHOUT the operator remembering a flag: batch "
+            "composition can move generated text at temperature 0, so a "
+            "cell that silently fell back to sequential answering would "
+            "not be strictly comparable to the other nineteen. Pass a "
+            "smaller value to override for a cost probe; pass 0 for the "
+            "historic sequential path. "
+            "Enables TWO-PHASE answering: retrieve every query in a unit "
             "first, then generate the unit in batches of this size. "
-            "Omit for the historic sequential path. Only affects systems "
+            "Only affects systems "
             "with supports_batched_answer=True (M1 and M7 stay "
             "sequential). Needed for local generation, where sequential "
             "answering wastes most of the GPU; measured feasible batch "
@@ -467,10 +475,17 @@ def main() -> None:
         print(f"[eval] prewarm: generator resident in {load_s:.1f}s "
               "(EXCLUDED from the timings below)")
 
+    # 0 is the explicit opt-out: argparse cannot express "None by
+    # request" once the default is an int, and a sequential path that
+    # can only be reached by editing config is not an escape hatch.
+    batch_size = args.batch_size if args.batch_size else None
+    if batch_size is None:
+        print("[eval] batch_size=0 -> SEQUENTIAL answering (explicitly "
+              "requested; matrix cells must use the default)")
     runner = BenchmarkRunner(
         output_path=args.output,
         verbose=not args.quiet,
-        batch_size=args.batch_size,
+        batch_size=batch_size,
         resume=args.resume,
         max_padded_tokens=args.max_padded_tokens,
         verify_max_new_tokens=args.max_new_tokens,
@@ -567,7 +582,7 @@ def main() -> None:
         "s_per_query": (
             round(elapsed_s / n_scored, 4) if n_scored else None
         ),
-        "batch_size": args.batch_size,
+        "batch_size": batch_size,
         "max_padded_tokens": args.max_padded_tokens,
         # Cold-tree provenance. None for systems with no tree; False on
         # the P10 pass means the lever took and the tree was rebuilt.

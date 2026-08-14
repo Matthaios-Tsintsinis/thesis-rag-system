@@ -35,6 +35,7 @@ from unittest import mock
 from src.config import DEFAULT_CONFIG
 from src.eval import aggregate as aggregate_mod
 from src.eval import analyse as analyse_mod
+from src.config import MATRIX_BATCH_SIZE
 from src.eval import runner as runner_mod
 from src.eval.types import (
     ANSWER_TYPE_FREE_FORM,
@@ -161,6 +162,39 @@ class _CliCase(unittest.TestCase):
         with mock.patch.object(sys, "argv", argv):
             runner_mod.main()
         return out
+
+
+class TestBatchSizeDefault(_CliCase):
+    """The runner READS config.MATRIX_BATCH_SIZE — the property the P9
+    commit claimed and left inert.
+
+    The test P9 shipped asserted MATRIX_BATCH_SIZE == 16, which is a
+    tautology about a constant and proves nothing about the pipeline: the
+    flag still defaulted to None, so a cell launched without an explicit
+    --batch-size fell back to SEQUENTIAL answering. Batch composition can
+    move generated text at temperature 0, so that cell would not have
+    been strictly comparable to the rest of the matrix, and nothing in
+    the run would have said so.
+
+    These assertions read what the CLI RESOLVED, from the artifact a real
+    run leaves behind.
+    """
+
+    def _summary(self, *extra):
+        out = self._run(*extra)
+        return json.loads(
+            out.with_suffix(".summary.json").read_text(encoding="utf-8"))
+
+    def test_no_flag_resolves_to_the_configured_matrix_batch_size(self):
+        self.assertEqual(self._summary()["batch_size"], MATRIX_BATCH_SIZE)
+
+    def test_the_flag_still_overrides_downward_for_a_cost_probe(self):
+        self.assertEqual(self._summary("--batch-size", "4")["batch_size"], 4)
+
+    def test_zero_is_the_explicit_sequential_opt_out(self):
+        """An escape hatch reachable only by editing config is not an
+        escape hatch."""
+        self.assertIsNone(self._summary("--batch-size", "0")["batch_size"])
 
 
 class TestRunnerMain(_CliCase):
