@@ -43,7 +43,7 @@ from ..retrievers.base import RetrievedChunk
 from .alignment import score_retrieval_ck2, score_retrieval_rank_aware
 from .scorers import (
     is_abstention,
-    score_abstention,
+    score_unanswerable,
     substring_match,
     token_f1,
 )
@@ -266,8 +266,11 @@ class MultiHopBenchmark:
         treating it as a refusal conflates the two.
 
         Primary value:
-          - null_query: the unanswerable rule (method
-            "unanswerable_rule").
+          - null_query: score_unanswerable -- the PURE-REFUSAL rule
+            (method "unanswerable_rule"). Detection alone used to decide
+            this and credited fabrication: "I don't know the year, but
+            the answer is Tesla." scored 1.0. The rule now requires the
+            utterance MINUS its hedge to assert nothing.
           - Other queries: token_F1 vs gold.free_form (the
             QASPER-consistent default; less false-positive-prone than
             substring). The MultiHop-RAG paper evaluates answers with an
@@ -288,7 +291,7 @@ class MultiHopBenchmark:
         # consulted by any branch that produces a score.
         abstained = is_abstention(predicted)
         if gold.answer_type == ANSWER_TYPE_UNANSWERABLE:
-            value = score_abstention(predicted)
+            value = score_unanswerable(predicted)
             # Even on null_query, record substring + token_f1 against
             # the gold string for analytic visibility (how often does
             # the system fabricate a "factual" answer to a null query).

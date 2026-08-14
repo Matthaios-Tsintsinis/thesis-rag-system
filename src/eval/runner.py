@@ -413,6 +413,15 @@ def main() -> None:
     sum_retr_f1 = 0.0
     sum_retr_skipped = 0
     sum_ans = 0.0
+    # COMPOSITION DISCLOSURE. The answer column is ONE number, but on
+    # MultiHop it averages two different measurement scales: token-F1 on
+    # answerable queries and a binary rule on null ones. A micro-mean
+    # over two scales is not legible unless the split is published
+    # beside it, so the parts are counted here and reported in the
+    # summary. The table still carries one column; its caption states
+    # the composition.
+    n_null = 0
+    sum_ans_null = 0.0
     # Timed HERE, around runner.run only, so the prewarm load and every
     # import sit outside it. Recorded in the summary because otherwise
     # the only source of a timing is stdout, and reading a wall clock off
@@ -427,6 +436,9 @@ def main() -> None:
         max_queries=args.max_queries,
     ):
         n_scored += 1
+        if scored.answer.method == "unanswerable_rule":
+            n_null += 1
+            sum_ans_null += scored.answer.value
         if scored.retrieval.skipped:
             sum_retr_skipped += 1
         else:
@@ -447,6 +459,17 @@ def main() -> None:
         "n_retrieval_skipped": sum_retr_skipped,
         "mean_retrieval_f1": sum_retr_f1 / n_retr_scored,
         "mean_answer_score": sum_ans / max(1, n_scored),
+        # The two parts of the one answer column, so the composition is
+        # inspectable without re-reading the JSONL.
+        "n_answerable": n_scored - n_null,
+        "mean_answer_score_answerable": (
+            (sum_ans - sum_ans_null) / (n_scored - n_null)
+            if n_scored - n_null else None
+        ),
+        "n_null_queries": n_null,
+        "mean_answer_score_null": (
+            sum_ans_null / n_null if n_null else None
+        ),
         "benchmark_stats": getattr(benchmark, "stats", {}),
         # Run-condition provenance (the aggregator's conditions columns;
         # every matrix row must be self-describing from birth). The

@@ -32,6 +32,7 @@ from .unanswerable import (
     ABSTENTION_PHRASES,
     is_abstention,
     score_abstention,
+    score_unanswerable,
 )
 from .yes_no import (
     normalize_yes_no,
@@ -51,6 +52,7 @@ __all__ = [
     "ABSTENTION_PHRASES",
     "is_abstention",
     "score_abstention",
+    "score_unanswerable",
     "normalize_yes_no",
     "score_yes_no",
 ]

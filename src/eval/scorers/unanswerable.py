@@ -252,13 +252,46 @@ def is_abstention(predicted: str) -> bool:
 def score_abstention(predicted: str) -> float:
     """1.0 if the prediction is an abstention; 0.0 otherwise.
 
-    NOT the null-query rule. P2 replaces the MultiHop null-query path
-    with `score_unanswerable`, which additionally requires that the
-    prediction assert nothing beyond the hedge. This remains for the
-    dropped-benchmark callers (QASPER) that still score on detection
-    alone.
+    NOT the null-query rule — see `score_unanswerable`, which
+    additionally requires that the prediction assert nothing beyond the
+    hedge. This remains for the dropped-benchmark callers (QASPER) that
+    score on detection alone.
     """
     return 1.0 if is_abstention(predicted) else 0.0
+
+
+def score_unanswerable(predicted: str) -> float:
+    """THE NULL-QUERY RULE (P2). Credit a PURE REFUSAL, nothing else.
+
+    Detection alone used to decide this, and it credited fabrication: "I
+    don't know the year, but the answer is Tesla." scored 1.0 on a
+    MultiHop null_query, full marks for naming an entity the corpus does
+    not support. Measured in docs/EVAL_AUDIT.md ISSUE-2.
+
+    Two parts:
+      1. the anchored detector must fire (P3), and
+      2. the utterance with the hedge clause REMOVED must carry no
+         content word.
+
+    WHAT THIS DELIBERATELY IS NOT. An earlier proposal credited 1.0
+    unless the remainder held a digit or a non-sentence-initial
+    capitalised token. That is an entity detector, and it fails in both
+    directions: "The evidence does not cover 2023." would score 0.0 for
+    echoing a year it explicitly declines to answer about, and "Tesla is
+    not mentioned in the evidence." would score 1.0 because the entity
+    happens to sit sentence-initially. This rule asks the simpler
+    question - is anything asserted at all - and needs no notion of what
+    an entity is, no capitalisation, and no language-specific casing
+    convention.
+
+    The remainder test reuses `is_filler_only`, the same primitive the
+    detector uses to decide a clause is a pure hedge, so the two halves
+    of the rule cannot drift apart.
+    """
+    match = detect_abstention(predicted)
+    if not match.matched:
+        return 0.0
+    return 1.0 if is_filler_only(match.remainder) else 0.0
 
 
 __all__ = [
@@ -268,4 +301,5 @@ __all__ = [
     "is_abstention",
     "is_filler_only",
     "score_abstention",
+    "score_unanswerable",
 ]
