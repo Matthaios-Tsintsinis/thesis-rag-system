@@ -87,6 +87,7 @@ from typing import Any, Iterable
 from ..retrievers.base import RetrievedChunk
 from .alignment import score_retrieval_ck2, score_retrieval_rank_aware
 from .scorers.extractive import normalize_qasper_answer, token_f1
+from .scorers.unanswerable import is_abstention
 from .types import (
     ANSWER_TYPE_FREE_FORM,
     AnswerScore,
@@ -497,7 +498,15 @@ class HotpotQABenchmark:
             value=f1,
             method="token_f1",
             per_annotator=(f1,),
-            metadata={"exact_match": em, "gold": gold},
+            metadata={
+                # Recorded for parity with the other two benchmarks under
+                # the shared contract. HotpotQA never had an abstention
+                # gate, so this field changes no score here; it exists so
+                # abstention RATES are comparable across all three.
+                "abstained": is_abstention(predicted),
+                "exact_match": em,
+                "gold": gold,
+            },
         )
 
 

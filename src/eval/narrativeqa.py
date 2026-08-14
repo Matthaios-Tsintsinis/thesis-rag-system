@@ -230,25 +230,35 @@ class NarrativeQABenchmark:
 
         extractive_max_f1 IS max-of-token_f1 over a string tuple —
         reused verbatim; consistent with QASPER's max-over-annotators
-        convention. Abstention scores 0 (NarrativeQA questions are
-        answerable by construction) but stays flagged in metadata.
+        convention.
+
+        THE SCORING CONTRACT (identical in multihop.py and hotpotqa.py):
+        the score is ALWAYS the computed token-F1. Abstention detection
+        is recorded in metadata.abstained and never reaches a value. The
+        gate this replaced forced 0.0 on any hedged prediction, which
+        discarded real overlap -- see docs/EVAL_AUDIT.md ISSUE-1.
+
+        NarrativeQA's own paper reports BLEU-1/4, METEOR and ROUGE-L.
+        Token-F1 is primary here for cross-benchmark consistency;
+        ROUGE-L is computed post-hoc as a secondary column so the numbers
+        can be read against the published ones.
         """
         refs = tuple(g.free_form for g in query.gold_answers if g.free_form)
         if not refs:
+            # Unreachable given the loader skips a story-question with no
+            # references. Kept as an explicit guard rather than an
+            # exception so one malformed row cannot kill a 1,208-query
+            # cell; the loader-side assertion is the real defence.
             return AnswerScore(value=0.0, method="no_references")
-        if is_abstention(predicted):
-            return AnswerScore(
-                value=0.0,
-                method="narrativeqa_abstained",
-                per_annotator=tuple(0.0 for _ in refs),
-                metadata={"abstained": True},
-            )
         per_ref = tuple(token_f1(predicted, r) for r in refs)
         return AnswerScore(
             value=extractive_max_f1(predicted, refs),
-            method="narrativeqa_token_f1",
+            method="token_f1",
             per_annotator=per_ref,
-            metadata={"abstained": False, "n_references": len(refs)},
+            metadata={
+                "abstained": is_abstention(predicted),
+                "n_references": len(refs),
+            },
         )
 
 

@@ -17,16 +17,21 @@ Question types from the dataset's explicit `question_type` field:
 Null queries carry empty `evidence_list` (out-of-corpus / unanswerable)
 and are scored via abstention.
 
-Answer scoring (Pass-1 skeleton):
-  * null_query annotations: score_abstention.
-  * Other queries: token_f1(predicted, gold.free_form). This is a
-    PLACEHOLDER — the official MultiHop-RAG metric is an LLM-judge on
-    free-form answers per the paper. Pass-2 swaps in the judge prompt
-    (gpt-4o-mini, same controlled-reader as the systems). Every
-    AnswerScore carries `pass1_placeholder=True` in its metadata so
-    downstream analysis can identify Pass-1 numbers vs final Pass-2
-    numbers. (The emitted method tag is the bare `multihop_token_f1`;
-    the metadata flag, not the method string, is the Pass-1 signal.)
+Answer scoring:
+  * null_query annotations: the unanswerable rule, method
+    `unanswerable_rule`.
+  * Other queries: token_f1(predicted, gold.free_form), method
+    `token_f1`, ALWAYS COMPUTED — abstention detection is metadata and
+    never reaches the value (see score_answer for what that replaced).
+
+  This is a LEXICAL STAND-IN: the official MultiHop-RAG metric is an
+  LLM-judge on free-form answers per the paper. No judge is run here and
+  none is planned — the harness deliberately has no model grading another
+  model's output, so there is no evaluator bias to argue about. Every
+  AnswerScore carries `pass1_placeholder=True`, and the RESULTS TABLE
+  CAPTION must state that this column is a lexical stand-in for the
+  paper's judge. The metadata flag, not the method string, is the
+  stand-in signal.
 """
 
 from __future__ import annotations
@@ -247,11 +252,27 @@ class MultiHopBenchmark:
     def score_answer(self, predicted: str, query: EvalQuery) -> AnswerScore:
         """MultiHop answer scorer (Pass-1).
 
+        THE SCORING CONTRACT (identical in narrativeqa.py and
+        hotpotqa.py). The score for an answerable query is token-F1
+        against gold and is ALWAYS COMPUTED. Abstention detection is
+        recorded in metadata.abstained and never reaches a value.
+
+        The gate this replaced returned 0.0 whenever the prediction
+        contained a hedging phrase, which discarded real token-F1: a
+        prediction carrying the exact gold string scored 0.0000 where its
+        F1 was 0.3333, and the same prediction scored differently on
+        HotpotQA, which never had the gate. Measured, not argued -- see
+        docs/EVAL_AUDIT.md ISSUE-1. A hedge is a property of PHRASING;
+        treating it as a refusal conflates the two.
+
         Primary value:
-          - null_query: score_abstention (1.0 if abstained, else 0.0).
+          - null_query: the unanswerable rule (method
+            "unanswerable_rule").
           - Other queries: token_F1 vs gold.free_form (the
             QASPER-consistent default; less false-positive-prone than
-            substring). Pass-2 swaps the primary to an LLM judge.
+            substring). The MultiHop-RAG paper evaluates answers with an
+            LLM judge; this column is a LEXICAL STAND-IN for it and the
+            results table must say so.
 
         Metadata always records both `token_f1` AND `substring_match`
         for analysis — substring's leniency (e.g. boundary-match of a
@@ -263,35 +284,25 @@ class MultiHopBenchmark:
         value is also recorded in metadata for downstream comparison.
         """
         gold = query.gold_answers[0]
+        # Detection is METADATA. It is computed once, recorded, and never
+        # consulted by any branch that produces a score.
+        abstained = is_abstention(predicted)
         if gold.answer_type == ANSWER_TYPE_UNANSWERABLE:
-            absc = score_abstention(predicted)
+            value = score_abstention(predicted)
             # Even on null_query, record substring + token_f1 against
             # the gold string for analytic visibility (how often does
             # the system fabricate a "factual" answer to a null query).
             tf1 = token_f1(predicted, gold.free_form) if gold.free_form else 0.0
             ssm = substring_match(predicted, gold.free_form) if gold.free_form else 0.0
             return AnswerScore(
-                value=absc,
-                method="abstention",
-                per_annotator=(absc,),
+                value=value,
+                method="unanswerable_rule",
+                per_annotator=(value,),
                 metadata={
+                    "abstained": abstained,
                     "token_f1": tf1,
                     "substring_match": ssm,
                     "max_lenient": max(tf1, ssm),
-                    "pass1_placeholder": True,
-                },
-            )
-        if is_abstention(predicted):
-            # Answerable question; predicted abstained -> 0.0 primary.
-            # Record substring too for symmetry (will be 0.0).
-            return AnswerScore(
-                value=0.0,
-                method="free_form_abstained",
-                per_annotator=(0.0,),
-                metadata={
-                    "token_f1": 0.0,
-                    "substring_match": 0.0,
-                    "max_lenient": 0.0,
                     "pass1_placeholder": True,
                 },
             )
@@ -299,9 +310,10 @@ class MultiHopBenchmark:
         ssm = substring_match(predicted, gold.free_form)
         return AnswerScore(
             value=tf1,
-            method="multihop_token_f1",
+            method="token_f1",
             per_annotator=(tf1,),
             metadata={
+                "abstained": abstained,
                 "token_f1": tf1,
                 "substring_match": ssm,
                 "max_lenient": max(tf1, ssm),

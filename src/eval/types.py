@@ -172,10 +172,15 @@ class RetrievalScore:
 class AnswerScore:
     """Answer-quality result for one (system, query).
 
-    `value` is the primary scalar (0-1). `method` describes what produced
-    it ('token_f1', 'exact_match', 'abstention', 'token_f1_placeholder',
-    etc.). `per_annotator` carries the raw per-annotator scores prior
-    to the max-over-annotators aggregation.
+    `value` is the primary scalar (0-1). `method` names the SCORING RULE
+    that produced it, never the OUTCOME: 'token_f1', 'exact_match',
+    'unanswerable_rule'. A method that encoded an outcome (the former
+    'free_form_abstained' / 'narrativeqa_abstained') made a scoring
+    decision legible only as a label, which is how a gate that discarded
+    real token-F1 survived unnoticed. `per_annotator` carries the raw
+    per-annotator scores prior to the max-over-annotators aggregation.
+    `metadata.abstained` records abstention DETECTION; it never affects
+    `value`.
     """
 
     value: float
