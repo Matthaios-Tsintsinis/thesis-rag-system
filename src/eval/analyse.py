@@ -38,7 +38,30 @@ from ..raptor_paper import PAPER_NON_LEAF_SHARE_BAND
 from .scorers import is_abstention
 
 
-def _iter_records(paths: Iterable[Path]) -> Iterable[dict]:
+def _iter_records(paths: Iterable[Path]) -> list[dict]:
+    """Load rows, DEDUPLICATED by query_id, last row wins.
+
+    Without this, a duplicated query_id is counted twice and silently
+    reweights every mean. `scripts/significance_diagnostic.py` has always
+    deduplicated (it keys a dict by query_id), so the two tools could
+    report different n and different means from the SAME file - measured
+    at 0.6667 against 0.5000 on a three-row fixture holding one duplicate
+    (docs/EVAL_AUDIT.md ISSUE-3). It is not acceptable for two tools in
+    one repo to disagree about what a file says.
+
+    Duplicates are NAMED, not just counted: an unexplained duplicate is a
+    symptom, and the id is what makes it diagnosable.
+
+    REFUSES a mix of systems or benchmarks in one invocation. Pooling two
+    systems into one mean is not a report anyone wants, and it is exactly
+    what a careless glob produces.
+    """
+    rows: dict[str, dict] = {}
+    duplicates: list[str] = []
+    n_lines = 0
+    systems: set[str] = set()
+    benchmarks: set[str] = set()
+
     for p in paths:
         with p.open("r", encoding="utf-8") as f:
             for line in f:
@@ -46,9 +69,84 @@ def _iter_records(paths: Iterable[Path]) -> Iterable[dict]:
                 if not line:
                     continue
                 try:
-                    yield json.loads(line)
+                    r = json.loads(line)
                 except json.JSONDecodeError as e:
                     print(f"[analyse] WARN: bad JSONL line in {p}: {e}")
+                    continue
+                n_lines += 1
+                systems.add(str(r.get("system_id", "?")))
+                benchmarks.add(str(r.get("benchmark", "?")))
+                qid = r.get("query_id")
+                if qid is None:
+                    print(f"[analyse] WARN: row without query_id in {p}")
+                    continue
+                qid = str(qid)
+                if qid in rows:
+                    duplicates.append(qid)
+                rows[qid] = r
+
+    if len(systems) > 1:
+        raise ValueError(
+            f"[analyse] REFUSING to pool {len(systems)} systems in one "
+            f"invocation: {sorted(systems)}. One system per run."
+        )
+    if len(benchmarks) > 1:
+        raise ValueError(
+            f"[analyse] REFUSING to pool {len(benchmarks)} benchmarks in one "
+            f"invocation: {sorted(benchmarks)}. One benchmark per run."
+        )
+    if duplicates:
+        uniq = sorted(set(duplicates))
+        print(
+            f"[analyse] WARN: {len(uniq)} duplicated query_id(s) collapsed "
+            f"(last row wins), {n_lines} lines -> {len(rows)} rows: "
+            f"{uniq[:10]}{' ...' if len(uniq) > 10 else ''}"
+        )
+    return list(rows.values())
+
+
+def _check_expected_n(paths: list[Path], n_rows: int) -> None:
+    """Abort when the row count disagrees with the loader's own count.
+
+    The expected count is read from the sibling `.summary.json`, where the
+    runner wrote what the BENCHMARK LOADER emitted at run time. It is
+    never a literal in this file: P7 re-draws NarrativeQA's sample, so any
+    constant here would be wrong by construction.
+
+    Skipped when the run was capped (`--max-units` / `--max-queries`), and
+    skipped with a warning when no summary is present - a partial mean is
+    worth reporting when it is ASKED for, and worth refusing when it is
+    not.
+    """
+    for p in paths:
+        summary_path = p.with_suffix("").with_suffix(".summary.json")
+        if not summary_path.exists():
+            summary_path = Path(str(p)[: -len(".jsonl")] + ".summary.json")
+        if not summary_path.exists():
+            print(f"[analyse] WARN: no summary beside {p.name}; cannot check "
+                  "the expected query count")
+            continue
+        try:
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"[analyse] WARN: unreadable summary {summary_path.name}: {e}")
+            continue
+        if summary.get("max_units") is not None or summary.get(
+            "max_queries"
+        ) is not None:
+            continue  # deliberately capped run
+        expected = summary.get("expected_n_queries")
+        if expected is None:
+            print(f"[analyse] WARN: {summary_path.name} predates "
+                  "expected_n_queries; cannot check the count")
+            continue
+        if int(expected) != n_rows:
+            raise ValueError(
+                f"[analyse] REFUSING to report a partial mean: {p.name} has "
+                f"{n_rows} distinct rows against the loader's "
+                f"{int(expected)} queries. A cell missing rows is an "
+                "incomplete run, not a smaller sample."
+            )
 
 
 def _expand_inputs(inputs: list[str]) -> list[Path]:
@@ -818,7 +916,9 @@ def main() -> None:
     for p in paths:
         print(f"  {p}")
 
-    rollup = _aggregate(_iter_records(paths))
+    records = _iter_records(paths)
+    _check_expected_n(paths, len(records))
+    rollup = _aggregate(records)
     _print_text(rollup, by_type=args.by_type)
 
     if args.output is not None:

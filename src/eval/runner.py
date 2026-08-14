@@ -482,6 +482,12 @@ def main() -> None:
             sum_ans_null / n_null if n_null else None
         ),
         "benchmark_stats": getattr(benchmark, "stats", {}),
+        # LOADER-DERIVED, never a literal. P8 asserts the post-dedup row
+        # count against this, and a hardcoded constant would abort every
+        # NarrativeQA cell the moment P7 re-drew the sample.
+        "expected_n_queries": (getattr(benchmark, "stats", {}) or {}).get(
+            "n_queries"
+        ),
         # Run-condition provenance (the aggregator's conditions columns;
         # every matrix row must be self-describing from birth). The
         # generator field is what keeps Qwen-era and gpt-4o-mini-era
