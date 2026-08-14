@@ -1,9 +1,29 @@
-"""QASPER extractive-answer scorer: SQuAD-style token-F1 with QASPER normaliser.
+"""SQuAD-style token-F1 with the official answer normaliser.
 
-Verbatim port of the QASPER official evaluator's `normalize_answer` and
-F1 computation (Dasigi et al., 2021; their qasper_eval.py). Lower-case,
-strip articles (a/an/the), drop punctuation, collapse whitespace. Then
-SQuAD-style token F1 between predicted and gold token sets.
+NORMALISER COMPOSITION, corrected 2026-08-14 and VERIFIED AGAINST SOURCE
+AFTER THE CHANGE. Both official evaluators compose identically:
+
+    white_space_fix(remove_articles(remove_punc(lower(s))))
+
+i.e. lower -> DROP PUNCTUATION -> STRIP ARTICLES -> collapse whitespace.
+Checked verbatim against `hotpotqa/hotpot` `hotpot_evaluate_v1.py` and
+the SQuAD 2.0 `evaluate-v2.0.py`; the two agree on order.
+
+This module previously ran lower -> strip articles -> drop punctuation,
+under a docstring claiming a verbatim port and asserting that "the
+ordering matters". It does matter, and the order was inverted: on
+"the-cat" the official pipeline removes the hyphen first, leaving
+"thecat" with no word boundary for the article regex to match, while the
+old order matched "the" against the hyphen boundary and returned "cat".
+Any answer with an article adjacent to punctuation therefore produced a
+different token stream from the published evaluator. That was a
+MISLABELLED deviation, not a documented one, and correcting it is what
+lets the deviations table claim HotpotQA matches its official metric.
+
+Unicode NFKC is applied FIRST, before lowercasing, so curly and straight
+apostrophes produce identical tokens. This is an addition to the official
+pipeline, applied uniformly to all three live benchmarks, and it cannot
+change any answer that was already ASCII.
 
 IMPORTANT — what the official QASPER scorer actually does with multiple
 extractive spans: it JOINS an annotator's spans into ONE reference
@@ -27,6 +47,7 @@ from __future__ import annotations
 
 import re
 import string
+import unicodedata
 from collections import Counter
 
 
@@ -35,19 +56,56 @@ _WHITESPACE_RE = re.compile(r"\s+")
 _PUNCT_TABLE = str.maketrans("", "", string.punctuation)
 
 
-def normalize_qasper_answer(s: str) -> str:
-    """Lowercase + strip articles + drop punctuation + collapse whitespace.
+def _strip_non_ascii_punctuation(s: str) -> str:
+    """Drop Unicode punctuation the official ASCII table cannot reach.
 
-    Ported from QASPER official `qasper_eval.normalize_answer`. The
-    ordering matters: lowercase first, THEN article-strip (otherwise
-    a capitalised "The" survives), THEN punctuation, THEN whitespace
-    collapse.
+    NFKC alone does NOT fold a curly apostrophe: U+2019 is not a
+    compatibility character, so it survives normalisation, and it is not
+    in `string.punctuation`, so the official table leaves it too — which
+    would tokenise "don't" as "don't" against "dont". Measured, not
+    assumed.
+
+    EXACTNESS ON ASCII IS PRESERVED. This runs AFTER the official table,
+    so every ASCII punctuation character is already gone and only
+    non-ASCII survives to be considered. Category P only: `string.punctuation`
+    also contains symbols (`$ + < = > ^ | ~`, category S) which the
+    official pipeline removes and which must stay removed — they are
+    handled by the table above, not here — while non-ASCII symbols (a
+    currency sign, say) are LEFT, exactly as the official pipeline leaves
+    them.
+    """
+    if s.isascii():
+        return s
+    return "".join(
+        ch for ch in s
+        if ch.isascii() or not unicodedata.category(ch).startswith("P")
+    )
+
+
+def normalize_qasper_answer(s: str) -> str:
+    """NFKC, then the official composition.
+
+    Order, matching `white_space_fix(remove_articles(remove_punc(lower(s))))`
+    in both published evaluators:
+
+      1. NFKC       — ours, so a curly apostrophe tokenises like a straight
+                      one. No effect on ASCII input.
+      2. lower
+      3. remove_punc
+      4. remove_articles
+      5. white_space_fix
+
+    Steps 3 and 4 are in the published order, which is the reverse of what
+    this function did before 2026-08-14. See the module docstring for the
+    "the-cat" divergence that made the difference observable.
     """
     if s is None:
         return ""
+    s = unicodedata.normalize("NFKC", s)
     s = s.lower()
-    s = _ARTICLES_RE.sub(" ", s)
     s = s.translate(_PUNCT_TABLE)
+    s = _strip_non_ascii_punctuation(s)
+    s = _ARTICLES_RE.sub(" ", s)
     s = _WHITESPACE_RE.sub(" ", s).strip()
     return s
 
@@ -61,10 +119,21 @@ def token_f1(predicted: str, gold: str) -> float:
     """
     pred_tokens = normalize_qasper_answer(predicted).split()
     gold_tokens = normalize_qasper_answer(gold).split()
-    if not pred_tokens and not gold_tokens:
-        return 1.0
+    # OFFICIAL SQuAD 2.0 rule, quoted from evaluate-v2.0.py:
+    #   if len(gold_toks) == 0 or len(pred_toks) == 0:
+    #     # If either is no-answer, then F1 is 1 if they agree, 0 otherwise
+    #     return int(gold_toks == pred_toks)
+    #
+    # THE TWO OFFICIAL REFERENCES DISAGREE HERE, and the disagreement is
+    # recorded rather than resolved by preference: HotpotQA's
+    # hotpot_evaluate_v1.f1_score has no no-answer branch, so two empty
+    # token lists fall through to `num_same == 0` and it returns 0.
+    # SQuAD's rule is adopted. The branch is UNREACHABLE in this pipeline
+    # either way: the loader assertion forbids a gold that normalises to
+    # empty, and the pred-only-empty case is where every implementation
+    # already agrees on 0. See tests/test_normalisation.py.
     if not pred_tokens or not gold_tokens:
-        return 0.0
+        return float(pred_tokens == gold_tokens)
     common = Counter(pred_tokens) & Counter(gold_tokens)
     n_common = sum(common.values())
     if n_common == 0:
@@ -87,7 +156,30 @@ def extractive_max_f1(predicted: str, gold_spans: tuple[str, ...]) -> float:
     return max(token_f1(predicted, g) for g in gold_spans)
 
 
+def assert_gold_not_empty(query_id: str, gold: str, *, benchmark: str) -> None:
+    """Abort at LOAD when an answerable query carries an empty gold.
+
+    This is the real defect behind the both-empty question, and catching
+    it here is why `token_f1` can keep the official SQuAD rule unchanged:
+    a gold that normalises to empty is malformed ground truth, not a
+    scoring edge case, and silently scoring it 1.0 against an empty
+    prediction would credit a system for saying nothing.
+
+    Null queries are EXEMPT by construction and must not be passed here —
+    their gold is empty on purpose and they score under
+    `unanswerable_rule`.
+    """
+    if not normalize_qasper_answer(gold):
+        raise ValueError(
+            f"{benchmark}: query {query_id!r} has an answerable gold answer "
+            f"that normalises to empty (raw {gold!r}). Ground truth is "
+            "malformed; scoring it would credit an empty prediction with "
+            "1.0 under the official SQuAD no-answer rule."
+        )
+
+
 __all__ = [
+    "assert_gold_not_empty",
     "normalize_qasper_answer",
     "token_f1",
     "extractive_max_f1",

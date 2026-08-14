@@ -42,6 +42,7 @@ from typing import Any, Iterable
 from ..retrievers.base import RetrievedChunk
 from .alignment import score_retrieval_ck2, score_retrieval_rank_aware
 from .scorers import (
+    assert_gold_not_empty,
     is_abstention,
     score_unanswerable,
     substring_match,
@@ -161,6 +162,12 @@ class MultiHopBenchmark:
                 self.stats["n_null_queries"] += 1
 
             gold_str = q.get("answer") or ""
+            if not is_null:
+                # Null queries are exempt: their gold is empty ON PURPOSE
+                # and they score under unanswerable_rule.
+                assert_gold_not_empty(
+                    query_id=f"multihop_{q_idx:06d}", gold=gold_str,
+                    benchmark="multihop_rag")
             gold = GoldAnswer(
                 answer_type=ANSWER_TYPE_UNANSWERABLE if is_null else ANSWER_TYPE_FREE_FORM,
                 free_form=gold_str,

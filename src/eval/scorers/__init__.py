@@ -15,6 +15,7 @@ applies max-over-annotators per QASPER convention.
 """
 
 from .extractive import (
+    assert_gold_not_empty,
     normalize_qasper_answer,
     token_f1,
     extractive_max_f1,
@@ -51,6 +52,7 @@ __all__ = [
     "score_multiple_choice",
     "ABSTENTION_PHRASES",
     "is_abstention",
+    "assert_gold_not_empty",
     "score_abstention",
     "score_unanswerable",
     "normalize_yes_no",

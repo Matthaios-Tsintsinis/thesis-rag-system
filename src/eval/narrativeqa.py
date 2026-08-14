@@ -61,7 +61,12 @@ from __future__ import annotations
 from typing import Any, Iterable
 
 from ..retrievers.base import RetrievedChunk
-from .scorers import extractive_max_f1, is_abstention, token_f1
+from .scorers import (
+    assert_gold_not_empty,
+    extractive_max_f1,
+    is_abstention,
+    token_f1,
+)
 from .types import (
     ANSWER_TYPE_FREE_FORM,
     AnswerScore,
@@ -185,6 +190,10 @@ class NarrativeQABenchmark:
             for q_idx, (question, refs) in enumerate(story["qa"]):
                 if not question or not refs:
                     continue
+                for ref in refs:
+                    assert_gold_not_empty(
+                        query_id=f"{did}::q{q_idx}", gold=ref,
+                        benchmark="narrativeqa")
                 self.stats["n_refs_total"] += len(refs)
                 queries.append(
                     EvalQuery(

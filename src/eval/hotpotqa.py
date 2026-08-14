@@ -86,7 +86,11 @@ from typing import Any, Iterable
 
 from ..retrievers.base import RetrievedChunk
 from .alignment import score_retrieval_ck2, score_retrieval_rank_aware
-from .scorers.extractive import normalize_qasper_answer, token_f1
+from .scorers.extractive import (
+    assert_gold_not_empty,
+    normalize_qasper_answer,
+    token_f1,
+)
 from .scorers.unanswerable import is_abstention
 from .types import (
     ANSWER_TYPE_FREE_FORM,
@@ -229,6 +233,10 @@ def _gold_atoms(row: Any) -> frozenset[tuple[str, str]]:
 
 def _query(row: Any, variant: str, parent_scope: str | None) -> EvalQuery:
     answer = (row.get("answer") or "").strip()
+    # HotpotQA has no unanswerable questions, so EVERY gold must survive
+    # normalisation.
+    assert_gold_not_empty(query_id=str(row["id"]), gold=answer,
+                          benchmark="hotpotqa")
     atoms = _gold_atoms(row)
     return EvalQuery(
         query_id=str(row["id"]),
