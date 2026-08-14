@@ -66,6 +66,17 @@ BENCHMARK_REGISTRY: dict[str, type] = {
 }
 
 
+def _tree_build_env() -> str | None:
+    """The resolved topology stack, recorded per cell. None if raptor_paper
+    is not importable (no tree-building system in this run)."""
+    try:
+        from ..raptor_paper import PAPER_TREE_BUILD_ENV
+
+        return PAPER_TREE_BUILD_ENV
+    except Exception:
+        return None
+
+
 def _git_commit_short() -> str:
     """Short HEAD hash for run provenance in summary.json. Never fatal —
     a clone without git metadata (or no git binary) degrades to
@@ -497,6 +508,10 @@ def main() -> None:
         ),
         "batch_size": args.batch_size,
         "max_padded_tokens": args.max_padded_tokens,
+        # Cold-tree provenance. None for systems with no tree; False on
+        # the P10 pass means the lever took and the tree was rebuilt.
+        "tree_cache_hit": getattr(system, "tree_cache_hit", None),
+        "tree_build_env": _tree_build_env(),
         "git_commit": _git_commit_short(),
         "output_path": str(args.output),
         "timestamp": stamp,

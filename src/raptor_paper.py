@@ -1335,6 +1335,41 @@ def load_collapsed_index(
 # --- cache identity (Lever B, strict reading) -----------------------------
 
 
+def _topology_env_id() -> str:
+    """Resolved versions of the libraries that DETERMINE tree topology.
+
+    UMAP + GMM output is version-sensitive even when seeded, which is why
+    P9 pins the stack at all. A tree built under an unpinned environment
+    is therefore not reproducible under the pinned one, and serving it
+    from cache would put M4 cells on artifacts the reproducibility
+    control declares unreproducible.
+
+    Folding this into the substrate key is the deliberate lever that
+    makes those old trees unreachable: the key changes with the stack, so
+    a cold build is forced rather than requested.
+
+    ONLY the three libraries that actually move topology are named.
+    Keying on the whole lockfile would rebuild every tree when an
+    unrelated test-only dependency moved, which is invalidation without
+    a reason. A missing package resolves to "absent" rather than raising:
+    this runs at import time on hosts that never build a tree.
+    """
+    from importlib.metadata import PackageNotFoundError, version
+
+    parts = []
+    for pkg in ("umap-learn", "scikit-learn", "numpy"):
+        try:
+            parts.append(f"{pkg}={version(pkg)}")
+        except PackageNotFoundError:
+            parts.append(f"{pkg}=absent")
+    return ";".join(parts)
+
+
+# Resolved once at import. Recorded in every M4 manifest and run summary
+# so a cell says which stack built its tree.
+PAPER_TREE_BUILD_ENV = _topology_env_id()
+
+
 def paper_substrate_extra(
     *,
     params: PaperTreeParams,
@@ -1348,6 +1383,7 @@ def paper_substrate_extra(
     fusion: str = "rrf",
     rrf_k: int = 60,
     include_root: bool = True,
+    build_env: str | None = None,
 ) -> dict:
     """M4's substrate-key extras. Deliberately NOT a call into src/raptor.py.
 
@@ -1395,6 +1431,10 @@ def paper_substrate_extra(
         "summary_max_tokens": int(summary_max_tokens),
         "summary_batch_size": int(summary_batch_size),
         "summary_max_padded_tokens": int(summary_max_padded_tokens),
+        # THE COLD-TREE LEVER. See _topology_env_id: keys the substrate on
+        # the stack that determines UMAP+GMM topology, so a tree built
+        # under a different stack cannot satisfy this key.
+        "build_env": PAPER_TREE_BUILD_ENV if build_env is None else build_env,
     }
 
 

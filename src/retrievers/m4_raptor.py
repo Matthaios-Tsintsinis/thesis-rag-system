@@ -110,6 +110,7 @@ from ..config import DEFAULT_CONFIG, RETRIEVAL_RANKING_DEPTH, HarnessConfig
 from ..models import embed_texts, load_embedder
 from ..parsing import walk_corpus
 from ..raptor_paper import (
+    PAPER_TREE_BUILD_ENV,
     PaperCollapsedIndex,
     PaperNode,
     PaperTree,
@@ -169,6 +170,10 @@ class RaptorSystem(BaseSystem):
         self._tree: PaperTree | None = None
         self._flat: PaperCollapsedIndex | None = None
         self._index_stats: dict = {}
+        # Set by index(): True when the substrate was served warm. P10's
+        # preflight FAILS on a True here, because the cold-tree lever not
+        # taking is exactly the failure it exists to catch.
+        self.tree_cache_hit: bool | None = None
         self._last_trace: dict = {}
         self._resolved: ResolvedComponents | None = None
 
@@ -262,6 +267,7 @@ class RaptorSystem(BaseSystem):
 
         if cdir.is_complete(REQUIRED_FILES):
             print(f"[{self.system_id}] cache hit: {cdir.path}")
+            self.tree_cache_hit = True
             self.chunks = load_chunks(cdir.chunks_path)
             self.chunk_embeddings = load_embeddings(cdir.embeddings_path)
             self._tree = load_paper_tree(
@@ -279,6 +285,7 @@ class RaptorSystem(BaseSystem):
 
         self._guard_index_llm()
         print(f"[{self.system_id}] cache miss -> building index at {cdir.path}")
+        self.tree_cache_hit = False
         docs = list(walk_corpus(corpus_path, min_chars=chunker_cfg.min_chars_per_doc))
         embedder = (
             load_embedder(embedder_id) if chunker_cfg.strategy == "semantic" else None
@@ -360,6 +367,9 @@ class RaptorSystem(BaseSystem):
                 # reproducible against a PINNED runtime rather than
                 # absolutely. Recorded so a mismatch is visible, not silent.
                 "summariser_runtime": self._summariser_runtime(),
+                # Which stack built this tree, recorded beside the key it
+                # is named by.
+                "build_env": PAPER_TREE_BUILD_ENV,
             },
         ).save(cdir.manifest_path)
 
