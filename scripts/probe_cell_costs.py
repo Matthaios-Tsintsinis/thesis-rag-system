@@ -186,6 +186,63 @@ def probe_tree_builds(benchmarks: list[str]) -> list[dict]:
     return rows
 
 
+def _cap_moves_key() -> bool:
+    """Does summary_max_padded_tokens actually change the substrate key?
+
+    Pure: compares two keys over a FIXED stub corpus hash, so it asks
+    about the LEVER and not about any particular story. That is what lets
+    it separate the two reasons a build can come back warm.
+    """
+    import dataclasses
+
+    from src.cache import compute_cache_key
+    from src.config import DEFAULT_CONFIG
+    from src.raptor_paper import paper_substrate_extra
+
+    def key(cap: int) -> str:
+        m4 = dataclasses.replace(DEFAULT_CONFIG.m4,
+                                 summary_max_padded_tokens=cap)
+        extra = paper_substrate_extra(
+            params=m4.paper, summary_model=m4.summary_model,
+            summary_prompt_version=m4.summary_prompt_version,
+            summary_max_tokens=m4.summary_max_tokens,
+            summary_batch_size=m4.summary_batch_size,
+            summary_max_padded_tokens=m4.summary_max_padded_tokens,
+            rrf_k=m4.rrf_k, include_root=m4.include_root_in_flat_index)
+        return compute_cache_key(chunking_config=m4.chunker,
+                                 embedder_model="stub", corpus_hash="stub",
+                                 extra=extra, parsing_identity={})
+
+    return key(8000) != key(4000)
+
+
+def _warm_hit_message(cap: int, story: str, build_s: float) -> str:
+    """Two different situations wore the same message. Separate them.
+
+    A warm substrate means EITHER this exact cap was already built for
+    this story - a repeat request, not a defect - OR the cap failed to
+    move the key, which is a lever bug that would silently serve one
+    cap tree for another. Reporting both as "the cap is supposed to move
+    the key" made a routine repeat look like a defect, and would have
+    made a real defect look routine.
+    """
+    if _cap_moves_key():
+        return (
+            f"cap={cap} was ALREADY BUILT for {story}: the substrate came "
+            f"back warm in {build_s:.1f}s, which is a cache read and not a "
+            "build. REPEAT REQUEST, not a defect - the cap does move the "
+            "key, verified just now against two other values. Pass "
+            "--force-cold to rebuild, or sweep a cap this story has not "
+            "seen."
+        )
+    return (
+        f"cap={cap}: LEVER BUG. The substrate came back warm AND two "
+        "different caps produce the SAME cache key, so a tree built at one "
+        "cap can be served for another. Every sweep result is suspect until "
+        "paper_substrate_extra folds the cap again."
+    )
+
+
 def _vram_peak_gb() -> float | None:
     try:
         import torch
@@ -213,8 +270,43 @@ def _is_oom(exc: BaseException) -> bool:
         "OutOfMemoryError")
 
 
+def _force_cold():
+    """Make the next index() take the BUILD path, whatever is cached.
+
+    DELIBERATELY NOT `rm -rf` ON THE SUBSTRATE DIRECTORY, and the
+    deviation is worth stating. A probe that deletes from a Drive path is
+    one typo away from removing a banked tree that cost hours, and
+    working out WHICH directory to delete means reproducing the key
+    derivation - the thing under test. Overriding the cache CHECK instead
+    makes index() take the miss branch, rebuild every artifact, and
+    overwrite in place. The manifest is still written last, so an
+    interrupted rebuild leaves an incomplete directory the next run
+    treats as a miss.
+
+    Same cold compute; no destructive filesystem operation. Returns the
+    original method so the caller restores it.
+    """
+    from src import cache as cache_mod
+
+    original = cache_mod.CacheDir.is_complete
+
+    def always_cold(self, required):  # noqa: ANN001
+        return False
+
+    cache_mod.CacheDir.is_complete = always_cold
+    return original
+
+
+def _restore_cache_check(original) -> None:
+    from src import cache as cache_mod
+
+    if original is not None:
+        cache_mod.CacheDir.is_complete = original
+
+
 def probe_padding_sweep(
-    benchmark_id: str, story_id: str, values: list[int], sweep_all: bool
+    benchmark_id: str, story_id: str, values: list[int], sweep_all: bool,
+    force_cold: bool = False,
 ) -> list[dict]:
     """Largest `summary_max_padded_tokens` that builds the worst-case unit.
 
@@ -258,12 +350,16 @@ def probe_padding_sweep(
                                    summary_max_padded_tokens=cap),
         )
         system = RaptorSystem(cfg)
+        restore = _force_cold() if force_cold else None
+        if force_cold:
+            print(f"[probe] --force-cold: cache check overridden for cap={cap}")
         _vram_reset()
         print(f"[probe] --- summary_max_padded_tokens={cap} ---")
         t0 = time.perf_counter()
         try:
             system.index_items(unit.corpus)
         except Exception as exc:  # noqa: BLE001 - the OOM IS the result
+            _restore_cache_check(restore)
             dt = time.perf_counter() - t0
             oom = _is_oom(exc)
             rows.append({
@@ -280,9 +376,9 @@ def probe_padding_sweep(
             continue
 
         dt = time.perf_counter() - t0
+        _restore_cache_check(restore)
         if system.tree_cache_hit:
-            _fail(f"cap={cap}: substrate served WARM — {dt:.1f}s is a cache "
-                  "read, not a build. The cap is supposed to move the key.")
+            _fail(_warm_hit_message(cap, str(unit.corpus_id), dt))
         stats = dict(system.index_stats)
         if int(stats.get("n_summary_calls_at_index", 0) or 0) <= 0:
             _fail(f"cap={cap}: zero summary calls; no summariser work timed.")
@@ -365,6 +461,9 @@ def main(argv: list[str] | None = None) -> int:
                          "for the biggest unit in the CELL'S OWN draw")
     ap.add_argument("--sweep-benchmark", default="narrativeqa")
     ap.add_argument("--sweep-values", default="16000,8000,4000,2000")
+    ap.add_argument("--force-cold", action="store_true",
+                    help="rebuild even when this story and cap are already "
+                         "cached (overrides the cache check; deletes nothing)")
     ap.add_argument("--sweep-all", action="store_true",
                     help="measure every value instead of stopping at the "
                          "largest that survives")
@@ -395,7 +494,7 @@ def main(argv: list[str] | None = None) -> int:
         report["padding_sweep"] = probe_padding_sweep(
             args.sweep_benchmark, args.story_id,
             [int(v) for v in args.sweep_values.split(",") if v.strip()],
-            args.sweep_all)
+            args.sweep_all, force_cold=args.force_cold)
     if args.mode in ("tree", "both"):
         report["tree_builds"] = probe_tree_builds(
             [b.strip() for b in args.tree_benchmarks.split(",") if b.strip()])
