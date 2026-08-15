@@ -93,6 +93,8 @@ the shared harness chunker at this commit, so NO cache key moves.
 
 from __future__ import annotations
 
+import time as _time_mod
+
 import functools
 import json
 import re
@@ -512,6 +514,81 @@ class PaperTree:
 # --- clustering (port of cluster_utils.py) --------------------------------
 
 
+class _PhaseClock:
+    """Cumulative wall-time and call counts per build phase.
+
+    PURE INSTRUMENTATION. It records; nothing branches on what it
+    records, so a timed build produces a byte-identical tree to an
+    untimed one. It changes nothing the cache key reads —
+    `paper_substrate_extra` folds PARAMETERS, not code — so this does not
+    invalidate a substrate.
+
+    It exists because a 4,953-leaf story took 20,691 s and the harness
+    could not say WHERE. Summarisation and clustering want opposite
+    fixes: one is a token-cap and batch-width question on the GPU, the
+    other is single-threaded CPU work that no VRAM metric can see.
+    Guessing between them costs a five-hour build per guess.
+    """
+
+    def __init__(self) -> None:
+        self.seconds: dict[str, float] = {}
+        self.calls: dict[str, int] = {}
+
+    def reset(self) -> None:
+        self.seconds.clear()
+        self.calls.clear()
+
+    def add(self, phase: str, dt: float) -> None:
+        self.seconds[phase] = self.seconds.get(phase, 0.0) + dt
+        self.calls[phase] = self.calls.get(phase, 0) + 1
+
+    def as_stats(self) -> dict:
+        total = sum(self.seconds.values())
+        return {
+            "phase_seconds": {k: round(v, 2) for k, v in sorted(
+                self.seconds.items(), key=lambda kv: -kv[1])},
+            "phase_calls": dict(self.calls),
+            "phase_share": ({k: round(v / total, 4)
+                             for k, v in self.seconds.items()}
+                            if total else {}),
+            "phase_measured_total_s": round(total, 2),
+        }
+
+
+_CLOCK = _PhaseClock()
+
+
+def get_phase_clock() -> _PhaseClock:
+    """The build's phase timings. Read after build_paper_tree returns."""
+    return _CLOCK
+
+
+def _timed(phase: str):
+    """Wrap a phase function so its wall time accrues to `phase`.
+
+    A decorator rather than inline `with` blocks: the timed calls are
+    multi-line constructor expressions, and re-indenting them to insert a
+    context manager would be a behavioural edit dressed as instrumentation.
+    """
+    import functools
+
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            import time as _time
+
+            t0 = _time.perf_counter()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                _CLOCK.add(phase, _time.perf_counter() - t0)
+
+        return wrapper
+
+    return deco
+
+
+@_timed("umap")
 def _umap_reduce(
     embeddings: np.ndarray,
     dim: int,
@@ -559,6 +636,7 @@ def _local_cluster_embeddings(
     )
 
 
+@_timed("gmm_bic_sweep")
 def _get_optimal_clusters(
     embeddings: np.ndarray, params: PaperTreeParams, stats: dict
 ) -> int:
@@ -612,6 +690,7 @@ def _get_optimal_clusters(
     return fitted[int(np.argmin(bics))]
 
 
+@_timed("gmm_final_fit")
 def _gmm_cluster(
     embeddings: np.ndarray, params: PaperTreeParams, stats: dict
 ) -> tuple[list[np.ndarray], int]:
@@ -996,6 +1075,13 @@ def build_paper_tree(
         raise ValueError("chunk_texts must be non-empty")
 
     cluster = cluster_fn if cluster_fn is not None else perform_clustering
+    _CLOCK.reset()
+    try:
+        from .models import reset_generate_calls
+
+        reset_generate_calls()
+    except Exception:
+        pass
     stats: dict = {"n_summary_calls": 0}
 
     nodes: dict[str, PaperNode] = {}
@@ -1034,7 +1120,9 @@ def build_paper_tree(
         clusters.sort(key=lambda c: _cluster_sort_key(c, position))
 
         contexts = [get_text(c) for c in clusters]
+        _t0 = _time_mod.perf_counter()
         summaries = list(summarize_batch_fn(contexts))
+        _CLOCK.add("summarize", _time_mod.perf_counter() - _t0)
         if len(summaries) != len(contexts):
             # Alignment is POSITIONAL, so a length mismatch does not
             # raise on its own — it silently attaches each summary to the
@@ -1074,7 +1162,9 @@ def build_paper_tree(
         keep = [bool(t and t.strip()) for t in texts]
         to_embed = [t for t, k in zip(texts, keep) if k]
         if to_embed:
+            _t0 = _time_mod.perf_counter()
             emb = embed_fn(to_embed)
+            _CLOCK.add("embed", _time_mod.perf_counter() - _t0)
             it = iter(emb)
             for nid, k in zip(new_ids, keep):
                 nodes[nid].embedding = (
@@ -1118,6 +1208,20 @@ def build_paper_tree(
     # property of small corpora (HotpotQA's standard distractor setting
     # gives ~10 paragraphs per question, i.e. ~8-12 leaves) rather than a
     # bug, which is exactly why nothing else would ever flag it.
+    try:
+        from .models import GENERATE_CALLS
+
+        widths = list(GENERATE_CALLS.get("widths", []))
+        tree.stats["generate_calls"] = {
+            "n_calls": int(GENERATE_CALLS.get("n_calls", 0)),
+            "mean_width": (round(sum(widths) / len(widths), 2)
+                           if widths else None),
+            "max_width": max(widths) if widths else None,
+            "min_width": min(widths) if widths else None,
+        }
+    except Exception:
+        tree.stats["generate_calls"] = None
+    tree.stats.update(_CLOCK.as_stats())
     tree.stats["degenerate_no_tree"] = not tree.summary_nodes()
     if tree.stats["degenerate_no_tree"]:
         print(

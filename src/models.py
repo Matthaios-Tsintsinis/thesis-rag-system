@@ -558,6 +558,17 @@ def describe_generator_runtime(
     return out
 
 
+# Populated by generate_batch: how many model.generate() invocations were
+# issued and how wide each was. Module-level because the interesting
+# consumer (tree building) is three frames away and threading a counter
+# through would change signatures for a diagnostic.
+GENERATE_CALLS: dict = {}
+
+
+def reset_generate_calls() -> None:
+    GENERATE_CALLS.clear()
+
+
 def generate_batch(
     system_prompts: list[str],
     user_prompts: list[str],
@@ -668,7 +679,16 @@ def generate_batch(
     results: list[str] = [""] * len(texts)
     try:
         n_done = 0
+        # REAL generate() call accounting. `n_summary_calls` in the tree
+        # stats counts NODES (one summary per node), which says nothing
+        # about whether those nodes were batched — 24 nodes could be 1
+        # call or 24. This counts the invocations that actually cost
+        # prefill, and the width of each, so "is batching working" stops
+        # being an inference from wall clock.
+        GENERATE_CALLS["n_calls"] = GENERATE_CALLS.get("n_calls", 0) + 0
         for group_no, idxs in enumerate(groups):
+            GENERATE_CALLS["n_calls"] = GENERATE_CALLS.get("n_calls", 0) + 1
+            GENERATE_CALLS.setdefault("widths", []).append(len(idxs))
             batch_texts = [texts[i] for i in idxs]
             enc = tokenizer(
                 batch_texts,

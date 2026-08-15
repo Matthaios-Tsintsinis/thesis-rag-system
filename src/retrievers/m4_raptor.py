@@ -414,7 +414,22 @@ class RaptorSystem(BaseSystem):
             _layer_to_unit_type(int(r["layer"])) for r in self._flat.refs
         )
         stats.update({
+            # NAMED FOR WHAT IT IS: this counts NODES summarised, one per
+            # summary, NOT model.generate() invocations. 24 nodes may be
+            # one batched call or 24 unbatched ones and this number
+            # cannot tell them apart — see generate_calls below, which
+            # can.
             "n_summary_calls_at_index": int(self._tree.stats.get("n_summary_calls", 0)),
+            "n_summary_nodes_at_index": int(self._tree.stats.get("n_summary_calls", 0)),
+            # PHASE ATTRIBUTION. Lands in tree.stats from the build
+            # clock; copied here because tree_stats() builds its own dict
+            # and would otherwise drop it, which is exactly why the first
+            # instrumented build reported no phase block.
+            "phase_seconds": self._tree.stats.get("phase_seconds"),
+            "phase_calls": self._tree.stats.get("phase_calls"),
+            "phase_share": self._tree.stats.get("phase_share"),
+            "phase_measured_total_s": self._tree.stats.get("phase_measured_total_s"),
+            "generate_calls": self._tree.stats.get("generate_calls"),
             # Legacy key names kept so existing smoke assertions and the
             # analyser keep reading M4 without a parallel vocabulary.
             "tree_n_nodes": stats["n_nodes"],
