@@ -45,7 +45,17 @@ the run it de-risks.
 
 from __future__ import annotations
 
+import os
+
+# BEFORE ANY TORCH IMPORT. The allocator config is read once, when torch
+# initialises CUDA; setting it later is a no-op that looks like it worked.
+# Baked in here rather than left to the shell so it is part of the
+# MEASUREMENT — an ambient export that differs between the probe session
+# and the real run would make the probe's headroom a fiction.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import argparse
+import dataclasses
 import json
 import sys
 import time
@@ -70,15 +80,51 @@ def _prewarm() -> float:
     return dt
 
 
-def _one_unit(benchmark_id: str):
-    """The smallest honest unit of each benchmark's corpus shape."""
+# The NarrativeQA cell draws 40 stories; this is how many the probe must
+# draw too. Using --max-units 1 runs subsample_indices(115, 1), which is a
+# DIFFERENT seeded draw from subsample_indices(115, 40) — it selected story
+# index 65 where the matrix's first story is index 1. A probe that measures
+# a story the run will not build is measuring the wrong thing.
+NARRATIVEQA_CELL_UNITS = 40
+
+
+def _units_for(benchmark_id: str, max_units: int | None):
     from src.eval.runner import BENCHMARK_REGISTRY
 
     bench = BENCHMARK_REGISTRY[benchmark_id]()
-    split = "validation"
-    for unit in bench.iter_eval_units(split=split, max_units=1):
+    units = list(bench.iter_eval_units(split="validation", max_units=max_units))
+    if not units:
+        _fail(f"{benchmark_id}: loader yielded no unit")
+    return bench, units
+
+
+def _one_unit(benchmark_id: str, story_id: str | None = None):
+    """One unit, drawn from THE SAME sample the matrix cell will use.
+
+    `story_id` accepts a prefix. "largest" picks the biggest corpus in the
+    cell's own draw, which is the memory worst case and therefore the only
+    unit whose success bounds the whole cell.
+    """
+    max_units = (NARRATIVEQA_CELL_UNITS
+                 if benchmark_id == "narrativeqa" else 1)
+    bench, units = _units_for(benchmark_id, max_units)
+
+    if story_id in (None, ""):
+        return bench, units[0]
+    if story_id == "largest":
+        unit = max(units, key=lambda u: sum(len(i.text) for i in u.corpus))
+        print(f"[probe] largest unit in the {len(units)}-unit draw: "
+              f"{unit.corpus_id} "
+              f"({sum(len(i.text) for i in unit.corpus):,} chars)")
         return bench, unit
-    _fail(f"{benchmark_id}: loader yielded no unit")
+    matches = [u for u in units if str(u.corpus_id).startswith(story_id)]
+    if not matches:
+        _fail(f"{benchmark_id}: no unit in the {len(units)}-unit draw whose "
+              f"corpus_id starts with {story_id!r}. The probe must target a "
+              "unit the CELL will actually build.")
+    if len(matches) > 1:
+        _fail(f"{benchmark_id}: {story_id!r} matches {len(matches)} units")
+    return bench, matches[0]
 
 
 def probe_tree_builds(benchmarks: list[str]) -> list[dict]:
@@ -140,6 +186,131 @@ def probe_tree_builds(benchmarks: list[str]) -> list[dict]:
     return rows
 
 
+def _vram_peak_gb() -> float | None:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return round(torch.cuda.max_memory_allocated() / 2**30, 2)
+    except Exception:
+        pass
+    return None
+
+
+def _vram_reset() -> None:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats()
+    except Exception:
+        pass
+
+
+def _is_oom(exc: BaseException) -> bool:
+    return "out of memory" in str(exc).lower() or type(exc).__name__ == (
+        "OutOfMemoryError")
+
+
+def probe_padding_sweep(
+    benchmark_id: str, story_id: str, values: list[int], sweep_all: bool
+) -> list[dict]:
+    """Largest `summary_max_padded_tokens` that builds the worst-case unit.
+
+    WHY THIS KNOB AND NOT summary_batch_size. `generate_batch` packs until
+    `n * longest_prompt` reaches the cap, so on ~800-token summary prompts
+    the effective batch is already clipped well below the nominal 32.
+    Halving the CAP halves peak activation directly; halving the batch
+    size may not move the effective batch at all.
+
+    WHY THE LARGEST THAT FITS, NOT THE SMALLEST THAT RUNS. The cap is not
+    purely operational: a smaller cap means fewer summary contexts per
+    batch, which can change what gets summarised, and therefore tree
+    topology and M4's retrieval numbers. Staying near the intended RAPTOR
+    construction argues for the high end of what survives.
+
+    EACH VALUE IS ITS OWN COLD BUILD, free of cross-contamination: the cap
+    sits in `paper_substrate_extra`, so every sweep step lands on a
+    different cache key. The cache-hit assertion still runs at each step,
+    because "different key" is a claim about the code and the probe checks
+    it against the artifact.
+
+    Default is DESCENDING, STOPPING AT THE FIRST SUCCESS: that success IS
+    the answer, and every lower value is a strictly worse choice by the
+    fidelity argument above. --sweep-all measures the rest for the
+    tradeoff curve, at the price of three more full builds of a ~4,900-leaf
+    story.
+    """
+    from src.config import DEFAULT_CONFIG
+    from src.retrievers.m4_raptor import RaptorSystem
+
+    bench, unit = _one_unit(benchmark_id, story_id)
+    n_chars = sum(len(i.text) for i in unit.corpus)
+    print(f"[probe] sweep target: {unit.corpus_id} ({n_chars:,} chars, "
+          f"{len(unit.queries)} queries)")
+
+    rows: list[dict] = []
+    for cap in sorted(values, reverse=True):
+        cfg = dataclasses.replace(
+            DEFAULT_CONFIG,
+            m4=dataclasses.replace(DEFAULT_CONFIG.m4,
+                                   summary_max_padded_tokens=cap),
+        )
+        system = RaptorSystem(cfg)
+        _vram_reset()
+        print(f"[probe] --- summary_max_padded_tokens={cap} ---")
+        t0 = time.perf_counter()
+        try:
+            system.index_items(unit.corpus)
+        except Exception as exc:  # noqa: BLE001 - the OOM IS the result
+            dt = time.perf_counter() - t0
+            oom = _is_oom(exc)
+            rows.append({
+                "summary_max_padded_tokens": cap, "ok": False,
+                "oom": oom, "error": f"{type(exc).__name__}: {exc}"[:300],
+                "elapsed_s": round(dt, 2), "peak_vram_gb": _vram_peak_gb(),
+            })
+            print(f"[probe] cap={cap:<6} {'OOM' if oom else 'ERROR'} after "
+                  f"{dt:.1f}s  peak={_vram_peak_gb()}GB")
+            if not oom:
+                _fail(f"cap={cap} failed for a reason that is NOT OOM; the "
+                      "sweep cannot interpret it. Fix that first.")
+            _vram_reset()
+            continue
+
+        dt = time.perf_counter() - t0
+        if system.tree_cache_hit:
+            _fail(f"cap={cap}: substrate served WARM — {dt:.1f}s is a cache "
+                  "read, not a build. The cap is supposed to move the key.")
+        stats = dict(system.index_stats)
+        if int(stats.get("n_summary_calls_at_index", 0) or 0) <= 0:
+            _fail(f"cap={cap}: zero summary calls; no summariser work timed.")
+        row = {
+            "summary_max_padded_tokens": cap, "ok": True, "oom": False,
+            "build_s": round(dt, 2), "peak_vram_gb": _vram_peak_gb(),
+            "n_leaves": int(stats.get("n_leaves", 0) or 0),
+            "n_summary_calls": int(stats.get("n_summary_calls_at_index", 0) or 0),
+            "n_summary_nodes": int(stats.get("flat_n_summaries", 0) or 0),
+            "layer_sizes": stats.get("layer_sizes"),
+        }
+        rows.append(row)
+        print(f"[probe] cap={cap:<6} OK build={dt:8.1f}s  "
+              f"peak={row['peak_vram_gb']}GB  leaves={row['n_leaves']} "
+              f"summary_calls={row['n_summary_calls']}")
+        _vram_reset()
+        if not sweep_all:
+            print(f"[probe] LARGEST SURVIVING CAP = {cap} (stopping; every "
+                  "lower value is strictly worse for tree fidelity)")
+            break
+
+    survivors = [r for r in rows if r.get("ok")]
+    if not survivors:
+        _fail("no value in the sweep completed. Lower the range, or fall "
+              "back to summary_batch_size as the second knob.")
+    return rows
+
+
 def probe_query_slice(system_ids: list[str], benchmark_id: str, n: int) -> list[dict]:
     """Timed slice: s_per_query net of indexing and of model load."""
     from src.config import DEFAULT_CONFIG
@@ -186,7 +357,17 @@ def probe_query_slice(system_ids: list[str], benchmark_id: str, n: int) -> list[
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--mode", choices=("tree", "queries", "both"), default="both")
+    ap.add_argument("--mode",
+                    choices=("tree", "queries", "both", "sweep"),
+                    default="both")
+    ap.add_argument("--story-id", default="largest",
+                    help="corpus_id prefix to target, or 'largest' (default) "
+                         "for the biggest unit in the CELL'S OWN draw")
+    ap.add_argument("--sweep-benchmark", default="narrativeqa")
+    ap.add_argument("--sweep-values", default="16000,8000,4000,2000")
+    ap.add_argument("--sweep-all", action="store_true",
+                    help="measure every value instead of stopping at the "
+                         "largest that survives")
     ap.add_argument("--n", type=int, default=50, help="queries in the timed slice")
     ap.add_argument("--tree-benchmarks", default="narrativeqa,multihop_rag,hotpotqa")
     ap.add_argument("--query-systems", default="M4,M9")
@@ -198,14 +379,23 @@ def main(argv: list[str] | None = None) -> int:
 
     report: dict[str, Any] = {
         "environment": environment_provenance(Path("requirements.lock")),
+        "pytorch_cuda_alloc_conf": os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
         "prewarm_s": None,
         "tree_builds": [],
         "query_slices": [],
+        "padding_sweep": [],
     }
+    print(f"[probe] PYTORCH_CUDA_ALLOC_CONF="
+          f"{report['pytorch_cuda_alloc_conf']}")
     print(f"[probe] gpu={report['environment'].get('gpu')}")
 
     report["prewarm_s"] = round(_prewarm(), 1)
 
+    if args.mode == "sweep":
+        report["padding_sweep"] = probe_padding_sweep(
+            args.sweep_benchmark, args.story_id,
+            [int(v) for v in args.sweep_values.split(",") if v.strip()],
+            args.sweep_all)
     if args.mode in ("tree", "both"):
         report["tree_builds"] = probe_tree_builds(
             [b.strip() for b in args.tree_benchmarks.split(",") if b.strip()])
