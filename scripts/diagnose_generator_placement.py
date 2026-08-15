@@ -83,6 +83,17 @@ def describe_placement() -> dict:
         "fraction_params_off_gpu": (
             round(off_gpu / total_params, 4) if total_params else None),
         "hf_device_map": getattr(model, "hf_device_map", None),
+        # KV CACHE. generate() is called without use_cache in
+        # models.py, so it inherits these. Decoding WITHOUT a cache
+        # re-runs the full prefill at every step, which turns a ~2.4 s
+        # prefill plus 100 decode steps into ~240 s — and ~236 s is what
+        # a summary generate() call actually measured. Reported because
+        # that arithmetic fits far too well to leave unchecked, and
+        # because transformers 5.x is a major version where a default is
+        # worth reading rather than assuming.
+        "config_use_cache": getattr(model.config, "use_cache", None),
+        "generation_config_use_cache": getattr(
+            getattr(model, "generation_config", None), "use_cache", None),
     }
     if torch.cuda.is_available():
         free_b, total_b = torch.cuda.mem_get_info()
@@ -100,6 +111,15 @@ def describe_placement() -> dict:
         if spilled else
         "FULLY RESIDENT — all parameters on GPU; the cost is elsewhere."
     )
+    if info.get("config_use_cache") is False or info.get(
+            "generation_config_use_cache") is False:
+        info["verdict"] += (
+            " ⚠ KV CACHE IS OFF. Every decode step re-runs the full "
+            "prefill, which multiplies a 100-token summary by ~100x and "
+            "matches the measured 236 s/call almost exactly. This is a "
+            "bug, not a memory limit, and fixing it costs nothing "
+            "methodologically."
+        )
     if fp32:
         info["verdict"] += (
             " AND the model is FP32: the dtype kwarg did not take, which on "

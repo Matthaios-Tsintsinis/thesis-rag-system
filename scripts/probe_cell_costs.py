@@ -337,6 +337,76 @@ def _restore_cache_check(original) -> None:
         cache_mod.CacheDir.is_complete = original
 
 
+def probe_batch_sweep(
+    benchmark_id: str, story_id: str, cap: int, batch_sizes: list[int],
+    force_cold: bool = True,
+) -> list[dict]:
+    """Sweep summary_batch_size at a FIXED cap.
+
+    A different lever from the cap, and a better trade if it works.
+    `max_padded_tokens` bounds n x longest_prompt, so lowering the CAP
+    shrinks the context each sequence may carry — which can change what
+    gets summarised, and therefore tree topology. Lowering the BATCH SIZE
+    reduces how many sequences are in flight without touching any
+    sequence's context, so KV cache and activations fall while tree
+    CONTENT stays put.
+
+    Both knobs sit in paper_substrate_extra, so each value is its own
+    cold build and its own cache key.
+    """
+    import dataclasses
+
+    from src.config import DEFAULT_CONFIG
+    from src.retrievers.m4_raptor import RaptorSystem
+
+    bench, unit = _one_unit(benchmark_id, story_id)
+    print(f"[probe] batch sweep on {unit.corpus_id} at cap={cap}")
+
+    rows: list[dict] = []
+    for bs in sorted(batch_sizes, reverse=True):
+        cfg = dataclasses.replace(
+            DEFAULT_CONFIG,
+            m4=dataclasses.replace(DEFAULT_CONFIG.m4,
+                                   summary_max_padded_tokens=cap,
+                                   summary_batch_size=bs),
+        )
+        system = RaptorSystem(cfg)
+        restore = _force_cold() if force_cold else None
+        _vram_reset()
+        print(f"[probe] --- summary_batch_size={bs} (cap={cap}) ---")
+        t0 = time.perf_counter()
+        try:
+            system.index_items(unit.corpus)
+        except Exception as exc:  # noqa: BLE001
+            _restore_cache_check(restore)
+            dt = time.perf_counter() - t0
+            oom = _is_oom(exc)
+            rows.append({"summary_batch_size": bs, "cap": cap, "ok": False,
+                         "oom": oom, "elapsed_s": round(dt, 2),
+                         "peak_vram_gb": _vram_peak_gb(),
+                         "error": f"{type(exc).__name__}: {exc}"[:300]})
+            print(f"[probe] bs={bs:<4} {'OOM' if oom else 'ERROR'} after "
+                  f"{dt:.1f}s  peak={_vram_peak_gb()}GB")
+            if not oom:
+                _fail(f"bs={bs} failed for a reason that is NOT OOM.")
+            _vram_reset()
+            continue
+        dt = time.perf_counter() - t0
+        _restore_cache_check(restore)
+        if system.tree_cache_hit:
+            _fail(_warm_hit_message(cap, str(unit.corpus_id), dt))
+        row = {"summary_batch_size": bs, "cap": cap, "ok": True, "oom": False,
+               "build_s": round(dt, 2), "peak_vram_gb": _vram_peak_gb(),
+               **build_row_diagnostics(dict(system.index_stats))}
+        rows.append(row)
+        print(f"[probe] bs={bs:<4} OK build={dt:8.1f}s  "
+              f"peak={row['peak_vram_gb']}GB")
+        print(f"[probe]   phases: {row['phase_seconds']}")
+        print(f"[probe]   generate(): {row['generate_calls']}")
+        _vram_reset()
+    return rows
+
+
 def probe_padding_sweep(
     benchmark_id: str, story_id: str, values: list[int], sweep_all: bool,
     force_cold: bool = False,
@@ -487,13 +557,17 @@ def probe_query_slice(system_ids: list[str], benchmark_id: str, n: int) -> list[
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--mode",
-                    choices=("tree", "queries", "both", "sweep"),
+                    choices=("tree", "queries", "both", "sweep",
+                             "batch-sweep"),
                     default="both")
     ap.add_argument("--story-id", default="largest",
                     help="corpus_id prefix to target, or 'largest' (default) "
                          "for the biggest unit in the CELL'S OWN draw")
     ap.add_argument("--sweep-benchmark", default="narrativeqa")
     ap.add_argument("--sweep-values", default="16000,8000,4000,2000")
+    ap.add_argument("--batch-sizes", default="",
+                    help="comma-separated summary_batch_size values to sweep "
+                         "at a fixed cap (mode=batch-sweep)")
     ap.add_argument("--force-cold", action="store_true",
                     help="rebuild even when this story and cap are already "
                          "cached (overrides the cache check; deletes nothing)")
@@ -516,6 +590,7 @@ def main(argv: list[str] | None = None) -> int:
         "tree_builds": [],
         "query_slices": [],
         "padding_sweep": [],
+        "batch_sweep": [],
     }
     print(f"[probe] PYTORCH_CUDA_ALLOC_CONF="
           f"{report['pytorch_cuda_alloc_conf']}")
@@ -523,6 +598,12 @@ def main(argv: list[str] | None = None) -> int:
 
     report["prewarm_s"] = round(_prewarm(), 1)
 
+    if args.mode == "batch-sweep":
+        caps = [int(v) for v in args.sweep_values.split(",") if v.strip()]
+        report["batch_sweep"] = probe_batch_sweep(
+            args.sweep_benchmark, args.story_id, caps[0],
+            [int(v) for v in args.batch_sizes.split(",") if v.strip()],
+            force_cold=True)
     if args.mode == "sweep":
         report["padding_sweep"] = probe_padding_sweep(
             args.sweep_benchmark, args.story_id,
