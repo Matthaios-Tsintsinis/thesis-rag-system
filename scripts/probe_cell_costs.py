@@ -127,6 +127,42 @@ def _one_unit(benchmark_id: str, story_id: str | None = None):
     return bench, matches[0]
 
 
+def build_row_diagnostics(stats: dict) -> dict:
+    """Everything the build reported, carried through WHOLESALE.
+
+    THE BUG THIS REPLACES, and it cost two cold builds. The row was
+    assembled by naming fields one at a time - n_leaves, layer_sizes,
+    n_summary_calls - so `phase_seconds` and `generate_calls` were
+    written correctly by raptor_paper, surfaced correctly by
+    _collect_index_stats, and then dropped on the floor here, three lines
+    before the JSON was written. A hand-picked subset silently discards
+    every field added after it was written, which is precisely how this
+    happened twice.
+
+    `index_stats` therefore carries the ENTIRE dict. The named fields
+    above it are convenience for reading the console output; they are a
+    VIEW, never the record. Anything the build learns to report arrives
+    here without this function being touched.
+    """
+    stats = dict(stats)
+    return {
+        # Convenience view. Duplicated inside index_stats on purpose:
+        # losing one of these to a rename must not lose the underlying
+        # number as well.
+        "n_leaves": int(stats.get("n_leaves", 0) or 0),
+        "n_summary_nodes": int(stats.get("flat_n_summaries", 0) or 0),
+        "n_summary_calls": int(stats.get("n_summary_calls_at_index", 0) or 0),
+        "layer_sizes": stats.get("layer_sizes"),
+        "phase_seconds": stats.get("phase_seconds"),
+        "phase_calls": stats.get("phase_calls"),
+        "phase_share": stats.get("phase_share"),
+        "phase_measured_total_s": stats.get("phase_measured_total_s"),
+        "generate_calls": stats.get("generate_calls"),
+        # THE RECORD. Nothing can be dropped from here by omission.
+        "index_stats": stats,
+    }
+
+
 def probe_tree_builds(benchmarks: list[str]) -> list[dict]:
     """Wall-time for M4 tree construction alone, one unit per benchmark."""
     from src.config import DEFAULT_CONFIG
@@ -172,11 +208,8 @@ def probe_tree_builds(benchmarks: list[str]) -> list[dict]:
             "n_corpus_items": len(unit.corpus),
             "n_queries_in_unit": len(unit.queries),
             "build_s": round(build_s, 2),
-            "n_leaves": n_leaves,
-            "n_summary_nodes": int(stats.get("flat_n_summaries", 0) or 0),
-            "n_summary_calls": int(stats.get("n_summary_calls_at_index", 0) or 0),
-            "layer_sizes": stats.get("layer_sizes"),
             "tree_cache_hit": system.tree_cache_hit,
+            **build_row_diagnostics(stats),
         }
         rows.append(row)
         print(f"[probe] tree {benchmark_id:<16} build={build_s:8.2f}s  "
@@ -385,15 +418,15 @@ def probe_padding_sweep(
         row = {
             "summary_max_padded_tokens": cap, "ok": True, "oom": False,
             "build_s": round(dt, 2), "peak_vram_gb": _vram_peak_gb(),
-            "n_leaves": int(stats.get("n_leaves", 0) or 0),
-            "n_summary_calls": int(stats.get("n_summary_calls_at_index", 0) or 0),
-            "n_summary_nodes": int(stats.get("flat_n_summaries", 0) or 0),
-            "layer_sizes": stats.get("layer_sizes"),
+            **build_row_diagnostics(stats),
         }
         rows.append(row)
         print(f"[probe] cap={cap:<6} OK build={dt:8.1f}s  "
               f"peak={row['peak_vram_gb']}GB  leaves={row['n_leaves']} "
-              f"summary_calls={row['n_summary_calls']}")
+              f"summary_nodes={row['n_summary_calls']}")
+        print(f"[probe]   phases: {row['phase_seconds']}")
+        print(f"[probe]   phase calls: {row['phase_calls']}")
+        print(f"[probe]   generate(): {row['generate_calls']}")
         _vram_reset()
         if not sweep_all:
             print(f"[probe] LARGEST SURVIVING CAP = {cap} (stopping; every "
