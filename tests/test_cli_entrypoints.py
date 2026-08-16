@@ -157,11 +157,37 @@ class _CliCase(unittest.TestCase):
 
     def _run(self, *extra):
         out = self.dir / "tiny_STUB.jsonl"
+        # --allow-unpinned because these are CLI-surface tests on a host
+        # with no requirements.lock. The lockfile gate is deliberately a
+        # HARD abort (it guards a matrix split that is undetectable after
+        # the fact), so every non-P10 caller has to say so explicitly.
+        # That the flag is needed HERE is the gate proving it is wired:
+        # dropping it makes these tests fail, which is the check the
+        # gate's own test cannot make about main().
         argv = ["runner", "--system", "STUB", "--benchmark", "tiny",
-                "--split", "validation", "--output", str(out), *extra]
+                "--split", "validation", "--output", str(out),
+                "--allow-unpinned", *extra]
         with mock.patch.object(sys, "argv", argv):
             runner_mod.main()
         return out
+
+    def test_the_lockfile_gate_is_wired_into_main(self):
+        """END TO END, not a unit test of the gate function.
+
+        Without --allow-unpinned and with no lockfile present, main() must
+        abort BEFORE it writes any output. This is the difference between
+        "the gate exists" and "the runner calls the gate" — the exact
+        distinction that made MATRIX_BATCH_SIZE inert through a whole
+        release.
+        """
+        out = self.dir / "gated.jsonl"
+        argv = ["runner", "--system", "STUB", "--benchmark", "tiny",
+                "--split", "validation", "--output", str(out),
+                "--lockfile", str(self.dir / "definitely-absent.lock")]
+        with mock.patch.object(sys, "argv", argv):
+            with self.assertRaises(SystemExit):
+                runner_mod.main()
+        self.assertFalse(out.exists(), "the gate fired too late")
 
 
 class TestBatchSizeDefault(_CliCase):

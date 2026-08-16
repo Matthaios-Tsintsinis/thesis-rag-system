@@ -185,6 +185,19 @@ def environment_provenance(lockfile: Path | None = None) -> dict:
     lock_hash = None
     if lockfile is not None and Path(lockfile).exists():
         lock_hash = lockfile_hash(Path(lockfile).read_text(encoding="utf-8"))
+    else:
+        # LOUD, because a null hash is not a missing nicety: it means this
+        # cell's summary records NOTHING about the environment that
+        # produced it, and M4's substrate key folds three of those
+        # versions. Every probe run in the 2026-08-16 cost investigation
+        # carried lockfile_hash: null and nobody noticed, because it was
+        # written in silence.
+        print(
+            f"[pin] WARNING: lockfile_hash=null — no lockfile at "
+            f"{lockfile!r}. This run's provenance records NO environment "
+            "pin. M4 tree topology is not claimed to reproduce from it. "
+            "Generate one with: python -m scripts.pin_environment write"
+        )
     installed = _installed()
     return {
         "lockfile_hash": lock_hash,

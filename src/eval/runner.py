@@ -151,9 +151,89 @@ def _git_commit_short() -> str:
         return "unknown"
 
 
+def assert_environment_pinned(
+    lockfile: Path,
+    *,
+    allow_unpinned: bool,
+) -> None:
+    """Abort before any model loads unless this environment is the locked one.
+
+    THE FAILURE THIS GATES IS SILENT AND UNRECOVERABLE AFTER THE FACT.
+    The M4 substrate key folds `build_env` — the umap-learn / scikit-learn
+    / numpy triple. Colab updates its base image without notice, so a
+    session on a drifted image computes a DIFFERENT substrate key. The
+    cache then MISSES rather than colliding: the tree rebuilds cleanly,
+    the cell succeeds, and the matrix quietly holds two tree populations.
+    Nothing in any output says which image built which tree, so no
+    post-hoc check can separate them. The only place to catch it is
+    before it happens.
+
+    `scripts.pin_environment.check_lockfile` did this correctly and had
+    NO CALLERS. That is the sixth instance in this project of a check
+    that exists, works, and is inert in the pipeline.
+
+    `allow_unpinned` means "I have no lockfile" — for probes and dev
+    runs. It does NOT mean "ignore the lockfile I have": a MISMATCH still
+    aborts, because a present-but-violated pin is an operator asserting
+    something untrue, which is worse than asserting nothing.
+    """
+    from scripts.pin_environment import check_lockfile
+
+    if not Path(lockfile).exists():
+        if allow_unpinned:
+            print(
+                f"[eval] WARNING: no lockfile at {lockfile}; running "
+                "UNPINNED because --allow-unpinned was passed. M4 tree "
+                "topology is not claimed to reproduce from this run."
+            )
+            return
+        raise SystemExit(
+            f"PREFLIGHT FAILED: no lockfile at {lockfile}.\n"
+            "  The M4 substrate key folds umap-learn/scikit-learn/numpy, "
+            "so an unpinned session can build trees under a different key "
+            "than the rest of the matrix. That rebuild SUCCEEDS and is "
+            "invisible afterwards.\n"
+            "  Generate one:  python -m scripts.pin_environment write\n"
+            "  Then verify:   python -m scripts.pin_environment check\n"
+            "  Probes and dev runs may pass --allow-unpinned."
+        )
+
+    if check_lockfile(Path(lockfile)) != 0:
+        raise SystemExit(
+            "PREFLIGHT FAILED: this environment does not match "
+            f"{lockfile} (mismatches printed above).\n"
+            "  Reinstall from the lock:  pip install -r "
+            f"{lockfile}\n"
+            "  --allow-unpinned does NOT bypass this: a lockfile that is "
+            "present and violated is a pin the operator asserted and the "
+            "environment broke."
+        )
+    print(f"[eval] PREFLIGHT: environment matches {lockfile}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run one system x one benchmark x one split to JSONL."
+    )
+    parser.add_argument(
+        "--allow-unpinned",
+        action="store_true",
+        help=(
+            "Run without a requirements.lock. FOR PROBES AND DEV RUNS "
+            "ONLY. Without it the run ABORTS when the lockfile is absent, "
+            "because the M4 substrate key folds the umap/sklearn/numpy "
+            "versions: a session on a drifted Colab image computes a "
+            "different key, MISSES the cache rather than colliding, "
+            "rebuilds the tree cleanly, and leaves the matrix holding two "
+            "tree populations with no error anywhere. This flag does NOT "
+            "bypass a MISMATCH against a lockfile that is present."
+        ),
+    )
+    parser.add_argument(
+        "--lockfile",
+        type=Path,
+        default=Path("requirements.lock"),
+        help="Environment lock checked before anything loads.",
     )
     parser.add_argument(
         "--system",
@@ -344,6 +424,12 @@ def main() -> None:
         "for the process lifetime.",
     )
     args = parser.parse_args()
+
+    # FIRST, before any model loads or any dataset is touched. A gate that
+    # fires after a 15 GB load has already cost the thing it protects.
+    assert_environment_pinned(
+        args.lockfile, allow_unpinned=args.allow_unpinned
+    )
 
     # Opt-in CK-4 budget. Runs before any system instantiation so the
     # config constant is in place before pack_context resolves it.
