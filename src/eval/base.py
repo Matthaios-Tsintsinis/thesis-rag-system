@@ -11,8 +11,11 @@ A `Benchmark` exposes:
 `BenchmarkRunner` drives one (system, benchmark, split) pass:
 
   for unit in benchmark.iter_eval_units(split, max_units):
+      todo = [q for q in unit.queries if q.query_id not in already_done]
+      if not todo:
+          continue            # NOT indexed - see run()
       system.index_items(unit.corpus)
-      for q in unit.queries:
+      for q in todo:
           ar = system.answer(q.question_text)
           retr = score_retrieval_ck2(ar.retrieved, q.gold_passage_sets)
           ans  = benchmark.score_answer(ar.answer, q)
@@ -307,6 +310,11 @@ class BenchmarkRunner:
         """
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         n_units = 0
+        # Counted separately rather than folded into n_units: a unit that
+        # was skipped without being indexed is not a unit that was
+        # processed, and collapsing the two would hide the very saving
+        # the ordering exists to produce.
+        n_units_skipped = 0
         n_queries = 0
         t_start = time.perf_counter()
 
@@ -329,15 +337,11 @@ class BenchmarkRunner:
                         f"n_items={len(unit.corpus)}  n_queries={len(unit.queries)}"
                     )
 
-                t_index = time.perf_counter()
-                system.index_items(unit.corpus)
-                index_s = time.perf_counter() - t_index
-
-                if self.verbose:
-                    print(f"  index_s={index_s:.2f}")
-
                 # Select this unit's queries up front so phase A and
-                # phase B iterate the same list.
+                # phase B iterate the same list — and, critically, BEFORE
+                # indexing. Indexing is work done on behalf of queries;
+                # a unit with nothing left to answer must not be indexed
+                # at all.
                 unit_queries: list[EvalQuery] = []
                 for q in unit.queries:
                     if max_queries is not None and (
@@ -348,6 +352,35 @@ class BenchmarkRunner:
                     if q.query_id in already_done:
                         continue
                     unit_queries.append(q)
+
+                # INDEX ORDERING IS LOAD-BEARING, not tidiness. With the
+                # index call above this filter, a resumed pass rebuilt
+                # the tree for every unit it was about to skip. On a
+                # Drive-resident cache that is a cache read; on
+                # HotpotQA-A, whose cache lives on session-local disk
+                # that dies with the runtime, it is a COLD M4 TREE BUILD
+                # per skipped unit — and tree builds are the dominant
+                # cost in this harness (one NarrativeQA story has
+                # measured 20,691 s). P10 is expected to span several
+                # Colab sessions, so resume is the normal path, and the
+                # waste would have been paid on every one of them.
+                if not unit_queries:
+                    if self.verbose:
+                        print(
+                            f"  no queries outstanding for "
+                            f"{unit.corpus_id!r} — NOT indexed"
+                        )
+                    n_units_skipped += 1
+                    if stopped:
+                        break
+                    continue
+
+                t_index = time.perf_counter()
+                system.index_items(unit.corpus)
+                index_s = time.perf_counter() - t_index
+
+                if self.verbose:
+                    print(f"  index_s={index_s:.2f}")
 
                 for q, ar, latency_s in self._answer_unit(system, unit_queries):
 
@@ -424,9 +457,15 @@ class BenchmarkRunner:
 
         if self.verbose:
             elapsed = time.perf_counter() - t_start
+            skipped = (
+                f", {n_units_skipped} units skipped un-indexed"
+                if n_units_skipped
+                else ""
+            )
             print(
-                f"[eval] done: {n_units} units, {n_queries} queries, "
-                f"elapsed={elapsed:.1f}s, output={self.output_path}"
+                f"[eval] done: {n_units} units, {n_queries} queries"
+                f"{skipped}, elapsed={elapsed:.1f}s, "
+                f"output={self.output_path}"
             )
 
 
