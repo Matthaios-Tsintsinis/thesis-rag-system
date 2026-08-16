@@ -11,6 +11,7 @@ same instance.
 from __future__ import annotations
 
 import functools
+import time
 from typing import Any
 
 import numpy as np
@@ -569,6 +570,100 @@ def reset_generate_calls() -> None:
     GENERATE_CALLS.clear()
 
 
+def record_generate_call(
+    *,
+    width: int,
+    prompt_tokens_padded: int,
+    new_tokens: int,
+    max_new_tokens: int,
+    tokenise_s: float,
+    generate_s: float,
+    decode_s: float,
+) -> dict:
+    """One `model.generate()` invocation, timed by phase and shaped.
+
+    WHY THE PHASES ARE SPLIT. A tree build's summarise phase measured
+    ~230 s per call and held that figure CONSTANT while batch width fell
+    from 8.5 to 2.92 — so the cost is neither per-token nor per-sequence,
+    and VRAM falling with no speedup rules out allocator pressure. A
+    single wall-clock number cannot distinguish prefill of a long padded
+    prompt from a decode loop running more steps than the cap implies
+    from CPU-side tokenise/decode work outside generation altogether.
+    Three timings and the shapes can.
+
+    `s_per_decode_step` is the figure that matters: the healthy baseline
+    is 6.6 s for 100 steps on one ~2,000-token prompt with fp16 resident
+    on an L4, i.e. ~66 ms/step. `new_tokens` is the other half — it is
+    the ACTUAL number of steps the loop ran, which is not necessarily
+    `max_new_tokens`, since a batch stops when every member has emitted
+    EOS and runs to the cap when even one has not.
+    """
+    call = {
+        "call_no": int(GENERATE_CALLS.get("n_calls", 0)) + 1,
+        "width": int(width),
+        "prompt_tokens_padded": int(prompt_tokens_padded),
+        # What `summary_max_padded_tokens` actually bounds. Recorded
+        # because the cap sweep moved this and nothing else, and the
+        # build time did not follow it.
+        "padded_input_cells": int(width) * int(prompt_tokens_padded),
+        "new_tokens": int(new_tokens),
+        "max_new_tokens": int(max_new_tokens),
+        "tokenise_s": round(float(tokenise_s), 4),
+        "generate_s": round(float(generate_s), 4),
+        "decode_s": round(float(decode_s), 4),
+        "total_s": round(
+            float(tokenise_s) + float(generate_s) + float(decode_s), 4
+        ),
+        # None rather than 0.0 or an exception: a call that emitted
+        # nothing is a real outcome and must not be reported as
+        # infinitely fast.
+        "s_per_decode_step": (
+            round(float(generate_s) / int(new_tokens), 6)
+            if int(new_tokens) > 0
+            else None
+        ),
+        "s_per_seq": (
+            round(
+                (float(tokenise_s) + float(generate_s) + float(decode_s))
+                / int(width),
+                4,
+            )
+            if int(width) > 0
+            else None
+        ),
+    }
+    # The legacy counters stay: existing consumers read them, and this
+    # record is additive rather than a replacement.
+    GENERATE_CALLS["n_calls"] = int(GENERATE_CALLS.get("n_calls", 0)) + 1
+    GENERATE_CALLS.setdefault("widths", []).append(int(width))
+    GENERATE_CALLS.setdefault("calls", []).append(call)
+    return call
+
+
+def generate_calls_summary() -> dict:
+    """Everything recorded, WHOLESALE, plus the aggregates.
+
+    THE BUG THIS SHAPE PREVENTS, which has already cost two cold builds:
+    the tree-stats block used to assemble its `generate_calls` entry by
+    naming four keys of GENERATE_CALLS one at a time, so any field added
+    later was written correctly, surfaced correctly, and dropped on the
+    floor before anything read it. Copying the whole dict and layering
+    the aggregates on top means a field invented tomorrow arrives at the
+    consumer without this function being touched.
+    """
+    widths = [int(w) for w in GENERATE_CALLS.get("widths", [])]
+    out = dict(GENERATE_CALLS)
+    out["n_calls"] = int(GENERATE_CALLS.get("n_calls", 0))
+    out["widths"] = widths
+    out["calls"] = list(GENERATE_CALLS.get("calls", []))
+    out["mean_width"] = (
+        round(sum(widths) / len(widths), 2) if widths else None
+    )
+    out["max_width"] = max(widths) if widths else None
+    out["min_width"] = min(widths) if widths else None
+    return out
+
+
 def generate_batch(
     system_prompts: list[str],
     user_prompts: list[str],
@@ -685,18 +780,31 @@ def generate_batch(
         # call or 24. This counts the invocations that actually cost
         # prefill, and the width of each, so "is batching working" stops
         # being an inference from wall clock.
-        GENERATE_CALLS["n_calls"] = GENERATE_CALLS.get("n_calls", 0) + 0
+        # PHASE ATTRIBUTION NEEDS AN EXPLICIT SYNC. CUDA work is queued
+        # asynchronously, so without a barrier the tokenise timing would
+        # end early and generate() would absorb whatever the previous
+        # phase had not finished — attributing CPU-side cost to the GPU
+        # and vice versa. One sync per phase per call is nothing against
+        # a ~230 s call, and without it the split is decorative.
+        def _sync() -> None:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+
         for group_no, idxs in enumerate(groups):
-            GENERATE_CALLS["n_calls"] = GENERATE_CALLS.get("n_calls", 0) + 1
-            GENERATE_CALLS.setdefault("widths", []).append(len(idxs))
             batch_texts = [texts[i] for i in idxs]
+
+            _sync()
+            t_tok = time.perf_counter()
             enc = tokenizer(
                 batch_texts,
                 return_tensors="pt",
                 padding=True,
                 add_special_tokens=False,
             ).to(model.device)
+            _sync()
+            tokenise_s = time.perf_counter() - t_tok
 
+            t_gen = time.perf_counter()
             with torch.inference_mode():
                 out = model.generate(
                     input_ids=enc["input_ids"],
@@ -707,7 +815,10 @@ def generate_batch(
                     top_p=cfg.top_p,
                     pad_token_id=tokenizer.pad_token_id,
                 )
+            _sync()
+            generate_s = time.perf_counter() - t_gen
 
+            t_dec = time.perf_counter()
             # Requirement 4: left padding aligns every row's continuation
             # to the same offset.
             gen = out[:, enc["input_ids"].shape[1] :]
@@ -715,6 +826,31 @@ def generate_batch(
                 results[i] = tokenizer.decode(
                     row, skip_special_tokens=True
                 ).strip()
+            decode_s = time.perf_counter() - t_dec
+
+            call = record_generate_call(
+                width=len(idxs),
+                prompt_tokens_padded=int(enc["input_ids"].shape[1]),
+                # ACTUAL decode steps, not the cap. A batch runs until
+                # every member has emitted EOS, so this is the only
+                # honest denominator for a per-step figure.
+                new_tokens=int(gen.shape[1]),
+                max_new_tokens=int(cfg.max_new_tokens),
+                tokenise_s=tokenise_s,
+                generate_s=generate_s,
+                decode_s=decode_s,
+            )
+            if progress_every:
+                print(
+                    f"[generate_batch] call {call['call_no']} "
+                    f"w={call['width']} "
+                    f"prompt={call['prompt_tokens_padded']} "
+                    f"new={call['new_tokens']}/{call['max_new_tokens']}  "
+                    f"tok={call['tokenise_s']:.2f}s "
+                    f"gen={call['generate_s']:.2f}s "
+                    f"dec={call['decode_s']:.2f}s  "
+                    f"s/step={call['s_per_decode_step']}"
+                )
 
             n_done += len(idxs)
             if progress_every and group_no % progress_every == 0:

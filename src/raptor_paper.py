@@ -1209,16 +1209,15 @@ def build_paper_tree(
     # gives ~10 paragraphs per question, i.e. ~8-12 leaves) rather than a
     # bug, which is exactly why nothing else would ever flag it.
     try:
-        from .models import GENERATE_CALLS
+        from .models import generate_calls_summary
 
-        widths = list(GENERATE_CALLS.get("widths", []))
-        tree.stats["generate_calls"] = {
-            "n_calls": int(GENERATE_CALLS.get("n_calls", 0)),
-            "mean_width": (round(sum(widths) / len(widths), 2)
-                           if widths else None),
-            "max_width": max(widths) if widths else None,
-            "min_width": min(widths) if widths else None,
-        }
+        # WHOLESALE, not a hand-picked list. This block used to name four
+        # keys of GENERATE_CALLS one at a time, which is the same
+        # enumeration bug that dropped phase_seconds and generate_calls
+        # from the probe row and cost two cold builds. The per-call
+        # breakdown added for the 230 s/call investigation arrives here
+        # because the summary is copied whole.
+        tree.stats["generate_calls"] = generate_calls_summary()
     except Exception:
         tree.stats["generate_calls"] = None
     tree.stats.update(_CLOCK.as_stats())
