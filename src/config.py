@@ -487,37 +487,34 @@ class M4Config:
     # summarisation less constrained BY THE HARNESS. Do not restate that
     # as fidelity to the paper.
     #
-    # 8000 IS MEASURED, and it replaces a reasoned 16000 that DIES.
-    # 16000 OOMs after 370 s on the largest NarrativeQA story (peak
-    # 21.62 GB against a 22.03 GiB L4) — it was set below the answer
-    # path's measured 20000 ceiling on the argument that summaries decode
-    # 100 new tokens rather than 512, and that argument did not survive
-    # contact with a 4,953-leaf corpus.
+    # 16000 IS MEASURED, on story d431326b under the FIXED generator
+    # loading (2026-08-16):
     #
-    # 8000 IS THE CEILING THAT FITS, NOT A FAST VALUE. The measured
-    # sweep on story d431326b (2026-08-16):
+    #   cap 16000 -> build 79.6 s, peak 17.44 GB, free 4.17 GB at the
+    #                tightest call, 3 calls, mean width 11.33, max 25
+    #   cap  8000 -> build 82.4 s, 4 calls, mean width 8.5, max 16
     #
-    #   cap 8000 / bs 16 -> 1031 s, 4 calls, mean width 8.5, 21.51 GB
-    #   cap 8000 / bs  8 -> 1155 s, 5 calls, mean width 7.2, 21.37 GB
-    #   cap 4000 / bs 16 -> 1633 s, 7 calls, mean width 4.86, 21.24 GB
-    #   cap 2000 / bs 16 -> 2712 s, 12 calls, mean width 2.92, 21.12 GB
+    # Identical tree either way: 176 nodes, 34 summary nodes, layers
+    # 142 -> 30 -> 4. Wider batches, fewer calls, slightly faster, and
+    # 4.17 GB still free at the tightest moment.
     #
-    # Seconds per generate() call are CONSTANT at ~230 across a 3x range
-    # of batch width, and VRAM falls with no speedup — so the cost is
-    # fixed PER CALL, total time is n_calls x 230 s, and both knobs make
-    # things worse by cutting width and raising the call count. Allocator
-    # pressure is dead as an explanation: 21.12 GB is no faster than
-    # 21.51 GB. Lowering either knob is therefore a pure loss; the lever
-    # points upward, and 16000 is where it OOMs.
+    # IT WAS NEVER A MEMORY LIMIT. 16000 had been demoted to 8000 because
+    # it OOM'd after 370 s at a 21.62 GB peak — but that peak included a
+    # PHANTOM SECOND COPY of the 15 GB generator, loaded because
+    # load_generator was lru_cached on its argument tuple and two call
+    # sites spelled the defaults differently. With one copy resident the
+    # ceiling that forced 8000 does not exist.
     #
-    # Keep summary_batch_size at 32: the cap clips it to an effective 16,
-    # which is the widest shape measured and hence the fewest calls.
+    # EVERY ABSOLUTE NUMBER IN THE OLD SWEEP IS VOID. It ran under the
+    # double load, so each point paid a ~33x tax on every generate()
+    # call. Its RELATIVE ordering survived (all points paid the same
+    # tax) which is why 8000 was the right call at the time, but nothing
+    # in it may be quoted as a cost.
     #
-    # The ~230 s per call is UNEXPLAINED and under investigation — see
-    # docs/SESSION_HANDOFF.md. This is the operating config until that
-    # diagnosis says otherwise.
+    # Keep summary_batch_size at 32: at cap 16000 the effective width
+    # reaches 25, so the cap still binds and the nominal count does not.
     summary_batch_size: int = 32
-    summary_max_padded_tokens: int = 8000
+    summary_max_padded_tokens: int = 16000
 
     # UNREAD by the paper-faithful path, retained so existing callers
     # construct. The rebuild dropped BM25 entirely: the paper's collapsed

@@ -893,7 +893,7 @@ def summarize_paper_style_batch(
     max_tokens: int = 100,
     temperature: float = 0.0,
     batch_size: int = 32,
-    max_padded_tokens: int | None = 8000,
+    max_padded_tokens: int | None = 16000,
     progress_every: int = 1,
 ) -> list[str]:
     """A whole layer's cluster summaries in one batched call. M4's path.
@@ -1481,7 +1481,7 @@ def paper_substrate_extra(
     chunker_version: str = RAPTOR_CHUNKER_VERSION,
     summary_max_tokens: int = 100,
     summary_batch_size: int = 32,
-    summary_max_padded_tokens: int = 8000,
+    summary_max_padded_tokens: int = 16000,
     sparse: str = "bm25okapi",
     fusion: str = "rrf",
     rrf_k: int = 60,
