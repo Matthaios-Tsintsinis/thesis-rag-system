@@ -431,11 +431,26 @@ class TestCacheIdentity(unittest.TestCase):
         token_budget_batches takes batch_size as a count cap and so both
         participate in composition.
         """
+        PROBE_CAP = 4000
+        PROBE_BATCH = 8
         mine = self._extra()
         self.assertIn("summary_batch_size", mine)
         self.assertIn("summary_max_padded_tokens", mine)
-        self.assertNotEqual(mine, self._extra(summary_batch_size=8))
-        self.assertNotEqual(mine, self._extra(summary_max_padded_tokens=8000))
+
+        # THE PROBE VALUES MUST DIFFER FROM THE DEFAULTS, asserted rather
+        # than assumed. This test previously probed the cap with 8000 —
+        # which then BECAME the default, turning both sides of the
+        # comparison into the same dict and making the assertion vacuous.
+        # It failed loudly only because assertNotEqual is the direction
+        # that catches a collision; the batch-size probe, being the same
+        # shape, would fail silently if 8 were ever adopted.
+        self.assertNotEqual(mine["summary_max_padded_tokens"], PROBE_CAP)
+        self.assertNotEqual(mine["summary_batch_size"], PROBE_BATCH)
+
+        self.assertNotEqual(mine, self._extra(summary_batch_size=PROBE_BATCH))
+        self.assertNotEqual(
+            mine, self._extra(summary_max_padded_tokens=PROBE_CAP)
+        )
 
     def test_extras_defaults_match_m4config(self):
         """The extras defaults and M4Config must not drift apart.
