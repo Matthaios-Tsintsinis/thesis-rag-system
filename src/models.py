@@ -18,6 +18,7 @@ import numpy as np
 
 from .config import (
     EMBEDDER_MODEL,
+    GENERATOR_MAX_MEMORY,
     GENERATOR_MODEL,
     GenerationConfig,
     RERANKER_MODEL,
@@ -219,18 +220,50 @@ def generator_identity(model_name: str, *, load_in_4bit: bool) -> dict:
     }
 
 
-@functools.lru_cache(maxsize=2)
-def load_generator(
-    model_name: str = GENERATOR_MODEL,
-    load_in_4bit: bool = False,
-) -> Any:
-    """Return (tokenizer, model). fp16 by default; 4-bit only on request.
+def assert_generator_fully_resident(
+    placement: dict,
+    *,
+    model_name: str,
+    cuda_available: bool,
+    allow_offload: bool = False,
+) -> None:
+    """Abort if the weights did not all land on the GPU.
 
-    Used by the local-HF answer path (`_generate_local`). The default is
-    now fp16 — see config.LOAD_GENERATOR_IN_4BIT for why the previous
-    True default was a latent repeat of b6e35c6. The load is gated by
-    `assert_loaded_generator_matches`, which aborts rather than warns.
+    THE CHECK THAT WAS MISSING, and its absence cost a 20-hour build.
+    `placement_at_load` already recorded `fraction_params_off_gpu: 0.6224`
+    on a second, spilled load. It was written correctly, surfaced
+    correctly, and nothing read it — the project's recurring defect class:
+    a value that is measured and not asserted is not a check.
+
+    Silent offload is the worst possible failure here because the run
+    still SUCCEEDS. It produces correct summaries, a correct tree and a
+    plausible results row, 33x slower, and nothing in the output says so.
+    A raise costs seconds; the silent version costs a session.
+
+    Skipped where CUDA is absent: the agent host legitimately holds
+    everything on CPU, and raising there would break every CPU smoke path.
     """
+    if not cuda_available or allow_offload:
+        return
+    frac = placement.get("fraction_params_off_gpu")
+    if frac is None or frac <= 0:
+        return
+    devices = placement.get("param_tensors_by_device", {})
+    raise RuntimeError(
+        f"GENERATOR NOT FULLY RESIDENT: {frac:.2%} of {model_name}'s "
+        f"parameters are off the GPU (tensors by device: {devices}). "
+        "Every decode step would stream those weights across PCIe, which "
+        "measured a 33x slowdown and a flat ~230 s per generate() call. "
+        "CAUSE, almost always: the generator was ALREADY loaded once and "
+        "a second load landed in VRAM that was no longer empty, so "
+        "device_map='auto' spilled the remainder. Check "
+        "len(GENERATOR_LOADS) — it should be 1. Pass allow_offload=True "
+        "only if you intend to pay this."
+    )
+
+
+def _load_generator_impl(model_name: str, load_in_4bit: bool) -> Any:
+    """The actual load. Separated from the cache so it can be stubbed."""
     # The one choke point every local path goes through, and the last
     # moment before CUDA allocates anything. Setting it in runner.main()
     # only covers subprocess runs; a notebook calling
@@ -252,11 +285,18 @@ def load_generator(
             bnb_4bit_use_double_quant=True,
         )
         kwargs["device_map"] = "auto"
+        kwargs["max_memory"] = dict(GENERATOR_MAX_MEMORY)
     elif torch.cuda.is_available():
         # EXPLICIT fp16, never torch_dtype="auto" — "auto" resolves from
         # the checkpoint and can hand back fp32 or bf16 without saying so.
         kwargs["torch_dtype"] = torch.float16
         kwargs["device_map"] = "auto"
+        # FAIL AT LOAD RATHER THAN DEGRADE FOR TWENTY HOURS. With
+        # "cpu": "0GiB" accelerate has nowhere to spill, so a load that
+        # would not fit RAISES instead of quietly placing 62% of the
+        # weights off-device and paying PCIe on every decode step. The
+        # measured cost of the silent version was 33x on a whole build.
+        kwargs["max_memory"] = dict(GENERATOR_MAX_MEMORY)
     else:
         kwargs["torch_dtype"] = torch.float32  # CPU smoke only
 
@@ -271,23 +311,91 @@ def load_generator(
         is_quantized=getattr(model.config, "quantization_config", None) is not None,
         dtype_str=str(model.dtype),
     )
-    # THE BODY RUNS ONLY ON AN lru_cache MISS, so one entry per process
-    # is the expected reading and a second means a genuine reload — into
-    # whatever VRAM was free at that later moment, which is the only
-    # mechanism by which placement could degrade mid-build. Recorded so
-    # the run says which happened instead of the reader assuming.
+    return tokenizer, model
+
+
+@functools.lru_cache(maxsize=2)
+def _load_generator_cached(model_name: str, load_in_4bit: bool) -> Any:
+    """Cached on a CANONICAL key — see `load_generator` for why.
+
+    Records the load and then CHECKS it. This body runs only on a cache
+    miss, so one entry per process is the expected reading and a second
+    means a genuine second load, into whatever VRAM was free at that
+    later moment.
+    """
+    tokenizer, model = _load_generator_impl(model_name, load_in_4bit)
+
+    placement = model_placement_snapshot(model)
     GENERATOR_LOADS.append({
         "model": model_name,
         "load_in_4bit": bool(load_in_4bit),
         "memory_after_load": cuda_memory_snapshot(),
-        "placement_at_load": model_placement_snapshot(model),
+        "placement_at_load": placement,
     })
+    # The identity block reads torch/CUDA, so it is best-effort: a
+    # LOG LINE must never be the thing that takes a load down.
+    try:
+        identity: Any = generator_identity(
+            model_name, load_in_4bit=load_in_4bit
+        )
+    except Exception:  # noqa: BLE001
+        identity = {"generator_model": model_name,
+                    "load_in_4bit": bool(load_in_4bit)}
     print(
-        "[models] loaded local generator: "
-        f"{generator_identity(model_name, load_in_4bit=load_in_4bit)} "
+        f"[models] loaded local generator: {identity} "
         f"(load #{len(GENERATOR_LOADS)} this process)"
     )
+
+    cuda = False
+    try:
+        import torch
+
+        cuda = torch.cuda.is_available()
+    except Exception:  # noqa: BLE001
+        pass
+    # The snapshot above is no longer merely recorded. It is READ.
+    assert_generator_fully_resident(
+        placement, model_name=model_name, cuda_available=cuda,
+        allow_offload=bool(load_in_4bit),
+    )
     return tokenizer, model
+
+
+def load_generator(
+    model_name: str = GENERATOR_MODEL,
+    load_in_4bit: bool = False,
+) -> Any:
+    """Return (tokenizer, model). fp16 by default; 4-bit only on request.
+
+    NORMALISES ITS ARGUMENTS BEFORE THE CACHE, and that is the whole
+    point of this wrapper. `functools.lru_cache` keys on the argument
+    TUPLE, so `load_generator(m)` and `load_generator(m, False)` were two
+    DIFFERENT keys despite naming the same model at the same precision.
+    The prewarm path used the first form and `generate_batch` the second,
+    which made the second call a cache MISS that loaded a second ~15 GB
+    copy. `maxsize=2` was exactly large enough to hold both, so nothing
+    was evicted and nothing complained.
+
+    The consequence was not a memory error. Load #2 landed in VRAM that
+    already held load #1 plus the embedder, so `device_map="auto"` spilled
+    62% of the weights to CPU and every decode step streamed them across
+    PCIe: a flat ~230 s per generate() call, 33x the healthy 6.9 s, on a
+    build that still produced correct output.
+
+    Collapsing the arguments to one canonical key here means every call
+    site — however it spells the defaults — reaches the same entry.
+
+    The load is gated by `assert_loaded_generator_matches` and, since the
+    above, by `assert_generator_fully_resident`.
+    """
+    return _load_generator_cached(str(model_name), bool(load_in_4bit))
+
+
+# `release_generator` and the probes call these on the public name; the
+# cache lives on the inner function, so the attributes are forwarded
+# rather than left to fail at the call site.
+load_generator.cache_clear = _load_generator_cached.cache_clear  # type: ignore[attr-defined]
+load_generator.cache_info = _load_generator_cached.cache_info  # type: ignore[attr-defined]
 
 
 def _generate_local(
