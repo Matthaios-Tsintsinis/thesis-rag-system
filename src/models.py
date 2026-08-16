@@ -271,9 +271,21 @@ def load_generator(
         is_quantized=getattr(model.config, "quantization_config", None) is not None,
         dtype_str=str(model.dtype),
     )
+    # THE BODY RUNS ONLY ON AN lru_cache MISS, so one entry per process
+    # is the expected reading and a second means a genuine reload — into
+    # whatever VRAM was free at that later moment, which is the only
+    # mechanism by which placement could degrade mid-build. Recorded so
+    # the run says which happened instead of the reader assuming.
+    GENERATOR_LOADS.append({
+        "model": model_name,
+        "load_in_4bit": bool(load_in_4bit),
+        "memory_after_load": cuda_memory_snapshot(),
+        "placement_at_load": model_placement_snapshot(model),
+    })
     print(
         "[models] loaded local generator: "
-        f"{generator_identity(model_name, load_in_4bit=load_in_4bit)}"
+        f"{generator_identity(model_name, load_in_4bit=load_in_4bit)} "
+        f"(load #{len(GENERATOR_LOADS)} this process)"
     )
     return tokenizer, model
 
@@ -570,6 +582,92 @@ def reset_generate_calls() -> None:
     GENERATE_CALLS.clear()
 
 
+def cuda_memory_snapshot() -> dict:
+    """Allocator and device memory, right now.
+
+    `reserved - allocated` is the number that separates the two remaining
+    explanations for a slow call under memory pressure: a large gap means
+    torch is holding blocks it cannot hand out, so the cost is reclaim; a
+    small gap with tiny `free_gb` means the device itself is full.
+
+    Reports None rather than raising where torch or CUDA is absent — the
+    agent host has neither, and a helper that took the probe down instead
+    of reporting what it could not see would be worse than useless.
+    """
+    out: dict = {
+        "cuda_available": False,
+        "allocated_gb": None,
+        "reserved_gb": None,
+        "reserved_minus_allocated_gb": None,
+        "free_gb": None,
+        "total_gb": None,
+    }
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return out
+        allocated = torch.cuda.memory_allocated() / 2**30
+        reserved = torch.cuda.memory_reserved() / 2**30
+        free_b, total_b = torch.cuda.mem_get_info()
+        out.update(
+            cuda_available=True,
+            allocated_gb=round(allocated, 3),
+            reserved_gb=round(reserved, 3),
+            reserved_minus_allocated_gb=round(reserved - allocated, 3),
+            free_gb=round(free_b / 2**30, 3),
+            total_gb=round(total_b / 2**30, 3),
+        )
+    except Exception:  # noqa: BLE001 - a diagnostic must never be fatal
+        pass
+    return out
+
+
+def model_placement_snapshot(model) -> dict:  # noqa: ANN001
+    """Where the parameters are AT THIS MOMENT, not at load time.
+
+    `device_map="auto"` fixes placement when the weights are loaded, so a
+    reading taken in a fresh process says nothing about a call issued
+    later under different conditions. Cheap enough to take per call: it
+    walks ~339 tensors and reads attributes, touching no data.
+    """
+    from collections import Counter
+
+    tensors: Counter[str] = Counter()
+    params: Counter[str] = Counter()
+    try:
+        for _, p in model.named_parameters():
+            dev = str(p.device)
+            tensors[dev] += 1
+            params[dev] += p.numel()
+    except Exception:  # noqa: BLE001
+        pass
+    total = sum(params.values())
+    off = sum(n for d, n in params.items() if not d.startswith("cuda"))
+    return {
+        "param_tensors_by_device": dict(tensors),
+        "params_by_device_billions": {
+            d: round(n / 1e9, 3) for d, n in params.items()
+        },
+        "fraction_params_off_gpu": (
+            round(off / total, 4) if total else None
+        ),
+        "hf_device_map": getattr(model, "hf_device_map", None),
+        "attn_implementation": getattr(
+            getattr(model, "config", None), "_attn_implementation", None
+        ),
+    }
+
+
+# Appended by load_generator on every ACTUAL load. Because load_generator
+# is lru_cached, the body runs only on a cache MISS — so more than one
+# entry per process means the model was genuinely reloaded, and reloaded
+# into whatever VRAM was free at that later moment. That is the one way
+# placement could degrade mid-run, and it is recorded rather than assumed
+# away.
+GENERATOR_LOADS: list = []
+
+
 def record_generate_call(
     *,
     width: int,
@@ -579,6 +677,8 @@ def record_generate_call(
     tokenise_s: float,
     generate_s: float,
     decode_s: float,
+    placement: dict | None = None,
+    memory: dict | None = None,
 ) -> dict:
     """One `model.generate()` invocation, timed by phase and shaped.
 
@@ -631,6 +731,10 @@ def record_generate_call(
             if int(width) > 0
             else None
         ),
+        # Carried WHOLE. None rather than {} where a snapshot was not
+        # taken: an empty dict reads as "measured, nothing there".
+        "placement": dict(placement) if placement is not None else None,
+        "memory": dict(memory) if memory is not None else None,
     }
     # The legacy counters stay: existing consumers read them, and this
     # record is additive rather than a replacement.
@@ -661,6 +765,11 @@ def generate_calls_summary() -> dict:
     )
     out["max_width"] = max(widths) if widths else None
     out["min_width"] = min(widths) if widths else None
+    # More than one load in a process means the generator was genuinely
+    # reloaded, and re-placed into whatever VRAM was free at that later
+    # moment. Reported next to the calls so the two are read together.
+    out["generator_loads"] = list(GENERATOR_LOADS)
+    out["n_generator_loads"] = len(GENERATOR_LOADS)
     return out
 
 
@@ -804,6 +913,14 @@ def generate_batch(
             _sync()
             tokenise_s = time.perf_counter() - t_tok
 
+            # IMMEDIATELY BEFORE THE CALL, which is the whole point.
+            # Every previous placement and VRAM reading was taken before
+            # or after a build, in a process whose memory state could not
+            # reproduce the fault. Taken after tokenisation so the batch's
+            # own tensors are already resident and counted.
+            placement = model_placement_snapshot(model)
+            memory = cuda_memory_snapshot()
+
             t_gen = time.perf_counter()
             with torch.inference_mode():
                 out = model.generate(
@@ -839,6 +956,8 @@ def generate_batch(
                 tokenise_s=tokenise_s,
                 generate_s=generate_s,
                 decode_s=decode_s,
+                placement=placement,
+                memory=memory,
             )
             if progress_every:
                 print(
@@ -850,6 +969,15 @@ def generate_batch(
                     f"gen={call['generate_s']:.2f}s "
                     f"dec={call['decode_s']:.2f}s  "
                     f"s/step={call['s_per_decode_step']}"
+                )
+                print(
+                    f"[generate_batch]   off_gpu="
+                    f"{placement['fraction_params_off_gpu']} "
+                    f"alloc={memory['allocated_gb']}GB "
+                    f"reserved={memory['reserved_gb']}GB "
+                    f"(reserved-alloc={memory['reserved_minus_allocated_gb']}) "
+                    f"free={memory['free_gb']}GB  "
+                    f"generator_loads={len(GENERATOR_LOADS)}"
                 )
 
             n_done += len(idxs)
