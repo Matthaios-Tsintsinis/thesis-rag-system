@@ -395,7 +395,14 @@ def main(argv: list[str] | None = None) -> int:
     # ---- VARIANT SET 2: every layer pinned to cuda:0, bypassing
     # device_map="auto". If this is fast and the production load is not,
     # the production load is not keeping the weights resident.
-    del enc
+    # DROP THIS PROBE'S OWN REFERENCES FIRST. `release_generator` clears
+    # the lru_cache and calls empty_cache, but the cache is not the only
+    # thing holding the model: these locals are. The first run of this
+    # probe kept them and the variant died with "Tried to allocate
+    # 14.16 GiB ... 14.45 GiB already in use" — the first copy, still
+    # referenced, still resident. Reported at the time as a failed
+    # control, which it was; it was also a bug in the control.
+    del enc, model, tokenizer
     release_generator()
     try:
         from transformers import AutoModelForCausalLM, AutoTokenizer
