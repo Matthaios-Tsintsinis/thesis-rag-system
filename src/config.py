@@ -477,6 +477,16 @@ class M4Config:
     # PaperTreeParams.max_length_in_cluster (3500), so a fixed count
     # sized for short clusters OOMs on a layer of long ones.
     #
+    # THIS IS A HARNESS BATCHING KNOB, NOT A RAPTOR PARAMETER. The paper
+    # specifies no such value, so no setting of it is "paper-faithful" in
+    # the sense M4 ruling 4 uses for the 100-token summary cap. The
+    # argument for preferring a HIGHER cap is one step removed and still
+    # real: the cap bounds n * longest_prompt, so a lower cap constrains
+    # which contexts may share a batch, and batch composition can move
+    # generated text at temperature 0. A higher cap therefore leaves
+    # summarisation less constrained BY THE HARNESS. Do not restate that
+    # as fidelity to the paper.
+    #
     # 8000 IS MEASURED, and it replaces a reasoned 16000 that DIES.
     # 16000 OOMs after 370 s on the largest NarrativeQA story (peak
     # 21.62 GB against a 22.03 GiB L4) — it was set below the answer
