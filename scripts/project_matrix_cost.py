@@ -89,6 +89,23 @@ def project_cell(
     build_s = float(sum(builds))
     query_s = float(s_per_query) * int(n_queries)
     total_s = build_s + query_s
+
+    # PER-UNIT CHECKPOINTING CHANGES WHAT AN OVERRUN COSTS, and that
+    # drives session packing more than the raw percentage does.
+    # `index_items` runs once per EvalUnit and flushes each story's tree
+    # to its own cache dir, manifest written last, before any query for
+    # that story is answered. A multi-unit M4 cell that dies mid-build
+    # therefore loses ONE story; a single-unit cell loses the whole build.
+    # MultiHop is one shared corpus, so its M4 build has no granularity to
+    # fall back on. A cell at 90% of a session WITH checkpointing is safer
+    # than one at 70% without it.
+    checkpointed = system in TREE_SYSTEMS and len(builds) > 1
+    fraction = total_s / SESSION_GUARD_S
+    # Unprotected cells are ranked as if they carried half a session more
+    # risk than their wall time implies, so the ordering reflects the cost
+    # of losing the work rather than the time to do it.
+    risk_rank = round(fraction + (0.0 if checkpointed else 0.5), 3)
+
     return {
         "system": system,
         "benchmark": benchmark,
@@ -100,7 +117,13 @@ def project_cell(
         "query_s": query_s,
         "total_s": total_s,
         "total_h": round(total_s / 3600, 2),
-        "fraction_of_session": round(total_s / SESSION_GUARD_S, 3),
+        "fraction_of_session": round(fraction, 3),
+        # What an interrupted build costs: one unit, or all of it.
+        "build_checkpointed": checkpointed,
+        "build_loss_on_interrupt_s": (
+            max(builds) if (checkpointed and builds) else build_s
+        ),
+        "risk_rank": risk_rank,
         "over_warn_fraction": total_s > SESSION_GUARD_S * WARN_FRACTION,
         # Categorically worse than merely large: this cell cannot finish
         # in one session and needs --resume planning, not a warning.
@@ -153,6 +176,13 @@ def project_matrix(
         "flagged": [c for c in cells if c["over_warn_fraction"]],
         "exceeding": [c for c in cells if c["exceeds_session"]],
         "unmeasured_builds": [c for c in cells if c["build_unmeasured"]],
+        # Packing order: an unprotected build outranks a larger protected
+        # one, because the question is what an interrupted session COSTS,
+        # not how long it takes.
+        "by_risk": sorted(cells, key=lambda c: -c["risk_rank"]),
+        "unprotected_builds": [
+            c for c in cells if c["build_s"] and not c["build_checkpointed"]
+        ],
         "n_sessions_at_guard": round(total_s / SESSION_GUARD_S, 2),
     }
 
@@ -160,8 +190,8 @@ def project_matrix(
 def _render(m: dict) -> str:
     rows = [
         f"{'system':<6} {'benchmark':<18} {'build_h':>8} {'query_h':>8} "
-        f"{'total_h':>8} {'frac':>6}  flags",
-        "-" * 74,
+        f"{'total_h':>8} {'frac':>6} {'ckpt':>6}  flags",
+        "-" * 86,
     ]
     for c in m["cells"]:
         flags = []
@@ -171,13 +201,20 @@ def _render(m: dict) -> str:
             flags.append("over-60%")
         if c["build_unmeasured"]:
             flags.append("BUILD-UNMEASURED")
+        # Only meaningful where there IS a build to lose.
+        if c["build_s"] and not c["build_checkpointed"]:
+            flags.append("BUILD-ALL-OR-NOTHING")
+        ckpt = (
+            "per-unit" if c["build_checkpointed"]
+            else ("whole" if c["build_s"] else "-")
+        )
         rows.append(
             f"{c['system']:<6} {c['benchmark']:<18} "
             f"{c['build_s'] / 3600:>8.2f} {c['query_s'] / 3600:>8.2f} "
-            f"{c['total_h']:>8.2f} {c['fraction_of_session']:>6.2f}  "
-            f"{', '.join(flags)}"
+            f"{c['total_h']:>8.2f} {c['fraction_of_session']:>6.2f} "
+            f"{ckpt:>6}  {', '.join(flags)}"
         )
-    rows.append("-" * 74)
+    rows.append("-" * 86)
     rows.append(
         f"TOTAL {m['total_h']:.2f} h = {m['n_sessions_at_guard']} sessions "
         f"at the {SESSION_GUARD_S / 3600:.0f} h guard"

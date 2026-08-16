@@ -82,6 +82,53 @@ class TestSessionGuardFlagging(unittest.TestCase):
         self.assertTrue(cell["exceeds_session"])
 
 
+class TestCheckpointRisk(unittest.TestCase):
+    """Per-unit tree caching changes what an overrun COSTS, and that
+    drives packing more than the raw percentage.
+
+    `index_items` runs once per EvalUnit and each story's tree is flushed
+    to its own cache dir, manifest last, before any query for it is
+    answered. So a multi-unit M4 cell that dies mid-build loses ONE story.
+    A single-unit cell — MultiHop is one shared corpus — loses the whole
+    build. A cell at 90% of a session with per-unit checkpointing is safer
+    than one at 70% without it.
+    """
+
+    def test_multi_unit_tree_cell_is_checkpointed(self):
+        cell = project_cell(
+            system="M4", benchmark="narrativeqa", n_queries=1208,
+            s_per_query=5.0, build_s_per_unit=[80.0] * 40,
+        )
+        self.assertTrue(cell["build_checkpointed"])
+
+    def test_single_unit_tree_cell_is_not_checkpointed(self):
+        """MultiHop is ONE EvalUnit, so there is no per-unit granularity
+        to fall back on — an interrupted build loses all of it."""
+        cell = project_cell(
+            system="M4", benchmark="multihop_rag", n_queries=2556,
+            s_per_query=5.0, build_s_per_unit=[3000.0],
+        )
+        self.assertFalse(cell["build_checkpointed"])
+
+    def test_non_tree_systems_have_no_build_to_checkpoint(self):
+        cell = project_cell(system="M2", benchmark="narrativeqa",
+                            n_queries=1208, s_per_query=3.7)
+        self.assertFalse(cell["build_checkpointed"])
+
+    def test_risk_ranks_an_unprotected_cell_above_a_larger_protected_one(self):
+        """The ordering that makes the column worth having."""
+        protected = project_cell(
+            system="M4", benchmark="narrativeqa", n_queries=1,
+            s_per_query=SESSION_GUARD_S * 0.9,
+            build_s_per_unit=[1.0] * 40,
+        )
+        exposed = project_cell(
+            system="M4", benchmark="multihop_rag", n_queries=1,
+            s_per_query=SESSION_GUARD_S * 0.7, build_s_per_unit=[1.0],
+        )
+        self.assertGreater(exposed["risk_rank"], protected["risk_rank"])
+
+
 class TestMatrixRollup(unittest.TestCase):
     MEASURED = {
         "s_per_query": {
