@@ -186,6 +186,22 @@ GEN_TOP_P = 1.0
 # disagrees with what was requested.
 LOAD_GENERATOR_IN_4BIT = False
 
+# Placement budget handed to accelerate. "cpu": "0GiB" leaves NOWHERE to
+# spill, which converts a silent offload into a load-time exception.
+#
+# Measured 2026-08-16, and the reason this exists. A second generator
+# load landed in VRAM already holding the first copy plus the embedder;
+# device_map="auto" did what it is designed to do and placed 62% of the
+# weights off-device. The build did not fail. It produced correct
+# summaries, a correct tree and a plausible results row, while every
+# decode step streamed 4.74 B parameters across PCIe — a flat ~230 s per
+# generate() call against a healthy 6.9 s, 33x, for twenty hours.
+#
+# 20GiB of a 22.03GiB L4 leaves headroom for KV and activations while
+# still admitting the ~14.2GB fp16 weights. Raise it only with a measured
+# reason; lowering it below the weight size makes every load raise.
+GENERATOR_MAX_MEMORY = {0: "20GiB", "cpu": "0GiB"}
+
 
 # --- Prompts --------------------------------------------------------------
 
