@@ -533,14 +533,52 @@ class _PhaseClock:
     def __init__(self) -> None:
         self.seconds: dict[str, float] = {}
         self.calls: dict[str, int] = {}
+        # One entry per phase currently on the stack, holding the time
+        # its CHILDREN have consumed. See `enter`/`exit_`.
+        self._stack: list[list] = []
 
     def reset(self) -> None:
         self.seconds.clear()
         self.calls.clear()
+        self._stack.clear()
+
+    def enter(self, phase: str) -> None:
+        """Open a frame. Its child time accrues here, not to the phase."""
+        self._stack.append([phase, 0.0])
+
+    def exit_(self, elapsed: float) -> None:
+        """Close the innermost frame, crediting it only its OWN time.
+
+        PHASES MUST PARTITION THE BUILD, NOT OVERLAP IT. `_gmm_cluster`
+        is timed as `gmm_final_fit` and calls `_get_optimal_clusters`,
+        timed as `gmm_bic_sweep`, so a flat accumulator charged the sweep
+        to both and the phases summed to ~19% MORE than the build they
+        described. Wall clock was never wrong; the ATTRIBUTION was, and
+        attribution is what retired UMAP as a suspect and surfaced GMM as
+        the second cost. Decisions are being made on these numbers.
+
+        Subtracting child time makes the invariant structural rather than
+        something a future nesting can quietly break.
+        """
+        phase, child_s = self._stack.pop()
+        own = elapsed - child_s
+        if own < 0:  # clock skew only; never let a phase go negative
+            own = 0.0
+        self.seconds[phase] = self.seconds.get(phase, 0.0) + own
+        self.calls[phase] = self.calls.get(phase, 0) + 1
+        if self._stack:
+            self._stack[-1][1] += elapsed
 
     def add(self, phase: str, dt: float) -> None:
+        """Flat accrual, for phases timed without the decorator.
+
+        Still charged to any open parent frame, so an inline `add` inside
+        a decorated function does not re-create the double count.
+        """
         self.seconds[phase] = self.seconds.get(phase, 0.0) + dt
         self.calls[phase] = self.calls.get(phase, 0) + 1
+        if self._stack:
+            self._stack[-1][1] += dt
 
     def as_stats(self) -> dict:
         total = sum(self.seconds.values())
@@ -577,11 +615,15 @@ def _timed(phase: str):
         def wrapper(*args, **kwargs):
             import time as _time
 
+            _CLOCK.enter(phase)
             t0 = _time.perf_counter()
             try:
                 return fn(*args, **kwargs)
             finally:
-                _CLOCK.add(phase, _time.perf_counter() - t0)
+                # `finally`, so a raising phase still closes its frame —
+                # a dirty stack would mis-attribute every later phase to
+                # whatever was open when the exception passed through.
+                _CLOCK.exit_(_time.perf_counter() - t0)
 
         return wrapper
 
