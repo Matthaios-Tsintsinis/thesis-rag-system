@@ -38,16 +38,33 @@ from src.eval.narrativeqa import CELL_UNITS
 
 
 def leaf_count(text: str) -> int:
-    """Leaves the paper chunker would produce for one document.
+    """Leaves the BUILD would produce for one document.
 
-    The SAME function the build calls, not an approximation of it: a
-    fixture standing in for real data must have its parameters measured
-    from that data, and a token-count heuristic here would silently
-    diverge from the chunker the moment either changed.
+    NOT `split_text_raptor(item.text)`. The build does not chunk the raw
+    item text: `index_items` writes each parent to a temp file and reads
+    it back through `walk_corpus` -> `extract_text` -> `parsing.clean_text`,
+    which collapses runs of spaces and tabs to a single space, and runs
+    of three or more newlines to two. Because `split_text_raptor` treats
+    a newline RUN as a boundary and folds a lone newline to a space, that
+    cleaning moves chunk boundaries.
+
+    MEASURED DIVERGENCE, and it is why this function exists: story
+    961902ae counted 519 leaves raw against 481 in the build, while
+    57523a48 and d431326b matched exactly. Story-dependent, because it
+    depends on how much whitespace the text happens to carry — which is
+    the worst shape of error, since two agreeing samples read as proof.
+
+    The token budget comes from the configured chunker rather than the
+    function default, for the same reason: an inventory that hardcodes
+    100 silently stops describing the build the moment the config moves.
     """
+    from src.config import DEFAULT_CONFIG
+    from src.parsing import clean_text
     from src.raptor_paper import split_text_raptor
 
-    return len(split_text_raptor(text))
+    chunker = DEFAULT_CONFIG.m4.chunker
+    max_tokens = getattr(chunker, "chunk_words", 100) if chunker else 100
+    return len(split_text_raptor(clean_text(text), max_tokens=max_tokens))
 
 
 def inventory(max_units: int | None = CELL_UNITS) -> dict[str, Any]:

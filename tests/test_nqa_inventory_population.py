@@ -122,5 +122,55 @@ class TestInventoryMatchesTheLoader(unittest.TestCase):
         self.assertIn("population", inv.inventory.__doc__.lower())
 
 
+class TestLeafCountMatchesTheBuild(unittest.TestCase):
+    """The inventory must count what the BUILD counts.
+
+    MEASURED DIVERGENCE: story 961902ae inventoried 519 leaves against
+    481 in the build, while 57523a48 and d431326b matched exactly. The
+    cause is that `index_items` writes each parent to a temp file and
+    reads it back through `parsing.clean_text`, which collapses runs of
+    spaces/tabs and runs of 3+ newlines — and `split_text_raptor` treats
+    a newline run as a boundary, so the cleaning MOVES chunk boundaries.
+
+    Story-dependent, which is the worst shape of error: two agreeing
+    samples read as proof that the third is fine.
+    """
+
+    def test_whitespace_heavy_text_diverges_when_counted_raw(self):
+        """Pins the MECHANISM. If this stops diverging, the cleaning
+        changed and the parity below is passing for a new reason."""
+        from src.raptor_paper import split_text_raptor
+
+        from scripts.inventory_narrativeqa_units import leaf_count
+
+        text = ("Alpha beta gamma delta epsilon zeta eta theta." + "\n" * 6
+                + "Iota    kappa\t\tlambda mu nu xi omicron pi rho. ") * 40
+        raw = len(split_text_raptor(text))
+        self.assertNotEqual(raw, leaf_count(text))
+
+    def test_leaf_count_equals_the_cleaned_chunking(self):
+        """Parity with the build's own pipeline, asserted directly."""
+        from src.parsing import clean_text
+        from src.raptor_paper import split_text_raptor
+
+        from scripts.inventory_narrativeqa_units import leaf_count
+
+        text = ("Alpha beta gamma." + "\n" * 5
+                + "Delta   epsilon\tzeta eta theta iota. ") * 30
+        self.assertEqual(leaf_count(text),
+                         len(split_text_raptor(clean_text(text))))
+
+    def test_the_token_budget_comes_from_the_config(self):
+        """A hardcoded 100 would stop describing the build the moment the
+        chunker moved."""
+        import inspect
+
+        from scripts.inventory_narrativeqa_units import leaf_count
+
+        src = inspect.getsource(leaf_count)
+        self.assertIn("chunk_words", src)
+        self.assertIn("clean_text", src)
+
+
 if __name__ == "__main__":
     unittest.main()
