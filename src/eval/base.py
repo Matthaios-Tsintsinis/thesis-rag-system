@@ -298,6 +298,7 @@ class BenchmarkRunner:
         split: str,
         max_units: int | None = None,
         max_queries: int | None = None,
+        only_unit: str | None = None,
     ) -> Iterator[ScoredQuery]:
         """Drive one (system, benchmark, split) pass to JSONL.
 
@@ -335,6 +336,14 @@ class BenchmarkRunner:
             for unit_idx, unit in enumerate(
                 benchmark.iter_eval_units(split=split, max_units=max_units)
             ):
+                # TARGETED SINGLE UNIT. Needed because `--max-units N`
+                # cannot address a specific unit on NarrativeQA: its draw
+                # is seeded on N, so `--max-units 1` selects a DIFFERENT
+                # story than the first of the 40-story cell. Filtering by
+                # id leaves the draw intact and picks from within it.
+                if only_unit and not str(unit.corpus_id).startswith(only_unit):
+                    continue
+
                 if self.verbose:
                     print(
                         f"[eval] unit {unit_idx + 1}: corpus_id={unit.corpus_id!r}  "

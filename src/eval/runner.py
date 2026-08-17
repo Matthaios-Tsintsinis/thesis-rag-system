@@ -211,6 +211,70 @@ def assert_environment_pinned(
     print(f"[eval] PREFLIGHT: environment matches {lockfile}")
 
 
+def resolve_expected_n_queries(benchmark) -> int | None:  # noqa: ANN001
+    """The loader-derived query count P8 asserts a cell against.
+
+    One key, read from one place. HotpotQA used to record only
+    `n_questions` while the other loaders recorded `n_queries`, so this
+    field was null on ten of twenty cells and P8's short-cell guard had
+    nothing to compare against. The loaders now agree; this reads the
+    agreed key and returns None rather than guessing at a synonym.
+    """
+    stats = getattr(benchmark, "stats", {}) or {}
+    value = stats.get("n_queries")
+    return int(value) if value else None
+
+
+def assert_expected_n_queries_usable(
+    expected: int | None,
+    *,
+    max_units: int | None,
+    max_queries: int | None,
+) -> None:
+    """A full cell must carry a count to be checked against.
+
+    P8's guard exists so a TRUNCATED cell aborts instead of reporting a
+    partial mean. A null `expected_n_queries` removes that guard without
+    removing the appearance of it, which is worse than a short cell —
+    nothing downstream can tell the difference between "complete" and
+    "unchecked".
+
+    A capped run legitimately has no full-cell expectation, so the check
+    applies only when neither cap is set.
+    """
+    if expected is not None:
+        return
+    if max_units is not None or max_queries is not None:
+        return
+    raise SystemExit(
+        "PROVENANCE FAILED: expected_n_queries is null on an UNCAPPED "
+        "run. P8 asserts each cell's row count against this number, so a "
+        "null silently disables the short-cell guard — nothing downstream "
+        "can then tell a complete cell from an unchecked one. The loader "
+        "must record `n_queries` in its stats."
+    )
+
+
+def resolve_chunking_strategy(system) -> str | None:  # noqa: ANN001
+    """The chunker the system RESOLVED, not the harness default.
+
+    `system.config.chunking.strategy` is the harness-wide default, which
+    M4 does not use: it resolves `raptor_100tok` through
+    `resolved_components.chunker_config`. Recording the default meant
+    every M4 row in the final table would have named the wrong chunker,
+    while the run's own components line printed the right one.
+    """
+    resolved = getattr(system, "resolved_components", None)
+    chunker = getattr(resolved, "chunker_config", None) if resolved else None
+    strategy = getattr(chunker, "strategy", None)
+    if strategy:
+        return strategy
+    return getattr(
+        getattr(getattr(system, "config", None), "chunking", None),
+        "strategy", None,
+    )
+
+
 def assert_population_as_declared(
     benchmark,  # noqa: ANN001
     *,
@@ -331,6 +395,19 @@ def main() -> None:
         "max papers (~20 is the recommended small-sample gate before "
         "the full validation run). For MultiHop-RAG only 0 or 1 is "
         "meaningful (the dataset is one EvalUnit).",
+    )
+    parser.add_argument(
+        "--only-unit",
+        type=str,
+        default=None,
+        help=(
+            "Run ONLY units whose corpus_id starts with this prefix, "
+            "drawn from within the benchmark's normal population. Use "
+            "this instead of --max-units to target a specific unit: on "
+            "NarrativeQA the seeded draw depends on N, so --max-units 1 "
+            "selects a DIFFERENT story than the first of the 40-story "
+            "cell, and would build a tree the cell never touches."
+        ),
     )
     parser.add_argument(
         "--max-queries",
@@ -661,6 +738,7 @@ def main() -> None:
         split=args.split,
         max_units=args.max_units,
         max_queries=args.max_queries,
+        only_unit=args.only_unit,
     ):
         n_scored += 1
         if scored.answer.method == "unanswerable_rule":
@@ -681,7 +759,18 @@ def main() -> None:
     assert_population_as_declared(
         benchmark,
         n_units_processed=getattr(runner, "n_units_processed", 0),
-        max_units_explicit=args.max_units,
+        max_units_explicit=args.max_units or (
+            1 if args.only_unit else None),
+    )
+
+    # Resolved AFTER the pass, because the loader fills its stats as it
+    # yields. Checked before the summary is written so an uncapped cell
+    # cannot be banked with P8's short-cell guard silently disarmed.
+    _expected_n_queries = resolve_expected_n_queries(benchmark)
+    assert_expected_n_queries_usable(
+        _expected_n_queries,
+        max_units=args.max_units,
+        max_queries=args.max_queries,
     )
 
     # Aggregate summary alongside the JSONL.
@@ -692,6 +781,7 @@ def main() -> None:
         "benchmark": args.benchmark,
         "split": args.split,
         "max_units": args.max_units,
+        "only_unit": args.only_unit,
         "n_queries_scored": n_scored,
         "n_retrieval_skipped": sum_retr_skipped,
         "mean_retrieval_f1": sum_retr_f1 / n_retr_scored,
@@ -711,9 +801,7 @@ def main() -> None:
         # LOADER-DERIVED, never a literal. P8 asserts the post-dedup row
         # count against this, and a hardcoded constant would abort every
         # NarrativeQA cell the moment P7 re-drew the sample.
-        "expected_n_queries": (getattr(benchmark, "stats", {}) or {}).get(
-            "n_queries"
-        ),
+        "expected_n_queries": _expected_n_queries,
         # Run-condition provenance (the aggregator's conditions columns;
         # every matrix row must be self-describing from birth). The
         # generator field is what keeps Qwen-era and gpt-4o-mini-era
@@ -724,11 +812,22 @@ def main() -> None:
         # are distinct roles and a row must say which model built the
         # trees it read -- that is precisely the M4 confound.
         "index_llm": system.config.m4.summary_model,
-        "chunking_strategy": system.config.chunking.strategy,
+        "chunking_strategy": resolve_chunking_strategy(system),
+        # The CK-4 ABLATION FLAG, not the effective budget. M4 carries a
+        # 2,000-token paper budget through its own config and shows null
+        # here; both are recorded so neither is read as the other.
         "evidence_budget": args.evidence_budget,
+        "evidence_budget_effective": getattr(
+            system.config.m4, "retrieval_token_budget", None
+        ) if args.system == "M4" else None,
         # Recorded so a probe artifact is self-describing. The 1-token
         # probe that silently ran uncapped would have been caught here.
+        # ANSWER-path cap. The index-time summariser uses its own,
+        # recorded beside it so a reader is not left inferring which.
         "max_new_tokens": harness_cfg.generation.max_new_tokens,
+        "summary_max_new_tokens": getattr(
+            system.config.m4, "summary_max_tokens", None
+        ) if args.system == "M4" else None,
         "prewarm_load_s": load_s,
         # Wall clock of runner.run() ALONE — model load excluded when
         # --prewarm is used. s_per_query is the number every cost

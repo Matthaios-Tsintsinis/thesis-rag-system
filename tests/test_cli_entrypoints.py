@@ -56,7 +56,12 @@ class _TinyBenchmark:
     name = "tiny"
 
     def __init__(self) -> None:
-        self.stats = {"n_units": 1}
+        # `n_queries` is part of the loader contract, not decoration:
+        # the runner asserts an uncapped cell carries a loader-derived
+        # count, because a null there disarms P8's short-cell guard
+        # without removing the appearance of it. A stub that omitted it
+        # was a stub that could not have caught the HotpotQA null.
+        self.stats = {"n_units": 1, "n_queries": 2}  # the two below
 
     def iter_eval_units(self, split, max_units=None):
         corpus = (

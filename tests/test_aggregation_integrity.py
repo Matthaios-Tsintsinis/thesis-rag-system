@@ -128,14 +128,36 @@ class TestExpectedCountGate(unittest.TestCase):
             an._check_expected_n([p], 1)
 
     def test_the_runner_records_a_loader_derived_count(self):
+        """BEHAVIOURAL, not a source grep.
+
+        This asserted the literal text of an inline `.get("n_queries")`
+        expression, so it broke the moment the read moved into a named
+        function — while proving nothing about where the number comes
+        from. It now drives the resolver with two different loaders and
+        checks the value TRACKS the loader, which a constant could not.
+        """
+        from src.eval.runner import resolve_expected_n_queries
+
+        class _Loader:
+            def __init__(self, n):
+                self.stats = {"n_queries": n}
+
+        self.assertEqual(resolve_expected_n_queries(_Loader(2556)), 2556)
+        self.assertEqual(resolve_expected_n_queries(_Loader(1208)), 1208)
+
+    def test_no_literal_query_count_is_baked_into_the_runner(self):
+        """The original intent of the grep above, kept and made precise:
+        a hardcoded 1208 would abort every NarrativeQA cell the moment P7
+        re-drew the sample."""
         import inspect
 
         from src.eval import runner
 
-        src = inspect.getsource(runner.main)
-        self.assertIn('"expected_n_queries"', src)
-        # It must come from the loader's own stats, not a constant.
-        self.assertIn('.get(\n            "n_queries"\n        )', src)
+        src = inspect.getsource(runner)
+        for literal in ("1208", "2556"):
+            self.assertNotIn(
+                f"== {literal}", src, f"literal {literal} compared in runner"
+            )
 
 
 if __name__ == "__main__":

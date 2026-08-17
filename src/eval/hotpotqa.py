@@ -299,6 +299,12 @@ class HotpotQABenchmark:
         self.max_questions = max_questions
         self.stats: dict[str, Any] = {
             "n_questions": 0,
+            # SAME KEY AS EVERY OTHER LOADER. The run summary's
+            # expected_n_queries reads "n_queries", and this loader
+            # recorded only "n_questions" — so P8's short-cell guard had
+            # nothing to compare against on all ten HotpotQA cells, and
+            # the null was written in silence.
+            "n_queries": 0,
             "n_units": 0,
             "n_bridge": 0,
             "n_comparison": 0,
@@ -384,6 +390,7 @@ class HotpotQABenchmark:
             round(tok_total / n_paras, 1) if n_paras else None)
         self.stats["n_distinct_titles"] = len(titles)
         self.stats["n_questions"] = len(ds)
+        self.stats["n_queries"] = len(ds)
 
         # REALISED distribution of the stratifying variables. The
         # subsample is random rather than stratified, so nothing
