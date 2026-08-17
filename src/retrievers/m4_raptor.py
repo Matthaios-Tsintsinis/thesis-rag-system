@@ -32,31 +32,30 @@ Pipeline, end to end:
 #    option to question ...") is replaced by the harness-wide answer
 #    prompt, whose exact abstention string is load-bearing for the
 #    unanswerable / abstention scorers across every benchmark.
-# 4. MINIMUM CORPUS SIZE — RAPTOR degenerates below it, and on
-#    HotpotQA-distractor the cell is MIXED rather than uniformly flat.
+# 4. MINIMUM CORPUS SIZE — 3.6% of HotpotQA-distractor units fall below
+#    it. MEASURED over all 1,000 units (2026-08-16):
 #
-#    The reference stop condition is
-#    `len(current) <= reduction_dimension + 1` = 11, checked BEFORE the
-#    first clustering pass. A unit at or below that yields layer 0 only:
-#    no UMAP, no GMM, no summaries, and a collapsed index over the leaves
-#    alone, i.e. flat dense retrieval with M4's OWN components (mpnet,
-#    100-token chunks, 2,000-token budget) — which is NOT M2, whose
-#    embedder, chunker and context budget all differ.
+#      18,235 leaves total; min 2, p25 15, median 18, p75 21, max 37
+#      964/1000 units build a 2-layer hierarchy
+#       36/1000 (3.6%) fall at or below the 11-leaf stop threshold
 #
-#    MEASURED, and it refuted the first version of this note: the LARGEST
-#    HotpotQA-distractor unit yields **15 leaves** and builds a real
-#    2-layer tree (layer_sizes {0:15, 1:3}, 3 summary nodes,
-#    degenerate_no_tree=False). It is NOT below the threshold. Units
-#    whose ~10 paragraphs chunk to <= 11 leaves DO degenerate, so the
-#    cell is a HETEROGENEOUS MIX: some questions answered over a 2-layer
-#    hierarchy, some over flat retrieval, decided by chunk count per
-#    question.
+#    RAPTOR stops when a layer holds `<= reduction_dimension + 1` = 11
+#    nodes, checked BEFORE the first clustering pass. So the cell is
+#    OVERWHELMINGLY A REAL RAPTOR RESULT: 964 units build layer 1 (the
+#    largest, 37 leaves, gives layer_sizes {0:15, 1:3} at 15 leaves and
+#    scales from there), while 36 units yield layer 0 only — no UMAP, no
+#    GMM, no summaries — and are scored on flat dense retrieval with M4's
+#    OWN components (mpnet, 100-token chunks, 2,000-token budget), which
+#    is NOT M2, whose embedder, chunker and context budget all differ.
 #
-#    That mix is the declarable property, and the fraction that
-#    degenerates must be MEASURED (scripts/inventory_unit_leaves.py
-#    --benchmark hotpotqa) rather than assumed in either direction. The
-#    paper never tests this regime; `analyse` reports the per-cell
-#    degenerate-row count at run time and the results caption carries it.
+#    State the 3.6% rather than characterising the cell as "mixed": the
+#    tail is small and naming it as a mix overstates it. `analyse` reports
+#    the per-cell degenerate-row count at run time and the results caption
+#    carries the fraction.
+#
+#    The paper never tests this regime — RAPTOR's own corpora are far
+#    above the threshold — so the small-corpus tail is a measured
+#    property of the method, reportable as such.
 # 4. Summarisation temperature is 0.0; the reference leaves it unset
 #    (=1.0). Infrastructure contract: a cache key must determine the
 #    artifact it names. Consequence recorded — the reference's own trees

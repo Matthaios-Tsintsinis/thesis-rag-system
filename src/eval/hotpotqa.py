@@ -36,24 +36,20 @@ VARIANT B — `hotpotqa_pooled` — pooled shards.
 
 # === DEVIATIONS AND LIMITS — thesis footnote ===
 #
-# 0. M4 ON VARIANT A IS A MIXED CELL, and the results table must say
-#    so. RAPTOR stops when a layer holds <= reduction_dimension + 1 = 11
-#    nodes, checked before the first clustering pass. A distractor corpus
-#    is ~10 paragraphs, which lands NEAR that threshold rather than
-#    safely below it: the largest unit measures 15 leaves and builds a
-#    real 2-layer tree (3 summary nodes), while units chunking to <= 11
-#    leaves build none at all.
+# 0. M4 ON VARIANT A IS A REAL RAPTOR RESULT, with a 3.6% flat tail.
+#    Measured over all 1,000 units: 18,235 leaves, min 2 / p25 15 /
+#    median 18 / p75 21 / max 37. RAPTOR stops when a layer holds
+#    <= reduction_dimension + 1 = 11 nodes, so:
 #
-#    So M4's rows here are heterogeneous — some answered over a 2-layer
-#    hierarchy, some over flat dense retrieval — determined by chunk
-#    count per question. The degenerate FRACTION is a measured quantity
-#    (scripts/inventory_unit_leaves.py --benchmark hotpotqa), not an
-#    assumption, and it is what the declaration states.
+#      964/1000 units (96.4%) build a 2-layer hierarchy
+#       36/1000 units  (3.6%) fall at or below the threshold and are
+#                             scored on flat dense retrieval with M4's
+#                             own components
 #
-#    Reported rather than dropped: an empty cell in a 5x4 matrix invites
-#    the question the label answers in place, and RAPTOR's behaviour at
-#    corpus sizes near its own stop condition is a regime the paper never
-#    tests.
+#    The results caption states the 3.6%. Reported rather than dropped:
+#    an empty cell in a 5x4 matrix invites the question the label answers
+#    in place, and RAPTOR's behaviour at corpus sizes near its own stop
+#    condition is a regime the paper never tests.
 #
 # 1. RESIDUAL COMPARABILITY GAP, even on variant A. Our generator is a
 #    non-fine-tuned Qwen2.5-7B and our retrieval unit is a 100-token
