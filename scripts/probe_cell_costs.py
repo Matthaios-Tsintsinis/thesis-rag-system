@@ -510,30 +510,80 @@ def probe_padding_sweep(
     return rows
 
 
+def units_covering(units: list, n: int) -> list:
+    """The prefix of `units` whose queries first reach `n`.
+
+    WHY A SLICE MUST SPAN UNITS. Queries per EvalUnit differ by three
+    orders of magnitude across this matrix: MultiHop is one shared corpus
+    with 2,556, a pooled HotpotQA shard holds 100, a NarrativeQA story
+    ~30, and a HotpotQA-distractor unit holds exactly ONE. A probe fixed
+    to a single unit cannot produce a 50-query slice on two of the four
+    benchmarks — it aborted rather than measuring.
+
+    Returns the units in loader order; the caller indexes each and stops
+    once it has answered `n`.
+    """
+    picked: list = []
+    total = 0
+    for unit in units:
+        if total >= n:
+            break
+        picked.append(unit)
+        total += len(unit.queries)
+    return picked
+
+
 def probe_query_slice(system_ids: list[str], benchmark_id: str, n: int) -> list[dict]:
-    """Timed slice: s_per_query net of indexing and of model load."""
+    """Timed slice: s_per_query net of model load, index cost reported.
+
+    Spans as many units as `n` requires and reports index and answer time
+    SEPARATELY, because the projector needs them separately: the build
+    term is per-unit and summed, the query term is per-query and
+    multiplied.
+    """
     from src.config import DEFAULT_CONFIG
-    from src.eval.runner import SYSTEM_REGISTRY
+    from src.eval.runner import BENCHMARK_REGISTRY, SYSTEM_REGISTRY
+
+    bench = BENCHMARK_REGISTRY[benchmark_id]()
+    declared = getattr(bench, "cell_units", None)
+    all_units = list(bench.iter_eval_units(split="validation",
+                                           max_units=declared))
+    units = units_covering(all_units, n)
+    available = sum(len(u.queries) for u in units)
+    if available < n:
+        _fail(
+            f"{benchmark_id}: only {available} queries across all "
+            f"{len(all_units)} units, wanted {n}"
+        )
+    print(f"[probe] {benchmark_id}: {n} queries span {len(units)} of "
+          f"{len(all_units)} units "
+          f"({'ONE tree' if len(units) == 1 else str(len(units)) + ' trees'} "
+          "for a tree system)")
 
     rows: list[dict] = []
-    bench, unit = _one_unit(benchmark_id)
-    queries = list(unit.queries)[:n]
-    if len(queries) < n:
-        _fail(f"{benchmark_id}: only {len(queries)} queries available, wanted {n}")
-
     for system_id in system_ids:
         system = SYSTEM_REGISTRY[system_id](DEFAULT_CONFIG)
 
-        t_index = time.perf_counter()
-        system.index_items(unit.corpus)
-        index_s = time.perf_counter() - t_index
-
-        t0 = time.perf_counter()
+        index_s = 0.0
+        answer_s = 0.0
+        per_unit_index_s: list[float] = []
         n_done = 0
-        for q in queries:
-            system.answer(q.question_text)
-            n_done += 1
-        answer_s = time.perf_counter() - t0
+        for unit in units:
+            if n_done >= n:
+                break
+            t_index = time.perf_counter()
+            system.index_items(unit.corpus)
+            dt = time.perf_counter() - t_index
+            index_s += dt
+            per_unit_index_s.append(round(dt, 2))
+
+            t0 = time.perf_counter()
+            for q in unit.queries:
+                if n_done >= n:
+                    break
+                system.answer(q.question_text)
+                n_done += 1
+            answer_s += time.perf_counter() - t0
 
         if n_done != n:
             _fail(f"{system_id}: answered {n_done} of {n} queries")
@@ -542,15 +592,17 @@ def probe_query_slice(system_ids: list[str], benchmark_id: str, n: int) -> list[
             "system": system_id,
             "benchmark": benchmark_id,
             "n": n_done,
+            "n_units_indexed": len(per_unit_index_s),
             "index_s": round(index_s, 2),
+            "per_unit_index_s": per_unit_index_s,
             "answer_s": round(answer_s, 2),
             "s_per_query": round(answer_s / n_done, 4),
             "tree_cache_hit": getattr(system, "tree_cache_hit", None),
         }
         rows.append(row)
-        print(f"[probe] queries {system_id:<4} {benchmark_id:<14} "
-              f"index={index_s:7.1f}s  {row['s_per_query']:.3f} s/query "
-              f"over n={n_done}")
+        print(f"[probe] queries {system_id:<4} {benchmark_id:<16} "
+              f"index={index_s:8.1f}s over {len(per_unit_index_s)} unit(s)  "
+              f"{row['s_per_query']:.3f} s/query over n={n_done}")
     return rows
 
 
