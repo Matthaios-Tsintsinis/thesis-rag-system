@@ -12,6 +12,8 @@ import unittest
 from scripts.project_matrix_cost import (
     SESSION_GUARD_S,
     WARN_FRACTION,
+    estimate_build_s_from_leaves,
+    estimate_cell_builds,
     project_cell,
     project_matrix,
 )
@@ -215,6 +217,79 @@ class TestMatrixRollup(unittest.TestCase):
         by = {(c["system"], c["benchmark"]): c for c in m["cells"]}
         self.assertTrue(by[("M4", "multihop_rag")]["build_unmeasured"])
         self.assertFalse(by[("M2", "multihop_rag")]["build_unmeasured"])
+
+
+class TestBuildEstimateFromLeaves(unittest.TestCase):
+    """Two measured stories + 40 leaf counts -> a per-unit build list.
+
+    The NarrativeQA draw spans 37x in story size, so ONE sample cannot
+    project the cell. Two points anchor a line in leaves, every other
+    story INTERPOLATES between them, and the result feeds
+    `build_s_per_unit` — which the projector already sums rather than
+    averages. That keeps the cell an addition over real units instead of
+    a multiply against a mean that no story actually is.
+
+    Build time is near-linear in leaves because it is
+    n_calls x per_call, n_calls ~ n_summary_nodes / width, and summary
+    nodes scale with leaves. That is a MODEL, and cells estimated from it
+    are marked so they are never mistaken for measurements.
+    """
+
+    # (leaves, build_s): the two stories the operator measures.
+    POINTS = [(142, 79.6), (4953, 2400.0)]
+
+    def test_reproduces_the_measured_points_exactly(self):
+        for leaves, seconds in self.POINTS:
+            est, extrapolated = estimate_build_s_from_leaves(
+                self.POINTS, leaves
+            )
+            self.assertAlmostEqual(est, seconds, places=6)
+            self.assertFalse(extrapolated)
+
+    def test_interpolates_between_them(self):
+        mid_leaves = (142 + 4953) / 2
+        est, extrapolated = estimate_build_s_from_leaves(
+            self.POINTS, mid_leaves
+        )
+        self.assertAlmostEqual(est, (79.6 + 2400.0) / 2, places=4)
+        self.assertFalse(extrapolated)
+
+    def test_outside_the_measured_range_is_flagged(self):
+        _, extrapolated = estimate_build_s_from_leaves(self.POINTS, 6000)
+        self.assertTrue(extrapolated)
+
+    def test_two_distinct_points_are_required(self):
+        with self.assertRaises(ValueError):
+            estimate_build_s_from_leaves([(142, 79.6)], 500)
+
+    def test_identical_leaf_counts_cannot_define_a_line(self):
+        with self.assertRaises(ValueError):
+            estimate_build_s_from_leaves([(142, 79.6), (142, 81.0)], 500)
+
+    def test_a_negative_estimate_is_clamped_and_flagged(self):
+        """A fitted intercept can go negative below the measured range.
+        A negative build time is not a projection, it is a bug leaking
+        into a session plan."""
+        est, extrapolated = estimate_build_s_from_leaves(self.POINTS, 1)
+        self.assertGreaterEqual(est, 0.0)
+        self.assertTrue(extrapolated)
+
+    def test_per_unit_list_preserves_one_entry_per_story(self):
+        leaves = [142, 500, 4953, 300]
+        builds, n_extrapolated = estimate_cell_builds(self.POINTS, leaves)
+        self.assertEqual(len(builds), 4)
+        self.assertEqual(n_extrapolated, 0)
+        self.assertAlmostEqual(builds[0], 79.6, places=4)
+        self.assertAlmostEqual(builds[2], 2400.0, places=4)
+
+    def test_the_sum_is_the_cell_not_the_mean_times_n(self):
+        """The property the 37x spread makes load-bearing."""
+        leaves = [142] * 39 + [4953]
+        builds, _ = estimate_cell_builds(self.POINTS, leaves)
+        self.assertAlmostEqual(sum(builds), 39 * 79.6 + 2400.0, places=3)
+        self.assertNotAlmostEqual(
+            sum(builds), len(leaves) * (sum(builds) / len(leaves)) + 1
+        )
 
 
 class TestPerBenchmarkRates(unittest.TestCase):

@@ -64,6 +64,76 @@ SESSION_GUARD_S = 5 * 3600
 WARN_FRACTION = 0.60
 
 
+def estimate_build_s_from_leaves(
+    points: list[tuple[float, float]],
+    leaves: float,
+) -> tuple[float, bool]:
+    """Estimate one unit's tree-build seconds from its leaf count.
+
+    WHY TWO MEASURED STORIES AND NOT ONE. The NarrativeQA draw spans 37x
+    in story size, so a single sample cannot project the cell — it can
+    only be multiplied, and a multiply against a story no unit resembles
+    is how a session plan goes wrong. Two points anchor a line and every
+    other story INTERPOLATES between them.
+
+    WHY LINEAR IN LEAVES. Build time is `n_calls x per_call`, `n_calls ~
+    n_summary_nodes / batch_width`, and summary nodes scale with leaves.
+    Per-call cost is flat across widths (measured), so the whole thing is
+    near-linear in leaves. That is a MODEL, not a measurement, which is
+    why every value derived from it is marked.
+
+    Returns `(seconds, extrapolated)`. `extrapolated` is True outside the
+    measured range, where the line is no longer anchored on both sides.
+    """
+    xs = sorted({float(x) for x, _ in points})
+    if len(points) < 2 or len(xs) < 2:
+        raise ValueError(
+            "need at least TWO measured stories with DIFFERENT leaf counts: "
+            "one point defines no slope, and two identical ones define no "
+            "line. Measure the largest story and one near the median."
+        )
+
+    # Least squares through however many points were supplied; with the
+    # expected two, this is exactly the line through them.
+    n = len(points)
+    mean_x = sum(x for x, _ in points) / n
+    mean_y = sum(y for _, y in points) / n
+    denom = sum((x - mean_x) ** 2 for x, _ in points)
+    slope = sum((x - mean_x) * (y - mean_y) for x, y in points) / denom
+    intercept = mean_y - slope * mean_x
+
+    est = intercept + slope * float(leaves)
+    extrapolated = not (min(xs) <= float(leaves) <= max(xs))
+    if est < 0:
+        # A fitted intercept can go negative below the measured range. A
+        # negative build time is not a projection, it is a bug leaking
+        # into a session plan.
+        est = 0.0
+        extrapolated = True
+    return est, extrapolated
+
+
+def estimate_cell_builds(
+    points: list[tuple[float, float]],
+    leaves_per_unit: list[float],
+) -> tuple[list[float], int]:
+    """Per-unit build seconds for a whole cell, one entry per unit.
+
+    Returns the list plus how many entries fell outside the measured
+    range. The list feeds `build_s_per_unit`, which the projector SUMS —
+    so the cell stays an addition over real units rather than a mean
+    multiplied by a count, which is the property the 37x spread makes
+    load-bearing.
+    """
+    out: list[float] = []
+    n_extrapolated = 0
+    for leaves in leaves_per_unit:
+        est, extrapolated = estimate_build_s_from_leaves(points, leaves)
+        out.append(est)
+        n_extrapolated += int(extrapolated)
+    return out, n_extrapolated
+
+
 def project_cell(
     *,
     system: str,
