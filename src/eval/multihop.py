@@ -126,6 +126,9 @@ class MultiHopBenchmark:
     """
 
     name = "multihop_rag"
+    # ONE shared-corpus EvalUnit: 609 articles indexed once, 2,556
+    # queries against it. Declared for the runner's population check.
+    cell_units = 1
     VALID_SPLITS = ("validation", "test", "all")
 
     def __init__(self) -> None:

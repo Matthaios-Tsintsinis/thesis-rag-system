@@ -53,8 +53,26 @@ class TestTheLoaderNoLongerTakesAPrefix(unittest.TestCase):
         self.assertNotIn("break", src)
 
     def test_the_loader_samples_through_the_shared_helper(self):
+        """The loader delegates the draw to `select_units`, which calls
+        the shared sampler.
+
+        NOTE ON WHAT THIS TEST IS WORTH. It is a SOURCE GREP, and it
+        passed continuously through the period when a cell launched
+        without `--max-units` ran all 115 stories: the loader did call the
+        shared sampler, just only sometimes. Grepping for a call proves
+        the call exists, never that it governs the run. The behavioural
+        counterpart lives in `test_cell_population_is_code.py`, and that
+        is the test that would have caught it."""
         src = inspect.getsource(narrativeqa.NarrativeQABenchmark.iter_eval_units)
-        self.assertIn("subsample_indices", src)
+        self.assertIn("select_units", src)
+        helper = inspect.getsource(narrativeqa.select_units)
+        self.assertIn("subsample_indices", helper)
+
+    def test_the_default_draw_is_the_cell_not_the_split(self):
+        """The behavioural claim the grep above cannot make."""
+        order = [f"s{i}" for i in range(115)]
+        self.assertEqual(len(narrativeqa.select_units(order, None)),
+                         narrativeqa.CELL_UNITS)
 
     def test_stats_declare_the_seed_and_the_drawn_ids(self):
         bench = narrativeqa.NarrativeQABenchmark()

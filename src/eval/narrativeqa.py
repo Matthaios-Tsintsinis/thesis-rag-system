@@ -63,22 +63,6 @@ from typing import Any, Iterable
 from ..retrievers.base import RetrievedChunk
 from .sampling import SUBSAMPLE_SEED, subsample_indices
 
-# Stories in a matrix CELL — P7's seeded draw of 40 from the 115-story
-# validation split.
-#
-# THE SINGLE SOURCE, and it needed one. This number lived only in
-# `scripts/probe_cell_costs.py`, so every other caller had to remember it
-# and one — the leaf inventory — did not, enumerating all 115 and
-# describing the wrong population.
-#
-# IT IS NOT APPLIED AUTOMATICALLY. `iter_eval_units` draws the sample
-# only when `max_units` is passed; with None it yields the full split.
-# So a cell is 40 stories BECAUSE THE OPERATOR TYPES `--max-units 40`,
-# not because the code says so. Read that again before planning a run:
-# `subsample_indices(115, n)` selects a DIFFERENT SET for each n, so a
-# forgotten flag does not merely widen the sample, it changes which
-# stories are in it.
-CELL_UNITS = 40
 from .scorers import (
     assert_gold_not_empty,
     extractive_max_f1,
@@ -105,10 +89,51 @@ HF_REVISION = "refs/convert/parquet"
 VALID_SPLITS = ("train", "validation", "test")
 
 
+# Stories in a matrix CELL — P7's seeded draw of 40 from the 115-story
+# validation split.
+#
+# THE SINGLE SOURCE, and it needed one. This number used to live only in
+# `scripts/probe_cell_costs.py`, so every other caller had to remember it
+# and one — the leaf inventory — did not, enumerating all 115 and
+# describing a population no cell builds.
+CELL_UNITS = 40
+
+
+def select_units(order: list, max_units: int | None) -> list:
+    """Apply P7's seeded draw. **None means the CELL, not everything.**
+
+    THE DEFECT THIS FIXES, and it is the seventh of its kind. P7 declared
+    a seeded 40-story sample and shipped a seeded SAMPLER: the draw was
+    applied only when `max_units` was passed, and `--max-units` defaults
+    to None, so a cell launched without the flag ran all 115 stories and
+    3,461 questions — and succeeded. The population of a cell is now a
+    property of this function rather than of an operator's memory.
+
+    `max_units` is NOT a cap. `subsample_indices(115, n)` selects a
+    DIFFERENT SET for each n, so asking for fewer does not narrow the
+    same sample, it takes another one. That is why a forgotten flag
+    changed WHICH stories ran, not merely how many — and why a story
+    picked as "largest" from the wrong draw might never be built at all.
+
+    Explicit values are still honoured, including the full split: pass
+    `115` and nothing is dropped. Explicit is possible; silent is not.
+    """
+    effective = CELL_UNITS if max_units is None else max_units
+    if effective is not None and effective < len(order):
+        picked = subsample_indices(len(order), effective)
+        return [order[i] for i in picked]
+    return list(order)
+
+
+
 class NarrativeQABenchmark:
     """Iterable over per-story NarrativeQA EvalUnits + free-form scorer."""
 
     name = "narrativeqa"
+    # Units a CELL resolves to, declared so the runner can check the
+    # resolved population against a stated number rather than against
+    # nothing. See `select_units` for why this is not merely a cap.
+    cell_units = CELL_UNITS
 
     def __init__(self) -> None:
         self._split_cache: dict[str, Any] = {}
@@ -176,16 +201,16 @@ class NarrativeQABenchmark:
                 ((row.get("question") or {}).get("text") or "", answers)
             )
 
-        # SEEDED SAMPLE, not the head of the split (P7). The 40-story
-        # subsample used to be `order[:40]`, which is a head slice of the
-        # 115 validation stories — indefensible next to HotpotQA's seeded
-        # draw, and under the same objection: dataset order is not
-        # guaranteed random, so a prefix can be skewed on any dimension
-        # the ordering happens to carry.
-        if max_units is not None and max_units < len(order):
-            picked = subsample_indices(len(order), max_units)
-            order = [order[i] for i in picked]
+        # SEEDED SAMPLE, not the head of the split (P7), and NOT the
+        # whole split either: `select_units` resolves None to CELL_UNITS,
+        # so the draw is a property of the code rather than of a flag the
+        # operator has to remember. A prefix was the first defect here; a
+        # silent full split was the second.
+        order = select_units(order, max_units)
         self.stats["subsample_seed"] = SUBSAMPLE_SEED
+        self.stats["n_units_requested"] = (
+            CELL_UNITS if max_units is None else max_units
+        )
         # RECORDED so the draw is reproducible AND inspectable: the run
         # summary carries benchmark stats verbatim, so the exact stories
         # behind a cell are in its provenance rather than re-derivable

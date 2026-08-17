@@ -309,6 +309,10 @@ class BenchmarkRunner:
         shared-corpus validation before the full run.
         """
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        # Exposed on the instance so main() can check the resolved
+        # population after the pass. A local would leave the count
+        # trapped inside a generator.
+        self.n_units_processed = 0
         n_units = 0
         # Counted separately rather than folded into n_units: a unit that
         # was skipped without being indexed is not a unit that was
@@ -443,6 +447,7 @@ class BenchmarkRunner:
                     yield scored
 
                 n_units += 1
+                self.n_units_processed = n_units
                 # Stop check at the BOTTOM of the body: breaking here
                 # (not at the top) means the max-queries stop never
                 # pulls another unit from the loader's generator. A

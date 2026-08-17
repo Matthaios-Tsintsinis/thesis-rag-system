@@ -266,6 +266,17 @@ class HotpotQABenchmark:
     """Variant A — standard distractor, one corpus per question."""
 
     name = "hotpotqa"
+
+    @property
+    def cell_units(self) -> int | None:
+        """One corpus per question, so units == questions.
+
+        Derived from `max_questions` rather than hardcoded: that value is
+        already a CONSTRUCTOR DEFAULT, which is what makes this
+        benchmark's population a property of the code. NarrativeQA had
+        the same intent expressed as a flag and lost it.
+        """
+        return self.max_questions
     variant = "distractor"
 
     def __init__(self, max_questions: int | None = PREREGISTERED_Q) -> None:
@@ -515,6 +526,13 @@ class HotpotQAPooledBenchmark(HotpotQABenchmark):
     """
 
     name = "hotpotqa_pooled"
+
+    @property
+    def cell_units(self) -> int | None:
+        """Questions pooled into shards, so units == ceil(q / shard)."""
+        if self.max_questions is None:
+            return None
+        return -(-self.max_questions // self.shard_questions)
     variant = "pooled"
 
     def __init__(

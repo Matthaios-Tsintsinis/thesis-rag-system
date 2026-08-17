@@ -211,6 +211,61 @@ def assert_environment_pinned(
     print(f"[eval] PREFLIGHT: environment matches {lockfile}")
 
 
+def assert_population_as_declared(
+    benchmark,  # noqa: ANN001
+    *,
+    n_units_processed: int,
+    max_units_explicit: int | None,
+) -> None:
+    """Abort if the cell resolved to a different population than declared.
+
+    THE BACKSTOP to the loader default. NarrativeQA's seeded 40-story
+    draw used to materialise only when `--max-units` was typed, so a
+    forgotten flag produced a 115-story, 3,461-question cell that ran to
+    completion and looked entirely normal. The loader now carries that
+    property itself; this checks the OUTCOME, so a future loader change,
+    a dataset that grew, or a benchmark whose draw stops matching its
+    declaration cannot pass silently.
+
+    An explicit `--max-units` is an operator decision and is honoured:
+    explicit 115 stays possible, silent 115 does not.
+
+    A benchmark with no declared `cell_units` is skipped WITH A PRINTED
+    NOTE rather than in silence — an undeclared population is exactly
+    the condition that hid this defect.
+    """
+    declared = getattr(benchmark, "cell_units", None)
+    if max_units_explicit is not None:
+        print(
+            f"[eval] population: {n_units_processed} units "
+            f"(--max-units {max_units_explicit} given explicitly; declared "
+            f"{declared})"
+        )
+        return
+    if declared is None:
+        print(
+            f"[eval] population: {n_units_processed} units; "
+            f"{benchmark.name} declares no cell_units, so nothing was "
+            "checked. An undeclared population is how the NarrativeQA "
+            "115-vs-40 defect hid."
+        )
+        return
+    if n_units_processed != declared:
+        raise SystemExit(
+            f"POPULATION MISMATCH: {benchmark.name} processed "
+            f"{n_units_processed} units but declares cell_units="
+            f"{declared}.\n"
+            "  A cell built on the wrong population runs to completion "
+            "and looks normal — its rows are simply about different "
+            "data than the rest of the matrix.\n"
+            "  Pass --max-units explicitly if you intend this."
+        )
+    print(
+        f"[eval] population OK: {n_units_processed} units "
+        f"= declared cell_units"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Run one system x one benchmark x one split to JSONL."
@@ -613,6 +668,16 @@ def main() -> None:
         sum_ans += scored.answer.value
 
     elapsed_s = time.perf_counter() - t_run
+
+    # POPULATION CHECK — after the pass, because the resolved unit count
+    # is only known once the units have been drawn, and BEFORE the
+    # summary is written, so a cell built on the wrong population does
+    # not acquire a provenance block that makes it look finished.
+    assert_population_as_declared(
+        benchmark,
+        n_units_processed=getattr(runner, "n_units_processed", 0),
+        max_units_explicit=args.max_units,
+    )
 
     # Aggregate summary alongside the JSONL.
     summary_path = args.output.with_suffix(".summary.json")
