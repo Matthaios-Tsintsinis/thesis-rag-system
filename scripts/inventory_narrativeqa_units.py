@@ -34,6 +34,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from src.eval.narrativeqa import CELL_UNITS
+
 
 def leaf_count(text: str) -> int:
     """Leaves the paper chunker would produce for one document.
@@ -48,7 +50,22 @@ def leaf_count(text: str) -> int:
     return len(split_text_raptor(text))
 
 
-def inventory(max_units: int | None = None) -> dict[str, Any]:
+def inventory(max_units: int | None = CELL_UNITS) -> dict[str, Any]:
+    """Leaf counts for the POPULATION THE CELL BUILDS — the seeded draw.
+
+    THE BUG THIS SIGNATURE FIXES. The default used to be None, which
+    makes `iter_eval_units` yield the FULL 115-story validation split
+    instead of the 40-story draw a cell runs. Every number the inventory
+    produced was then correct about the wrong population, and a cell
+    projected from it would have overstated the build term by ~3x.
+
+    `max_units` is not a cap, it is part of the DRAW:
+    `subsample_indices(115, n)` selects a different SET for each n, so
+    `subsample_indices(115, 1)` is not the first story of
+    `subsample_indices(115, 40)`. Passing a different number here does
+    not narrow the sample, it takes a different one — which is why the
+    default is the cell's own constant rather than None.
+    """
     from src.eval.runner import BENCHMARK_REGISTRY
 
     bench = BENCHMARK_REGISTRY["narrativeqa"]()
@@ -56,6 +73,17 @@ def inventory(max_units: int | None = None) -> dict[str, Any]:
                                        max_units=max_units))
     if not units:
         raise RuntimeError("narrativeqa loader yielded no unit")
+
+    # ASSERT THE POPULATION, because the loader's own header printing
+    # "115 stories" beside a 40-story build log is exactly how this got
+    # through the first time. A count that disagrees with the request is
+    # a wrong inventory, not a note.
+    if max_units is not None and len(units) != max_units:
+        raise RuntimeError(
+            f"asked the loader for {max_units} units and it yielded "
+            f"{len(units)}. This inventory would describe a population "
+            "the cell does not build; refusing to report it."
+        )
 
     rows = []
     for i, unit in enumerate(units, 1):
@@ -77,6 +105,9 @@ def inventory(max_units: int | None = None) -> dict[str, Any]:
     largest = by_leaves[-1]
 
     return {
+        "population": "seeded cell draw" if max_units is not None
+        else "FULL validation split (NOT the cell population)",
+        "max_units_requested": max_units,
         "n_units": len(rows),
         "units": rows,
         "leaves_per_unit": [r["leaves"] for r in rows],
@@ -97,15 +128,21 @@ def inventory(max_units: int | None = None) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--max-units", type=int, default=None,
-                    help="Cap units, for a smoke run. The REAL inventory "
-                         "must cover the whole draw or the sum is short.")
+    ap.add_argument("--max-units", type=int, default=CELL_UNITS,
+                    help=f"Units to draw. DEFAULTS TO {CELL_UNITS}, the "
+                         "cell's own seeded draw. This is NOT a cap: "
+                         "subsample_indices(115, n) picks a different SET "
+                         "for each n, so changing it inventories different "
+                         "stories, not fewer of the same ones. Pass 0 for "
+                         "the full 115-story split as CONTEXT ONLY - those "
+                         "numbers do not describe any cell.")
     ap.add_argument("--out", type=Path, default=None)
     args = ap.parse_args(argv)
 
-    report = inventory(args.max_units)
+    report = inventory(args.max_units or None)
 
     print()
+    print(f"[nqa] population: {report['population']}")
     print(f"[nqa] {report['n_units']} units, "
           f"{report['total_leaves']:,} leaves total")
     print(f"[nqa] leaves min={report['min_leaves']:,} "

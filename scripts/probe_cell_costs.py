@@ -85,7 +85,7 @@ def _prewarm() -> float:
 # DIFFERENT seeded draw from subsample_indices(115, 40) — it selected story
 # index 65 where the matrix's first story is index 1. A probe that measures
 # a story the run will not build is measuring the wrong thing.
-NARRATIVEQA_CELL_UNITS = 40
+from src.eval.narrativeqa import CELL_UNITS as NARRATIVEQA_CELL_UNITS  # noqa: E402
 
 
 def _units_for(benchmark_id: str, max_units: int | None):

@@ -62,6 +62,23 @@ from typing import Any, Iterable
 
 from ..retrievers.base import RetrievedChunk
 from .sampling import SUBSAMPLE_SEED, subsample_indices
+
+# Stories in a matrix CELL — P7's seeded draw of 40 from the 115-story
+# validation split.
+#
+# THE SINGLE SOURCE, and it needed one. This number lived only in
+# `scripts/probe_cell_costs.py`, so every other caller had to remember it
+# and one — the leaf inventory — did not, enumerating all 115 and
+# describing the wrong population.
+#
+# IT IS NOT APPLIED AUTOMATICALLY. `iter_eval_units` draws the sample
+# only when `max_units` is passed; with None it yields the full split.
+# So a cell is 40 stories BECAUSE THE OPERATOR TYPES `--max-units 40`,
+# not because the code says so. Read that again before planning a run:
+# `subsample_indices(115, n)` selects a DIFFERENT SET for each n, so a
+# forgotten flag does not merely widen the sample, it changes which
+# stories are in it.
+CELL_UNITS = 40
 from .scorers import (
     assert_gold_not_empty,
     extractive_max_f1,
