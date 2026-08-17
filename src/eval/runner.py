@@ -230,6 +230,7 @@ def assert_expected_n_queries_usable(
     *,
     max_units: int | None,
     max_queries: int | None,
+    only_unit: str | None = None,
 ) -> None:
     """A full cell must carry a count to be checked against.
 
@@ -244,7 +245,7 @@ def assert_expected_n_queries_usable(
     """
     if expected is not None:
         return
-    if max_units is not None or max_queries is not None:
+    if max_units is not None or max_queries is not None or only_unit:
         return
     raise SystemExit(
         "PROVENANCE FAILED: expected_n_queries is null on an UNCAPPED "
@@ -279,7 +280,7 @@ def assert_population_as_declared(
     benchmark,  # noqa: ANN001
     *,
     n_units_processed: int,
-    max_units_explicit: int | None,
+    explicit_reason: str | None,
 ) -> None:
     """Abort if the cell resolved to a different population than declared.
 
@@ -299,11 +300,14 @@ def assert_population_as_declared(
     the condition that hid this defect.
     """
     declared = getattr(benchmark, "cell_units", None)
-    if max_units_explicit is not None:
+    if explicit_reason:
+        # NAME THE FLAG THAT WAS ACTUALLY GIVEN. This used to take an int
+        # and print "--max-units N given explicitly" even when the caller
+        # had passed --only-unit and no --max-units at all, so the gate's
+        # own message described a run that did not happen.
         print(
             f"[eval] population: {n_units_processed} units "
-            f"(--max-units {max_units_explicit} given explicitly; declared "
-            f"{declared})"
+            f"({explicit_reason}; declared {declared})"
         )
         return
     if declared is None:
@@ -759,18 +763,38 @@ def main() -> None:
     assert_population_as_declared(
         benchmark,
         n_units_processed=getattr(runner, "n_units_processed", 0),
-        max_units_explicit=args.max_units or (
-            1 if args.only_unit else None),
+        explicit_reason=(
+            f"--max-units {args.max_units} given explicitly"
+            if args.max_units is not None
+            else f"--only-unit {args.only_unit!r} given explicitly"
+            if args.only_unit
+            else None
+        ),
     )
 
     # Resolved AFTER the pass, because the loader fills its stats as it
     # yields. Checked before the summary is written so an uncapped cell
     # cannot be banked with P8's short-cell guard silently disarmed.
-    _expected_n_queries = resolve_expected_n_queries(benchmark)
+    # A PARTIAL RUN'S LOADER STATS ARE NOT A CELL COUNT. `iter_eval_units`
+    # fills stats as it YIELDS, and a capped or filtered pass stops
+    # consuming the generator early — so an --only-unit run on story 12
+    # of 40 left n_stories=12 and n_queries=372. Recording that as
+    # expected_n_queries would hand P8's guard a number a third the size
+    # of the cell, and the guard would then certify a third of the data
+    # as complete.
+    _partial_run = bool(
+        args.max_units is not None
+        or args.max_queries is not None
+        or args.only_unit
+    )
+    _expected_n_queries = (
+        None if _partial_run else resolve_expected_n_queries(benchmark)
+    )
     assert_expected_n_queries_usable(
         _expected_n_queries,
         max_units=args.max_units,
         max_queries=args.max_queries,
+        only_unit=args.only_unit,
     )
 
     # Aggregate summary alongside the JSONL.
@@ -802,6 +826,13 @@ def main() -> None:
         # count against this, and a hardcoded constant would abort every
         # NarrativeQA cell the moment P7 re-drew the sample.
         "expected_n_queries": _expected_n_queries,
+        # Says WHY the field is null, so a reader never has to guess
+        # whether a partial run is a short cell.
+        "expected_n_queries_scope": (
+            "PARTIAL RUN - loader stats describe only the units consumed, "
+            "not the cell" if _partial_run else "full cell"
+        ),
+        "partial_run": _partial_run,
         # Run-condition provenance (the aggregator's conditions columns;
         # every matrix row must be self-describing from birth). The
         # generator field is what keeps Qwen-era and gpt-4o-mini-era
@@ -818,7 +849,7 @@ def main() -> None:
         # here; both are recorded so neither is read as the other.
         "evidence_budget": args.evidence_budget,
         "evidence_budget_effective": getattr(
-            system.config.m4, "retrieval_token_budget", None
+            system.config.m4, "retrieval_budget_tokens", None
         ) if args.system == "M4" else None,
         # Recorded so a probe artifact is self-describing. The 1-token
         # probe that silently ran uncapped would have been caught here.
