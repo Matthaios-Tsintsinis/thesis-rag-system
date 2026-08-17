@@ -32,6 +32,26 @@ Pipeline, end to end:
 #    option to question ...") is replaced by the harness-wide answer
 #    prompt, whose exact abstention string is load-bearing for the
 #    unanswerable / abstention scorers across every benchmark.
+# 4. MINIMUM CORPUS SIZE — RAPTOR COLLAPSES TO FLAT RETRIEVAL BELOW IT,
+#    and this is a FINDING rather than a limitation of the port. The
+#    reference stop condition is `len(current) <= reduction_dimension + 1`
+#    (11 at the paper's own settings), checked BEFORE the first
+#    clustering pass. A corpus yielding fewer leaves than that produces
+#    layer 0 ONLY: no UMAP, no GMM, no summary, no tree. The collapsed
+#    index is then a flat dense index over the leaves, so M4 runs as flat
+#    dense retrieval WITH M4's OWN components (mpnet, 100-token chunks,
+#    2,000-token budget) — which is NOT M2, whose embedder, chunker and
+#    context budget all differ.
+#
+#    HotpotQA-distractor is below the threshold BY CONSTRUCTION: ~10
+#    paragraphs per question gives ~8-12 leaves. Every M4 row on that
+#    benchmark is therefore flat-by-construction and MUST be labelled so
+#    in the results table; `analyse` prints the per-cell warning at run
+#    time and the table caption carries it in the deliverable.
+#
+#    The paper never tests this regime — RAPTOR's corpora are all far
+#    above the threshold — so the collapse is a measured property of the
+#    method at small corpus sizes, reportable as such.
 # 4. Summarisation temperature is 0.0; the reference leaves it unset
 #    (=1.0). Infrastructure contract: a cache key must determine the
 #    artifact it names. Consequence recorded — the reference's own trees

@@ -36,6 +36,21 @@ VARIANT B — `hotpotqa_pooled` — pooled shards.
 
 # === DEVIATIONS AND LIMITS — thesis footnote ===
 #
+# 0. M4 ON VARIANT A IS FLAT-BY-CONSTRUCTION, and the results table
+#    must say so. A distractor corpus is ~10 paragraphs, giving ~8-12
+#    leaves against RAPTOR's stop condition of
+#    `reduction_dimension + 1` = 11 — checked before the first
+#    clustering pass, so the build produces layer 0 only: no UMAP, no
+#    GMM, no summaries, no tree. M4's rows on this benchmark are flat
+#    dense retrieval over its own 100-token chunks, NOT a RAPTOR result.
+#
+#    Reported rather than dropped. An empty cell in a 5x4 matrix invites
+#    the question that the label answers in place, and the collapse is a
+#    real finding: RAPTOR has a minimum corpus size below which it
+#    degenerates, the paper never tests that regime, and a 10-paragraph
+#    distractor set sits below it. `analyse` prints the per-cell warning
+#    at run time; the deliverable's caption carries it.
+#
 # 1. RESIDUAL COMPARABILITY GAP, even on variant A. Our generator is a
 #    non-fine-tuned Qwen2.5-7B and our retrieval unit is a 100-token
 #    chunk rather than a paragraph-selection pipeline. Published numbers
