@@ -115,6 +115,22 @@ class TestCheckpointRisk(unittest.TestCase):
                             n_queries=1208, s_per_query=3.7)
         self.assertFalse(cell["build_checkpointed"])
 
+    def test_a_cell_with_no_build_carries_no_build_risk(self):
+        """A query-only cell has nothing to lose to an interrupt beyond
+        one batch: answers are flushed per batch and `--resume` skips
+        what is banked. Charging it the unprotected-build penalty would
+        rank M9/MultiHop — which builds no tree at all — above the M4
+        cell whose whole hour of tree work is genuinely at risk."""
+        query_only = project_cell(
+            system="M9", benchmark="multihop_rag", n_queries=2556,
+            s_per_query=5.793,
+        )
+        self.assertEqual(query_only["build_s"], 0.0)
+        self.assertEqual(
+            query_only["risk_rank"], query_only["fraction_of_session"]
+        )
+        self.assertEqual(query_only["build_loss_on_interrupt_s"], 0.0)
+
     def test_risk_ranks_an_unprotected_cell_above_a_larger_protected_one(self):
         """The ordering that makes the column worth having."""
         protected = project_cell(
@@ -199,6 +215,86 @@ class TestMatrixRollup(unittest.TestCase):
         by = {(c["system"], c["benchmark"]): c for c in m["cells"]}
         self.assertTrue(by[("M4", "multihop_rag")]["build_unmeasured"])
         self.assertFalse(by[("M2", "multihop_rag")]["build_unmeasured"])
+
+
+class TestPerBenchmarkRates(unittest.TestCase):
+    """s_per_query does NOT transfer across benchmarks, and the projector
+    must not pretend it does.
+
+    M4 measured 1.920 s/query on MultiHop — the FASTEST of the five,
+    because its 2,000-token budget means less to read. That ratio cannot
+    carry to NarrativeQA, where M4 builds 40 separate per-unit trees
+    against MultiHop's single shared one. A projector that reused one
+    rate everywhere would produce a confident and wrong plan.
+    """
+
+    NESTED = {
+        "multihop_rag": {"M1": 4.495, "M2": 4.060, "M3": 3.607,
+                         "M4": 1.920, "M9": 5.793},
+    }
+    N = {"multihop_rag": 2556, "narrativeqa": 1208,
+         "hotpotqa": 1000, "hotpotqa_pooled": 1000}
+
+    def test_nested_rates_are_used_per_benchmark(self):
+        m = project_matrix(
+            s_per_query={**self.NESTED,
+                         "narrativeqa": {"M1": 9.0, "M2": 9.0, "M3": 9.0,
+                                         "M4": 9.0, "M9": 9.0},
+                         "hotpotqa": {k: 1.0 for k in
+                                      ("M1", "M2", "M3", "M4", "M9")},
+                         "hotpotqa_pooled": {k: 1.0 for k in
+                                             ("M1", "M2", "M3", "M4", "M9")}},
+            n_queries=self.N,
+        )
+        by = {(c["system"], c["benchmark"]): c for c in m["cells"]}
+        self.assertAlmostEqual(by[("M4", "multihop_rag")]["s_per_query"], 1.920)
+        self.assertAlmostEqual(by[("M4", "narrativeqa")]["s_per_query"], 9.0)
+
+    def test_missing_benchmark_raises_without_an_explicit_source(self):
+        with self.assertRaises(ValueError) as ctx:
+            project_matrix(s_per_query=self.NESTED, n_queries=self.N)
+        msg = str(ctx.exception)
+        self.assertIn("narrativeqa", msg)
+
+    def test_extrapolation_is_opt_in_and_marks_every_cell_it_touches(self):
+        m = project_matrix(
+            s_per_query=self.NESTED, n_queries=self.N,
+            extrapolate_from="multihop_rag",
+        )
+        by = {(c["system"], c["benchmark"]): c for c in m["cells"]}
+        measured = by[("M4", "multihop_rag")]
+        borrowed = by[("M4", "narrativeqa")]
+        self.assertFalse(measured["s_per_query_extrapolated"])
+        self.assertTrue(borrowed["s_per_query_extrapolated"])
+        self.assertEqual(borrowed["s_per_query_source"], "multihop_rag")
+
+    def test_extrapolated_cells_are_listed_in_the_rollup(self):
+        m = project_matrix(
+            s_per_query=self.NESTED, n_queries=self.N,
+            extrapolate_from="multihop_rag",
+        )
+        self.assertEqual(len(m["extrapolated"]), 15)
+
+
+class TestMeasuredZeroIsNotUnmeasured(unittest.TestCase):
+    """M4 on HotpotQA-distractor has NO TREE — ~10 leaves per question
+    falls below the layer stop condition, so it degenerates to flat.
+    A zero build term there is a MEASURED FACT, and reporting it as
+    BUILD-UNMEASURED would send someone to measure a thing that does not
+    exist."""
+
+    def test_none_means_unmeasured(self):
+        cell = project_cell(system="M4", benchmark="hotpotqa",
+                            n_queries=1000, s_per_query=1.0,
+                            build_s_per_unit=None)
+        self.assertTrue(cell["build_unmeasured"])
+
+    def test_empty_list_means_measured_zero(self):
+        cell = project_cell(system="M4", benchmark="hotpotqa",
+                            n_queries=1000, s_per_query=1.0,
+                            build_s_per_unit=[])
+        self.assertFalse(cell["build_unmeasured"])
+        self.assertEqual(cell["build_s"], 0.0)
 
 
 if __name__ == "__main__":

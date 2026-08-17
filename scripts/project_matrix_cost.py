@@ -71,8 +71,20 @@ def project_cell(
     n_queries: int,
     s_per_query: float | None,
     build_s_per_unit: list[float] | None = None,
+    s_per_query_source: str | None = None,
 ) -> dict:
-    """One cell. Raises rather than defaulting on a missing input."""
+    """One cell. Raises rather than defaulting on a missing input.
+
+    `build_s_per_unit` distinguishes **None** (not measured) from **[]**
+    (measured, and there is no build). M4 on HotpotQA-distractor has NO
+    TREE — ~10 leaves per question falls below the layer stop condition,
+    so it degenerates to flat retrieval — and reporting that as
+    BUILD-UNMEASURED would send someone to measure a thing that does not
+    exist.
+
+    `s_per_query_source` names a DIFFERENT benchmark when the rate was
+    borrowed rather than measured here, so the cell can carry the fact.
+    """
     if s_per_query is None:
         raise ValueError(
             f"{system}/{benchmark}: no measured s_per_query. Run "
@@ -85,6 +97,7 @@ def project_cell(
             "no queries is a configuration error, not a free cell."
         )
 
+    measured_build = build_s_per_unit is not None
     builds = list(build_s_per_unit or [])
     build_s = float(sum(builds))
     query_s = float(s_per_query) * int(n_queries)
@@ -101,10 +114,14 @@ def project_cell(
     # than one at 70% without it.
     checkpointed = system in TREE_SYSTEMS and len(builds) > 1
     fraction = total_s / SESSION_GUARD_S
-    # Unprotected cells are ranked as if they carried half a session more
-    # risk than their wall time implies, so the ordering reflects the cost
-    # of losing the work rather than the time to do it.
-    risk_rank = round(fraction + (0.0 if checkpointed else 0.5), 3)
+    # The penalty applies ONLY where there is a build to lose. A
+    # query-only cell has nothing at risk beyond one batch — answers are
+    # flushed per batch and `--resume` skips what is banked — so charging
+    # it here would rank M9/MultiHop, which builds no tree at all, above
+    # the M4 cell whose whole hour of tree work is genuinely exposed.
+    # That is the inversion this column exists to prevent.
+    at_risk = build_s > 0 and not checkpointed
+    risk_rank = round(fraction + (0.5 if at_risk else 0.0), 3)
 
     return {
         "system": system,
@@ -129,43 +146,93 @@ def project_cell(
         # in one session and needs --resume planning, not a warning.
         "exceeds_session": total_s > SESSION_GUARD_S,
         # A tree system with no measured build is NOT a zero-build cell.
-        "build_unmeasured": system in TREE_SYSTEMS and not builds,
+        # An EMPTY list is a measured zero (no tree here) and is not
+        # flagged.
+        "build_unmeasured": system in TREE_SYSTEMS and not measured_build,
+        "s_per_query_source": s_per_query_source,
+        "s_per_query_extrapolated": bool(s_per_query_source)
+        and s_per_query_source != benchmark,
     }
+
+
+def _rate_table(s_per_query: dict) -> dict[str, dict[str, float]]:
+    """Accept either {system: rate} or {benchmark: {system: rate}}.
+
+    The flat form is legacy and means "one rate everywhere", which is the
+    assumption this function exists to make visible: rates do NOT transfer
+    across benchmarks. M4 measured 1.920 s/query on MultiHop — the fastest
+    of the five, because its 2,000-token budget means less to read — and
+    that ratio cannot carry to NarrativeQA, where it builds 40 per-unit
+    trees against MultiHop's single shared corpus.
+    """
+    if s_per_query and all(
+        isinstance(v, dict) for v in s_per_query.values()
+    ):
+        return {k: dict(v) for k, v in s_per_query.items()}
+    return {b: dict(s_per_query) for b in BENCHMARKS}
 
 
 def project_matrix(
     *,
-    s_per_query: dict[str, float],
+    s_per_query: dict,
     n_queries: dict[str, int],
     m4_build_s_per_unit: dict[str, list[float]] | None = None,
+    extrapolate_from: str | None = None,
 ) -> dict:
-    """All 20 cells, plus the rollup and the flagged list."""
-    missing_sys = [s for s in SYSTEMS if s_per_query.get(s) is None]
-    if missing_sys:
-        raise ValueError(
-            f"no measured s_per_query for: {', '.join(missing_sys)}. "
-            "Every system in the matrix needs a timed slice."
-        )
+    """All 20 cells, plus the rollup and the flagged lists.
+
+    `extrapolate_from` names a benchmark whose measured rates fill cells
+    that have none. It is OPT-IN and every cell it touches is marked, so
+    a borrowed rate can never be read as a measured one. Without it, a
+    missing rate raises.
+    """
+    rates = _rate_table(s_per_query)
     missing_bench = [b for b in BENCHMARKS if not n_queries.get(b)]
     if missing_bench:
         raise ValueError(
             f"no loader-derived query count for: {', '.join(missing_bench)}"
         )
 
-    builds = m4_build_s_per_unit or {}
-    cells = [
-        project_cell(
-            system=system,
-            benchmark=benchmark,
-            n_queries=n_queries[benchmark],
-            s_per_query=s_per_query[system],
-            build_s_per_unit=(
-                builds.get(benchmark) if system in TREE_SYSTEMS else None
-            ),
+    if extrapolate_from and extrapolate_from not in rates:
+        raise ValueError(
+            f"extrapolate_from={extrapolate_from!r} has no measured rates"
         )
-        for system in SYSTEMS
-        for benchmark in BENCHMARKS
-    ]
+
+    gaps: list[str] = []
+    for benchmark in BENCHMARKS:
+        for system in SYSTEMS:
+            if rates.get(benchmark, {}).get(system) is None and not (
+                extrapolate_from
+                and rates[extrapolate_from].get(system) is not None
+            ):
+                gaps.append(f"{system}/{benchmark}")
+    if gaps:
+        raise ValueError(
+            f"no measured s_per_query for: {', '.join(gaps)}. Run the "
+            "timed slice for those cells, or pass extrapolate_from=<a "
+            "benchmark> to borrow its rates — every borrowed cell is "
+            "marked, because rates do NOT transfer across benchmarks."
+        )
+
+    builds = m4_build_s_per_unit or {}
+    cells = []
+    for system in SYSTEMS:
+        for benchmark in BENCHMARKS:
+            rate = rates.get(benchmark, {}).get(system)
+            source = benchmark
+            if rate is None:
+                rate = rates[extrapolate_from][system]
+                source = extrapolate_from
+            cells.append(project_cell(
+                system=system,
+                benchmark=benchmark,
+                n_queries=n_queries[benchmark],
+                s_per_query=rate,
+                build_s_per_unit=(
+                    builds.get(benchmark) if system in TREE_SYSTEMS else None
+                ),
+                s_per_query_source=source,
+            ))
     total_s = sum(c["total_s"] for c in cells)
     return {
         "cells": cells,
@@ -183,6 +250,8 @@ def project_matrix(
         "unprotected_builds": [
             c for c in cells if c["build_s"] and not c["build_checkpointed"]
         ],
+        # Borrowed rates, listed so they cannot be read as measured.
+        "extrapolated": [c for c in cells if c["s_per_query_extrapolated"]],
         "n_sessions_at_guard": round(total_s / SESSION_GUARD_S, 2),
     }
 
@@ -204,6 +273,8 @@ def _render(m: dict) -> str:
         # Only meaningful where there IS a build to lose.
         if c["build_s"] and not c["build_checkpointed"]:
             flags.append("BUILD-ALL-OR-NOTHING")
+        if c["s_per_query_extrapolated"]:
+            flags.append(f"RATE-FROM-{c['s_per_query_source']}")
         ckpt = (
             "per-unit" if c["build_checkpointed"]
             else ("whole" if c["build_s"] else "-")
@@ -233,6 +304,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--measurements", type=Path, required=True,
                     help="JSON with s_per_query, n_queries, and optionally "
                          "m4_build_s_per_unit")
+    ap.add_argument("--extrapolate-from", default=None,
+                    help="Benchmark whose measured rates fill cells that "
+                         "have none. OPT-IN, and every borrowed cell is "
+                         "marked RATE-FROM-<benchmark>. Rates do NOT "
+                         "transfer across benchmarks.")
     ap.add_argument("--out", type=Path, default=None)
     args = ap.parse_args(argv)
 
@@ -243,6 +319,7 @@ def main(argv: list[str] | None = None) -> int:
         s_per_query=data["s_per_query"],
         n_queries=data["n_queries"],
         m4_build_s_per_unit=data.get("m4_build_s_per_unit"),
+        extrapolate_from=args.extrapolate_from or data.get("extrapolate_from"),
     )
     print(_render(m))
     if args.out:
