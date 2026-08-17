@@ -36,20 +36,24 @@ VARIANT B — `hotpotqa_pooled` — pooled shards.
 
 # === DEVIATIONS AND LIMITS — thesis footnote ===
 #
-# 0. M4 ON VARIANT A IS FLAT-BY-CONSTRUCTION, and the results table
-#    must say so. A distractor corpus is ~10 paragraphs, giving ~8-12
-#    leaves against RAPTOR's stop condition of
-#    `reduction_dimension + 1` = 11 — checked before the first
-#    clustering pass, so the build produces layer 0 only: no UMAP, no
-#    GMM, no summaries, no tree. M4's rows on this benchmark are flat
-#    dense retrieval over its own 100-token chunks, NOT a RAPTOR result.
+# 0. M4 ON VARIANT A IS A MIXED CELL, and the results table must say
+#    so. RAPTOR stops when a layer holds <= reduction_dimension + 1 = 11
+#    nodes, checked before the first clustering pass. A distractor corpus
+#    is ~10 paragraphs, which lands NEAR that threshold rather than
+#    safely below it: the largest unit measures 15 leaves and builds a
+#    real 2-layer tree (3 summary nodes), while units chunking to <= 11
+#    leaves build none at all.
 #
-#    Reported rather than dropped. An empty cell in a 5x4 matrix invites
-#    the question that the label answers in place, and the collapse is a
-#    real finding: RAPTOR has a minimum corpus size below which it
-#    degenerates, the paper never tests that regime, and a 10-paragraph
-#    distractor set sits below it. `analyse` prints the per-cell warning
-#    at run time; the deliverable's caption carries it.
+#    So M4's rows here are heterogeneous — some answered over a 2-layer
+#    hierarchy, some over flat dense retrieval — determined by chunk
+#    count per question. The degenerate FRACTION is a measured quantity
+#    (scripts/inventory_unit_leaves.py --benchmark hotpotqa), not an
+#    assumption, and it is what the declaration states.
+#
+#    Reported rather than dropped: an empty cell in a 5x4 matrix invites
+#    the question the label answers in place, and RAPTOR's behaviour at
+#    corpus sizes near its own stop condition is a regime the paper never
+#    tests.
 #
 # 1. RESIDUAL COMPARABILITY GAP, even on variant A. Our generator is a
 #    non-fine-tuned Qwen2.5-7B and our retrieval unit is a 100-token

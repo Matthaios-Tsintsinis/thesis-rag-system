@@ -32,26 +32,31 @@ Pipeline, end to end:
 #    option to question ...") is replaced by the harness-wide answer
 #    prompt, whose exact abstention string is load-bearing for the
 #    unanswerable / abstention scorers across every benchmark.
-# 4. MINIMUM CORPUS SIZE — RAPTOR COLLAPSES TO FLAT RETRIEVAL BELOW IT,
-#    and this is a FINDING rather than a limitation of the port. The
-#    reference stop condition is `len(current) <= reduction_dimension + 1`
-#    (11 at the paper's own settings), checked BEFORE the first
-#    clustering pass. A corpus yielding fewer leaves than that produces
-#    layer 0 ONLY: no UMAP, no GMM, no summary, no tree. The collapsed
-#    index is then a flat dense index over the leaves, so M4 runs as flat
-#    dense retrieval WITH M4's OWN components (mpnet, 100-token chunks,
-#    2,000-token budget) — which is NOT M2, whose embedder, chunker and
-#    context budget all differ.
+# 4. MINIMUM CORPUS SIZE — RAPTOR degenerates below it, and on
+#    HotpotQA-distractor the cell is MIXED rather than uniformly flat.
 #
-#    HotpotQA-distractor is below the threshold BY CONSTRUCTION: ~10
-#    paragraphs per question gives ~8-12 leaves. Every M4 row on that
-#    benchmark is therefore flat-by-construction and MUST be labelled so
-#    in the results table; `analyse` prints the per-cell warning at run
-#    time and the table caption carries it in the deliverable.
+#    The reference stop condition is
+#    `len(current) <= reduction_dimension + 1` = 11, checked BEFORE the
+#    first clustering pass. A unit at or below that yields layer 0 only:
+#    no UMAP, no GMM, no summaries, and a collapsed index over the leaves
+#    alone, i.e. flat dense retrieval with M4's OWN components (mpnet,
+#    100-token chunks, 2,000-token budget) — which is NOT M2, whose
+#    embedder, chunker and context budget all differ.
 #
-#    The paper never tests this regime — RAPTOR's corpora are all far
-#    above the threshold — so the collapse is a measured property of the
-#    method at small corpus sizes, reportable as such.
+#    MEASURED, and it refuted the first version of this note: the LARGEST
+#    HotpotQA-distractor unit yields **15 leaves** and builds a real
+#    2-layer tree (layer_sizes {0:15, 1:3}, 3 summary nodes,
+#    degenerate_no_tree=False). It is NOT below the threshold. Units
+#    whose ~10 paragraphs chunk to <= 11 leaves DO degenerate, so the
+#    cell is a HETEROGENEOUS MIX: some questions answered over a 2-layer
+#    hierarchy, some over flat retrieval, decided by chunk count per
+#    question.
+#
+#    That mix is the declarable property, and the fraction that
+#    degenerates must be MEASURED (scripts/inventory_unit_leaves.py
+#    --benchmark hotpotqa) rather than assumed in either direction. The
+#    paper never tests this regime; `analyse` reports the per-cell
+#    degenerate-row count at run time and the results caption carries it.
 # 4. Summarisation temperature is 0.0; the reference leaves it unset
 #    (=1.0). Infrastructure contract: a cache key must determine the
 #    artifact it names. Consequence recorded — the reference's own trees

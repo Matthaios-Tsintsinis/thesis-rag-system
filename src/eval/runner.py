@@ -300,10 +300,15 @@ def main() -> None:
         "--benchmark",
         required=True,
         choices=sorted(BENCHMARK_REGISTRY),
-        help="Benchmark id. hotpotqa = standard distractor (one corpus "
-        "per question; M4 has NO TREE there and its rows are not a RAPTOR "
-        "result). hotpotqa_pooled = shards of 100 questions (a real tree, "
-        "but NOT comparable to published HotpotQA).",
+        help="Benchmark id. hotpotqa = standard distractor, one corpus per "
+        "question. M4 is MIXED there: ~10 paragraphs land near RAPTOR's "
+        "own stop condition (<= reduction_dimension + 1 = 11 leaves), so "
+        "some units build a small tree — the largest measures 15 leaves "
+        "and 2 layers — and some degenerate to flat dense retrieval. "
+        "Rows are heterogeneous by chunk count and analyse reports the "
+        "degenerate fraction; do not read the cell as uniformly RAPTOR "
+        "or uniformly flat. hotpotqa_pooled = shards of 100 questions "
+        "(a real tree, but NOT comparable to published HotpotQA).",
     )
     parser.add_argument(
         "--split",

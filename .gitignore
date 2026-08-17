@@ -9,7 +9,8 @@ __pycache__/
 *$py.class
 
 
-# Ignore the PDFs and data 
+# Ignore the PDFs and data
+docs/ 
 data/*
 !data/.gitkeep
 
