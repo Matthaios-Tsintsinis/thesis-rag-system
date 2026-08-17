@@ -202,6 +202,13 @@ def environment_provenance(lockfile: Path | None = None) -> dict:
     return {
         "lockfile_hash": lock_hash,
         "gpu": gpu_model(),
+        # RECORDED so it cannot go inert unnoticed again. This setting was
+        # correct, was applied on the generation path only, and was
+        # therefore read after the embedder had already initialised the
+        # allocator — instance eleven. A value that is set and never
+        # asserted is not a check.
+        "cuda_alloc_conf": __import__("os").environ.get(
+            "PYTORCH_CUDA_ALLOC_CONF"),
         "python": sys.version.split()[0],
         "versions": {
             pkg: installed.get(pkg) for pkg in TOPOLOGY_CRITICAL

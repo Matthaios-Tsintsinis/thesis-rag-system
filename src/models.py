@@ -10,6 +10,26 @@ same instance.
 
 from __future__ import annotations
 
+import os
+
+# BEFORE ANY TORCH-TOUCHING IMPORT, and this line is load-bearing.
+#
+# INSTANCE ELEVEN OF THE RECURRING DEFECT. `configure_cuda_allocator()`
+# below is correct and was called from exactly two places, both on the
+# GENERATION path. But a cell loads the EMBEDDER first — `load_embedder`
+# constructs a SentenceTransformer, which moves weights to CUDA and
+# initialises the allocator — and PYTORCH_CUDA_ALLOC_CONF is read ONCE at
+# allocator setup. So the call ran after the thing it configures and was
+# inert for every cell that would ever run, while every probe set it at
+# module top and measured a machine the matrix would never have.
+#
+# The consequence was measured: M2/MultiHop at batch 16 OOM'd with
+# 1.16 GiB reserved-but-unallocated, which is exactly the fragmentation
+# expandable segments exist to prevent.
+#
+# `setdefault`, so a deliberate operator value still wins.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import functools
 import time
 from typing import Any
