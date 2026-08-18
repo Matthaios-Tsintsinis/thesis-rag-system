@@ -160,22 +160,57 @@ class TestColdTreeGate(unittest.TestCase):
 
 
 class TestWiring(unittest.TestCase):
-    def test_the_runner_requires_cold_trees_for_M4_by_default(self):
-        import inspect
+    """END TO END through main(), not a grep of its source.
 
-        from src.eval import runner
+    These asserted that the strings "require_cold_tree" and
+    "allow_warm_trees" appeared in `runner.main`. That proves the words
+    are present, never that the gate governs a run — the same shape as
+    the eleven instances this project had already found, written while
+    documenting them.
+    """
 
-        src = inspect.getsource(runner.main)
-        self.assertIn("require_cold_tree", src)
-        self.assertIn("allow_warm_trees", src)
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
 
-    def test_the_flag_is_recorded_in_the_summary(self):
-        import inspect
+    def tearDown(self):
+        self.td.cleanup()
 
-        from src.eval import runner
+    def _drive(self, *extra, warm: bool):
+        import json
+        import sys
 
-        self.assertIn('"allow_warm_trees"',
-                      inspect.getsource(runner.main))
+        from src.eval import runner as runner_mod
+
+        class _M4Stub(_TreeSystem):
+            def __init__(self, **kw):
+                super().__init__(warm=warm, **kw)
+
+        out = Path(self.td.name) / "two_M4.jsonl"
+        argv = ["runner", "--system", "M4", "--benchmark", "two",
+                "--split", "validation", "--output", str(out),
+                "--allow-unpinned", *extra]
+        with mock.patch.dict(runner_mod.SYSTEM_REGISTRY, {"M4": _M4Stub}), \
+             mock.patch.dict(runner_mod.BENCHMARK_REGISTRY,
+                             {"two": _TwoUnitBenchmark}), \
+             mock.patch.object(sys, "argv", argv):
+            runner_mod.main()
+        return json.loads(
+            out.with_suffix(".summary.json").read_text(encoding="utf-8"))
+
+    def test_an_M4_cell_aborts_on_a_warm_tree_by_default(self):
+        """No flag needed: the gate is on for M4 because the code says
+        so, not because an operator remembered."""
+        with self.assertRaises(SystemExit):
+            self._drive(warm=True)
+
+    def test_allow_warm_trees_permits_it_and_is_recorded(self):
+        summary = self._drive("--allow-warm-trees", warm=True)
+        self.assertTrue(summary["allow_warm_trees"])
+        self.assertEqual(summary["n_queries_scored"], 2)
+
+    def test_a_cold_M4_cell_records_the_flag_as_false(self):
+        summary = self._drive(warm=False)
+        self.assertFalse(summary["allow_warm_trees"])
 
 
 if __name__ == "__main__":

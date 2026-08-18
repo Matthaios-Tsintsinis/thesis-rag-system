@@ -214,18 +214,6 @@ class TestLeafCountMatchesTheBuild(unittest.TestCase):
         self.assertNotEqual(per_item, joined)
         self.assertLess(joined, per_item)
 
-    def test_it_uses_the_builds_own_payload_functions(self):
-        """Re-deriving the join or the cleaning would reintroduce the
-        drift the moment either changed."""
-        import inspect
-
-        from scripts.inventory_unit_leaves import unit_leaf_count
-
-        src = inspect.getsource(unit_leaf_count)
-        self.assertIn("build_parent_payload", src)
-        self.assertIn("group_items_by_parent", src)
-        self.assertIn("chunk_words", src)
-
     def test_the_degeneracy_threshold_comes_from_the_config(self):
         from src.config import DEFAULT_CONFIG
 

@@ -174,12 +174,14 @@ class TestTheKGrid(unittest.TestCase):
 
 class TestSystemsExposeAScoringRanking(unittest.TestCase):
     def test_the_base_default_asks_for_the_configured_depth(self):
+        """An `assertIn("k=depth", src)` stood here and was redundant:
+        the signature default below is the behavioural form of the same
+        claim, and the grep would have broken on a rename that changed
+        nothing."""
         import inspect
 
         from src.retrievers.base import BaseSystem
 
-        src = inspect.getsource(BaseSystem.retrieve_for_scoring)
-        self.assertIn("k=depth", src)
         self.assertEqual(
             inspect.signature(BaseSystem.retrieve_for_scoring)
             .parameters["depth"].default,
@@ -187,17 +189,34 @@ class TestSystemsExposeAScoringRanking(unittest.TestCase):
         )
 
     def test_m9_reuses_its_pool_instead_of_re_running_the_pipeline(self):
-        """M9's corrective decision is k-independent, so one pass cut
+        """M9's corrective decision is k-independent, so ONE pass cut
         twice is exact. Re-running would pay a second reranker pass and a
-        second rewrite LLM call."""
-        import inspect
+        second rewrite LLM call — that is F4 in the verification doc.
+
+        COUNTED BY CALLING, not by grepping `prepare`'s source for
+        `_corrective_retrieve(`. A source count proves the token appears
+        once; it says nothing about how many times a query triggers the
+        corrective pass, which is the property F4 asserts.
+        """
+        from unittest import mock
 
         from src.retrievers.m9_corrective import CorrectiveRAGSystem
 
-        src = inspect.getsource(CorrectiveRAGSystem.prepare)
-        self.assertIn("SCORING_RANKING_DEPTH", src)
-        self.assertIn("scoring_ranking=scoring_ranking", src)
-        self.assertEqual(src.count("_corrective_retrieve("), 1)
+        from src.config import DEFAULT_CONFIG
+
+        # Constructs without loading any model — verified, so this stays
+        # a CPU test that runs on every commit rather than one that only
+        # runs where a GPU is.
+        system = CorrectiveRAGSystem(config=DEFAULT_CONFIG)
+        # `prepare` guards on the index; the corrective pass is what is
+        # under test, not the guard, so satisfy it and stub the pass.
+        system._indexed = True
+        with mock.patch.object(
+            CorrectiveRAGSystem, "_corrective_retrieve",
+            return_value=([], {"m9_action": "CORRECT"}),
+        ) as call:
+            system.prepare("a question")
+        self.assertEqual(call.call_count, 1)
 
 
 if __name__ == "__main__":

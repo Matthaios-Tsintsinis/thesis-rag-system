@@ -102,18 +102,5 @@ class TestNestedPhasesDoNotDoubleCount(unittest.TestCase):
         )
 
 
-class TestRealNestingIsPresent(unittest.TestCase):
-    """Pins the actual call the defect came from, so a refactor that
-    re-nests them fails here rather than in a five-hour build."""
-
-    def test_gmm_final_fit_calls_the_bic_sweep(self):
-        import inspect
-
-        from src import raptor_paper
-
-        src = inspect.getsource(raptor_paper._gmm_cluster)
-        self.assertIn("_get_optimal_clusters", src)
-
-
 if __name__ == "__main__":
     unittest.main()
