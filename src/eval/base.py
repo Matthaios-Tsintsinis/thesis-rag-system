@@ -89,6 +89,7 @@ class BenchmarkRunner:
         resume: bool = False,
         max_padded_tokens: int | None = None,
         verify_max_new_tokens: int | None = None,
+        require_cold_tree: bool = False,
     ) -> None:
         self.output_path = output_path
         self.verbose = verbose
@@ -120,6 +121,14 @@ class BenchmarkRunner:
         # than an error once already; the caller should not have to be the
         # one who notices. None disables the check entirely.
         self.verify_max_new_tokens = verify_max_new_tokens
+        # P10's cold-tree rule, enforced rather than remembered. A warm
+        # M4 substrate may have been built under a different topology
+        # stack, and nothing in the output says which — so a matrix can
+        # end up holding two tree populations with no error anywhere.
+        # This session measured the same story three times and twice
+        # served a cache read while reporting a build; `probe_cell_costs`
+        # aborts on exactly this and the runner did not.
+        self.require_cold_tree = require_cold_tree
 
     def _check_output_length(self, answer: str, query_id: str, model: str) -> None:
         """Abort if a generated answer overran the cap that was requested.
@@ -391,6 +400,23 @@ class BenchmarkRunner:
                 t_index = time.perf_counter()
                 system.index_items(unit.corpus)
                 index_s = time.perf_counter() - t_index
+
+                # ON THE FIRST WARM UNIT, not after the pass. A 40-story
+                # cell that ran to completion before reporting a warm
+                # tree would have spent the session this protects.
+                if self.require_cold_tree and getattr(
+                    system, "tree_cache_hit", None
+                ):
+                    raise SystemExit(
+                        "COLD-TREE GATE FAILED: tree_cache_hit=True on "
+                        f"unit {unit.corpus_id!r} after {index_s:.2f}s. "
+                        "A warm substrate may have been built under a "
+                        "different topology stack, and nothing in the "
+                        "output records which — so the matrix could hold "
+                        "two tree populations with no error anywhere. "
+                        "Delete that substrate directory and re-run, or "
+                        "pass --allow-warm-trees if a warm run is intended."
+                    )
 
                 if self.verbose:
                     print(f"  index_s={index_s:.2f}")

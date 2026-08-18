@@ -353,6 +353,17 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--allow-warm-trees",
+        action="store_true",
+        help=(
+            "Permit an M4 cell to serve a WARM substrate. Off by default: "
+            "a warm tree may have been built under a different topology "
+            "stack and nothing in the output says which, so P10 requires "
+            "every M4 cell to build cold. Recorded in the summary, so a "
+            "cell can never claim a cold build it did not do."
+        ),
+    )
+    parser.add_argument(
         "--lockfile",
         type=Path,
         default=Path("requirements.lock"),
@@ -716,6 +727,10 @@ def main() -> None:
         resume=args.resume,
         max_padded_tokens=args.max_padded_tokens,
         verify_max_new_tokens=args.max_new_tokens,
+        # Tree systems only: M1/M2/M3/M9 build no tree, so the rule has
+        # nothing to say about them and a blanket gate would fire on a
+        # legitimate embedding-substrate cache hit.
+        require_cold_tree=(args.system == "M4" and not args.allow_warm_trees),
     )
     n_scored = 0
     sum_retr_f1 = 0.0
@@ -806,6 +821,7 @@ def main() -> None:
         "split": args.split,
         "max_units": args.max_units,
         "only_unit": args.only_unit,
+        "allow_warm_trees": args.allow_warm_trees,
         "n_queries_scored": n_scored,
         "n_retrieval_skipped": sum_retr_skipped,
         "mean_retrieval_f1": sum_retr_f1 / n_retr_scored,
