@@ -31,6 +31,7 @@ from src.eval.hotpotqa import (
     _project_to_titles,
     _sentence_items,
     hotpot_token_f1,
+    hotpot_token_f1_prf,
     subsample_indices,
 )
 from src.eval.scorers.extractive import normalize_qasper_answer, token_f1
@@ -440,6 +441,48 @@ class TestOfficialYesNoGuard(unittest.TestCase):
         s2 = HotpotQABenchmark().score_answer(
             self.MEASURED_PRED, _yn_query("yes"))
         self.assertEqual(s2.metadata["exact_match"], 0.0)
+
+
+class TestOfficialAnswerPrecisionAndRecall(unittest.TestCase):
+    """`update_answer` accumulates em, f1, prec AND recall — four answer
+    numbers. We computed precision and recall inside token_f1 and threw
+    them away; they are surfaced now because a reader checking against
+    the official script looks for them."""
+
+    def test_the_triple_matches_the_official_arithmetic(self):
+        # pred 2 tokens, gold 3 tokens, 2 in common
+        f1, p, r = hotpot_token_f1_prf("the Eiffel Tower", "Eiffel Tower Paris")
+        self.assertAlmostEqual(p, 2 / 2)
+        self.assertAlmostEqual(r, 2 / 3)
+        self.assertAlmostEqual(f1, 2 * (1.0 * (2 / 3)) / (1.0 + 2 / 3))
+
+    def test_f1_agrees_with_the_scalar_helper(self):
+        for pred, gold in (("Eiffel Tower", "the Eiffel Tower"),
+                           ("Paris", "London"), ("yes", "yes"),
+                           ("Yes, both were.", "yes")):
+            self.assertEqual(hotpot_token_f1_prf(pred, gold)[0],
+                             hotpot_token_f1(pred, gold), (pred, gold))
+
+    def test_the_yes_no_guard_zeroes_ALL_THREE(self):
+        """Reference ZERO_METRIC is (0, 0, 0), not an F1-only zero."""
+        self.assertEqual(
+            hotpot_token_f1_prf("Yes, both films were directed by the same "
+                                "person.", "yes"),
+            (0.0, 0.0, 0.0))
+
+    def test_they_reach_the_row_metadata(self):
+        s = HotpotQABenchmark().score_answer("the Eiffel Tower",
+                                             _yn_query("Eiffel Tower Paris"))
+        self.assertAlmostEqual(s.metadata["answer_precision"], 1.0)
+        self.assertAlmostEqual(s.metadata["answer_recall"], 2 / 3)
+
+    def test_the_primary_value_is_unchanged_by_surfacing_them(self):
+        """Additive metadata only — no score moves."""
+        q = _yn_query("Eiffel Tower Paris")
+        s = HotpotQABenchmark().score_answer("the Eiffel Tower", q)
+        self.assertEqual(s.value, hotpot_token_f1("the Eiffel Tower",
+                                                  "Eiffel Tower Paris"))
+        self.assertEqual(s.method, "token_f1")
 
 
 class TestTheGuardIsHotpotLocal(unittest.TestCase):

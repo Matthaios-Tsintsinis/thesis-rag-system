@@ -103,6 +103,7 @@ VARIANT B — `hotpotqa_pooled` — pooled shards.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import replace as dc_replace
 from typing import Any, Iterable
 
@@ -243,11 +244,51 @@ def hotpot_token_f1(predicted: str, gold: str) -> float:
     this harness already matched it; wrapping it would introduce a
     divergence where none existed.
     """
+    return hotpot_token_f1_prf(predicted, gold)[0]
+
+
+def hotpot_token_f1_prf(predicted: str, gold: str) -> tuple[float, float, float]:
+    """(f1, precision, recall) — the full triple the official scorer returns.
+
+    `hotpot_evaluate_v1.f1_score` returns `f1, precision, recall`, and
+    `update_answer` accumulates ALL THREE alongside EM:
+
+        metrics['em'] += float(em)
+        metrics['f1'] += f1
+        metrics['prec'] += prec
+        metrics['recall'] += recall
+
+    so the official report carries FOUR answer numbers, not two. This
+    harness computed precision and recall inside `token_f1` and threw
+    them away — a value that was correct and inert, which is the defect
+    class this project keeps finding. They are surfaced now because a
+    reader comparing against the official script will look for them and
+    they cost nothing: the arithmetic is already being done.
+
+    `ZERO_METRIC` is `(0, 0, 0)` in the reference, so the yes/no guard
+    zeroes all three together rather than F1 alone.
+
+    The both-empty branch mirrors `token_f1`'s adopted SQuAD rule and is
+    unreachable in this pipeline (`assert_gold_not_empty`).
+    """
     np_ = normalize_qasper_answer(predicted)
     ng_ = normalize_qasper_answer(gold)
     if np_ != ng_ and (np_ in _HOTPOT_SENTINELS or ng_ in _HOTPOT_SENTINELS):
-        return 0.0
-    return token_f1(predicted, gold)
+        return 0.0, 0.0, 0.0
+
+    pred_tokens = np_.split()
+    gold_tokens = ng_.split()
+    if not pred_tokens or not gold_tokens:
+        agree = float(pred_tokens == gold_tokens)
+        return agree, agree, agree
+    common = Counter(pred_tokens) & Counter(gold_tokens)
+    n_common = sum(common.values())
+    if n_common == 0:
+        return 0.0, 0.0, 0.0
+    precision = n_common / len(pred_tokens)
+    recall = n_common / len(gold_tokens)
+    f1 = 2.0 * precision * recall / (precision + recall)
+    return f1, precision, recall
 
 
 def _sentence_items(context: Any) -> list[CorpusItem]:
@@ -583,7 +624,7 @@ class HotpotQABenchmark:
         unqualified match it did not have.
         """
         gold = query.gold_answers[0].free_form if query.gold_answers else ""
-        f1 = hotpot_token_f1(predicted, gold)
+        f1, precision, recall = hotpot_token_f1_prf(predicted, gold)
         em = float(
             normalize_qasper_answer(predicted) == normalize_qasper_answer(gold)
         )
@@ -598,6 +639,13 @@ class HotpotQABenchmark:
                 # abstention RATES are comparable across all three.
                 "abstained": is_abstention(predicted),
                 "exact_match": em,
+                # The official report carries FOUR answer numbers -- em,
+                # f1, prec, recall (`update_answer`). We surfaced two and
+                # discarded two that were already being computed. A
+                # reader checking against the official script looks for
+                # these, so they are recorded rather than re-derived.
+                "answer_precision": precision,
+                "answer_recall": recall,
                 "gold": gold,
             },
         )
@@ -688,6 +736,7 @@ __all__ = [
     "HotpotQABenchmark",
     "HotpotQAPooledBenchmark",
     "hotpot_token_f1",
+    "hotpot_token_f1_prf",
     "SHARD_QUESTIONS",
     "SUBSAMPLE_SEED",
     "PREREGISTERED_Q",
