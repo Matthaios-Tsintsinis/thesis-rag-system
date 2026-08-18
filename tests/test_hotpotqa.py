@@ -30,8 +30,10 @@ from src.eval.hotpotqa import (
     HotpotQAPooledBenchmark,
     _project_to_titles,
     _sentence_items,
+    hotpot_token_f1,
     subsample_indices,
 )
+from src.eval.scorers.extractive import normalize_qasper_answer, token_f1
 from src.eval.types import EvalQuery, GoldAnswer
 from src.retrievers.base import RetrievedChunk
 
@@ -314,6 +316,172 @@ class TestScoring(unittest.TestCase):
                       gold_answers=(), gold_passage_sets=(frozenset(),),
                       question_type="bridge")
         self.assertIsNotNone(self.b.score_retrieval([], q))
+
+
+def _yn_query(gold: str, qtype: str = "comparison") -> EvalQuery:
+    return EvalQuery(
+        query_id="q", question_text="?", parent_scope=None,
+        gold_answers=(GoldAnswer(answer_type="free_form", free_form=gold),),
+        gold_passage_sets=(frozenset({("Alpha", "sent0")}),),
+        question_type=qtype)
+
+
+class TestOfficialYesNoGuard(unittest.TestCase):
+    """HotpotQA's yes/no/noanswer guard, against a transcribed reference.
+
+    The reference below is transcribed from the published
+    `hotpot_evaluate_v1.f1_score`, so each assertion carries its own
+    source instead of pointing at one. It uses THIS harness's normaliser
+    rather than the official `normalize_answer`, which is legitimate here
+    and only here: the two compose identically and our documented
+    NFKC/Unicode extension is provably inert on the ASCII inputs below.
+    """
+
+    @staticmethod
+    def _official_f1(prediction: str, ground_truth: str) -> float:
+        """Shape of the official f1_score, returning the F1 term only."""
+        from collections import Counter
+
+        normalized_prediction = normalize_qasper_answer(prediction)
+        normalized_ground_truth = normalize_qasper_answer(ground_truth)
+
+        ZERO_METRIC = 0.0
+
+        if (normalized_prediction in ["yes", "no", "noanswer"]
+                and normalized_prediction != normalized_ground_truth):
+            return ZERO_METRIC
+        if (normalized_ground_truth in ["yes", "no", "noanswer"]
+                and normalized_prediction != normalized_ground_truth):
+            return ZERO_METRIC
+
+        prediction_tokens = normalized_prediction.split()
+        ground_truth_tokens = normalized_ground_truth.split()
+        common = Counter(prediction_tokens) & Counter(ground_truth_tokens)
+        num_same = sum(common.values())
+        if num_same == 0:
+            return ZERO_METRIC
+        precision = 1.0 * num_same / len(prediction_tokens)
+        recall = 1.0 * num_same / len(ground_truth_tokens)
+        return (2 * precision * recall) / (precision + recall)
+
+    # The case measured on the preregistered sample, 2026-08-18.
+    MEASURED_PRED = "Yes, both films were directed by the same person."
+    MEASURED_GOLD = "yes"
+
+    def test_the_measured_case_scores_zero(self):
+        self.assertEqual(
+            hotpot_token_f1(self.MEASURED_PRED, self.MEASURED_GOLD), 0.0)
+
+    def test_the_guard_is_load_bearing_on_that_case(self):
+        """Without the guard this pair earns 2/9 — so the test above
+        cannot be passing for some incidental reason."""
+        self.assertAlmostEqual(
+            token_f1(self.MEASURED_PRED, self.MEASURED_GOLD), 0.2222, places=4)
+
+    def test_it_scores_zero_THROUGH_the_benchmark_scorer(self):
+        """The property is about the scorer a cell actually runs, not
+        about a helper reachable from a test."""
+        s = HotpotQABenchmark().score_answer(
+            self.MEASURED_PRED, _yn_query(self.MEASURED_GOLD))
+        self.assertEqual(s.value, 0.0)
+        self.assertEqual(s.method, "token_f1")
+
+    def test_the_pooled_variant_inherits_it(self):
+        """All ten HotpotQA cells score alike or the column is two
+        populations wearing one name."""
+        s = HotpotQAPooledBenchmark().score_answer(
+            self.MEASURED_PRED, _yn_query(self.MEASURED_GOLD))
+        self.assertEqual(s.value, 0.0)
+
+    def test_an_exactly_correct_yes_still_scores_one(self):
+        for pred in ("yes", "Yes", "Yes."):
+            self.assertEqual(hotpot_token_f1(pred, "yes"), 1.0, pred)
+
+    def test_the_opposite_sentinel_scores_zero(self):
+        self.assertEqual(hotpot_token_f1("no", "yes"), 0.0)
+        self.assertEqual(hotpot_token_f1("yes", "no"), 0.0)
+
+    def test_a_sentinel_prediction_against_a_real_gold_scores_zero(self):
+        """The FIRST official branch: prediction is the sentinel."""
+        self.assertEqual(hotpot_token_f1("yes", "the Eiffel Tower"), 0.0)
+
+    def test_non_sentinel_pairs_are_untouched(self):
+        """The guard must not disturb the 93.9% of rows it does not
+        concern."""
+        for pred, gold in (
+            ("Eiffel Tower", "the Eiffel Tower"),
+            ("Paris France", "Paris"),
+            ("nothing in common", "the Eiffel Tower"),
+        ):
+            self.assertEqual(hotpot_token_f1(pred, gold),
+                             token_f1(pred, gold), (pred, gold))
+
+    def test_agreement_with_the_transcribed_official_scorer(self):
+        battery = [
+            (self.MEASURED_PRED, "yes"),
+            ("yes", "yes"), ("no", "no"), ("yes", "no"), ("no", "yes"),
+            ("yes", "the Eiffel Tower"), ("noanswer", "yes"),
+            ("No, they were not.", "no"),
+            ("Eiffel Tower", "the Eiffel Tower"),
+            ("Paris", "Paris"), ("Paris", "London"),
+            ("the same person directed both", "yes"),
+        ]
+        for pred, gold in battery:
+            self.assertAlmostEqual(
+                hotpot_token_f1(pred, gold), self._official_f1(pred, gold),
+                places=12, msg=f"{pred!r} vs {gold!r}")
+
+    def test_exact_match_is_NOT_routed_through_the_guard(self):
+        """Official `exact_match_score` has no guard, and this harness
+        already matched it. Wrapping EM would create a divergence where
+        none existed."""
+        s = HotpotQABenchmark().score_answer("Yes", _yn_query("yes"))
+        self.assertEqual(s.metadata["exact_match"], 1.0)
+        s2 = HotpotQABenchmark().score_answer(
+            self.MEASURED_PRED, _yn_query("yes"))
+        self.assertEqual(s2.metadata["exact_match"], 0.0)
+
+
+class TestTheGuardIsHotpotLocal(unittest.TestCase):
+    """It must not reach the other two live benchmarks.
+
+    BEHAVIOURAL, not a source grep: each scorer is driven on the exact
+    pair the guard would zero, and asserted to return the UNGUARDED
+    value. A grep for the import would pass just as well if the shared
+    `token_f1` had been edited instead, which is the change this test
+    exists to forbid.
+    """
+
+    PRED = "Yes, both films were directed by the same person."
+    GOLD = "yes"
+
+    def test_the_shared_token_f1_is_unchanged(self):
+        self.assertAlmostEqual(token_f1(self.PRED, self.GOLD), 0.2222,
+                               places=4)
+
+    def test_multihop_still_scores_it_unguarded(self):
+        from src.eval.multihop import MultiHopBenchmark
+        from src.eval.types import ANSWER_TYPE_FREE_FORM
+
+        q = EvalQuery(
+            query_id="m", question_text="?", parent_scope=None,
+            gold_answers=(GoldAnswer(answer_type=ANSWER_TYPE_FREE_FORM,
+                                     free_form=self.GOLD),),
+            gold_passage_sets=(frozenset(),), question_type="comparison_query")
+        s = MultiHopBenchmark().score_answer(self.PRED, q)
+        self.assertAlmostEqual(s.value, 0.2222, places=4)
+
+    def test_narrativeqa_still_scores_it_unguarded(self):
+        from src.eval.narrativeqa import NarrativeQABenchmark
+        from src.eval.types import ANSWER_TYPE_FREE_FORM
+
+        q = EvalQuery(
+            query_id="n", question_text="?", parent_scope=None,
+            gold_answers=(GoldAnswer(answer_type=ANSWER_TYPE_FREE_FORM,
+                                     free_form=self.GOLD),),
+            gold_passage_sets=(), question_type="movie")
+        s = NarrativeQABenchmark().score_answer(self.PRED, q)
+        self.assertAlmostEqual(s.value, 0.2222, places=4)
 
 
 if __name__ == "__main__":

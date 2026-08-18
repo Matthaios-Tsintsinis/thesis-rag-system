@@ -189,6 +189,66 @@ RANK_K_VALUES = (1, 2, 5, 10)
 # scoring. Distinct from any real sentence id.
 _TITLE_SPAN = "<title>"
 
+# The official evaluator's yes/no/noanswer sentinels, verbatim from
+# `hotpot_evaluate_v1.f1_score`. HOTPOTQA-LOCAL BY PLACEMENT: this lives
+# here rather than in `scorers/extractive.py` so it is structurally
+# unreachable from MultiHop and NarrativeQA, which import the shared
+# `token_f1` directly. Unreachable beats unused — an "official" guard
+# sitting in the shared module is one import away from silently
+# rewriting two other benchmarks' scores.
+_HOTPOT_SENTINELS = ("yes", "no", "noanswer")
+
+
+def hotpot_token_f1(predicted: str, gold: str) -> float:
+    """Shared token-F1 plus the official yes/no/noanswer guard.
+
+    TRANSCRIBED FROM THE OFFICIAL EVALUATOR, `hotpot_evaluate_v1.py`,
+    whose `f1_score` opens with two early returns before any token
+    counting happens:
+
+        ZERO_METRIC = (0, 0, 0)
+
+        if normalized_prediction in ['yes', 'no', 'noanswer'] and
+                normalized_prediction != normalized_ground_truth:
+            return ZERO_METRIC
+        if normalized_ground_truth in ['yes', 'no', 'noanswer'] and
+                normalized_prediction != normalized_ground_truth:
+            return ZERO_METRIC
+
+    WHAT IT MEANS. On a yes/no question the official scorer demands the
+    normalised prediction be EXACTLY 'yes' or 'no'. Partial credit is
+    refused outright: gold 'yes' against "Yes, both films were directed
+    by the same person." shares one token of eight and would otherwise
+    earn F1 0.2222, but the official answer is 0.0. A yes/no answer is
+    right or it is wrong; there is no partial version of it.
+
+    WHY THIS EXISTS AS ITS OWN FUNCTION rather than a flag on the shared
+    scorer: `token_f1` is the harness-wide contract and MUST keep
+    behaving identically for MultiHop and NarrativeQA, whose golds are
+    free-form and where a prediction of 'no' against a real answer is an
+    ordinary wrong answer rather than a sentinel mismatch.
+
+    DIRECTION, and it is one-way: the guard can only ever ZERO a score
+    the fall-through would have granted. It cannot raise one. So this
+    can lower a HotpotQA answer column and can never inflate it.
+
+    MEASURED REACH on the preregistered sample (seed 20260805, 2026-08-18,
+    counted with this module's own normaliser): 61 of 1,000 questions
+    (6.1%) carry a yes/no gold — yes 38 / no 23 — and all 61 are
+    comparison questions, i.e. 32.6% of that slice. The full 7,405-question
+    dev split is 6.19%, so the draw is representative on this axis.
+
+    Exact match is NOT routed through here. The official
+    `exact_match_score` is an unguarded normalised string comparison and
+    this harness already matched it; wrapping it would introduce a
+    divergence where none existed.
+    """
+    np_ = normalize_qasper_answer(predicted)
+    ng_ = normalize_qasper_answer(gold)
+    if np_ != ng_ and (np_ in _HOTPOT_SENTINELS or ng_ in _HOTPOT_SENTINELS):
+        return 0.0
+    return token_f1(predicted, gold)
+
 
 def _sentence_items(context: Any) -> list[CorpusItem]:
     """One CorpusItem per SENTENCE, parented by its paragraph title.
@@ -515,9 +575,15 @@ class HotpotQABenchmark:
         whitespace), which `normalize_qasper_answer` already implements;
         reusing it keeps one normaliser in the codebase rather than two
         that could drift.
+
+        F1 additionally carries the official yes/no/noanswer guard — see
+        `hotpot_token_f1`. Without it this benchmark awarded token overlap
+        on 6.1% of the sample where the published evaluator awards zero,
+        which was the one place the deviations table claimed an
+        unqualified match it did not have.
         """
         gold = query.gold_answers[0].free_form if query.gold_answers else ""
-        f1 = token_f1(predicted, gold)
+        f1 = hotpot_token_f1(predicted, gold)
         em = float(
             normalize_qasper_answer(predicted) == normalize_qasper_answer(gold)
         )
@@ -621,6 +687,7 @@ class HotpotQAPooledBenchmark(HotpotQABenchmark):
 __all__ = [
     "HotpotQABenchmark",
     "HotpotQAPooledBenchmark",
+    "hotpot_token_f1",
     "SHARD_QUESTIONS",
     "SUBSAMPLE_SEED",
     "PREREGISTERED_Q",
