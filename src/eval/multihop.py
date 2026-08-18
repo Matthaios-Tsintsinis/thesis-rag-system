@@ -24,14 +24,52 @@ Answer scoring:
     `token_f1`, ALWAYS COMPUTED — abstention detection is metadata and
     never reaches the value (see score_answer for what that replaced).
 
-  This is a LEXICAL STAND-IN: the official MultiHop-RAG metric is an
-  LLM-judge on free-form answers per the paper. No judge is run here and
-  none is planned — the harness deliberately has no model grading another
-  model's output, so there is no evaluator bias to argue about. Every
-  AnswerScore carries `pass1_placeholder=True`, and the RESULTS TABLE
-  CAPTION must state that this column is a lexical stand-in for the
-  paper's judge. The metadata flag, not the method string, is the
-  stand-in signal.
+  THE OFFICIAL METRIC, read from the benchmark's own `qa_evaluate.py`
+  rather than from the paper's prose (corrected 2026-08-18; this block
+  had been wrong under three successive readings of the same metric —
+  "LLM judge", then "exact-match accuracy", then this, which is the one
+  taken from the source):
+
+      def has_intersection(prediction: str, gold: str) -> bool:
+          return bool(set(prediction.split()).intersection(gold.split()))
+
+      correct = sum(has_intersection(p.lower(), g.lower())
+                    for p, g in zip(predictions, gold_answers))
+
+  A response is scored CORRECT IF ANY SINGLE WORD OVERLAPS with the gold,
+  after lowercasing and whitespace splitting. No punctuation stripping,
+  no article removal, no exact match, and NO MODEL IS INVOLVED anywhere
+  in their evaluation — GPT-4 appears in that project as a
+  dataset-construction tool and as an evaluated system, never as a judge.
+
+  Consequences, all of which belong in the results caption:
+
+  1. TOKEN-F1 IS STRICTLY MORE DEMANDING than the official metric. This
+     is a deviation in the STRICT direction, which is the easy direction
+     to defend: we cannot be accused of flattering the systems by
+     scoring them more leniently than the benchmark's own script does.
+  2. THERE IS NO OFFICIAL "F1" TO COMPARE AGAINST. `calculate_metrics`
+     returns `score, score, score, score` and labels them precision,
+     recall, F1 and accuracy — one binary per-question success rate
+     printed four times. Comparing our token-F1 to their "F1" crosses
+     metric FAMILIES, not merely thresholds.
+  3. NULL QUERIES GET NO SPECIAL HANDLING THERE. Their loop has no
+     branch for `null_query`; it groups by `question_type` for reporting
+     only and routes every type through the same comparison. So the
+     pure-refusal rule this module applies is a HARNESS ADDITION with no
+     official counterpart — not a deviation from one.
+  4. THEIR NORMALISATION IS LOWERCASE + WHITESPACE SPLIT ONLY, so their
+     tokens keep trailing punctuation. Ours strips punctuation and
+     articles via the shared SQuAD-style normaliser.
+  5. WE DO NOT IMPLEMENT `extract_answer`. Their scorer regexes
+     `The answer to the question is "(.*?)"` out of the model output and
+     falls back to the raw text, so their prompt asks for that wrapper
+     and their scorer removes it before comparing. Our prompt does not
+     request it and our scorer does not strip it.
+
+  `pass1_placeholder=True` remains on every AnswerScore. Read it as
+  "this column is not the benchmark's own metric", which is still true —
+  it is NOT to be read as "an LLM judge is coming later".
 """
 
 from __future__ import annotations
@@ -295,10 +333,14 @@ class MultiHopBenchmark:
             this and credited fabrication: "I don't know the year, but
             the answer is Tesla." scored 1.0. The rule now requires the
             utterance MINUS its hedge to assert nothing.
+            NOTE, from their qa_evaluate.py: the benchmark itself has NO
+            null-query rule -- every type goes through the same one-word
+            overlap check. This rule is ours, added, with no official
+            counterpart to deviate from.
           - Other queries: token_F1 vs gold.free_form (the
             QASPER-consistent default; less false-positive-prone than
-            substring). The MultiHop-RAG paper evaluates answers with an
-            LLM judge; this column is a LEXICAL STAND-IN for it and the
+            substring). The benchmark's own scorer credits ANY one-word
+            overlap, so token-F1 is STRICTER than it; this column and the
             results table must say so.
 
         Metadata always records both `token_f1` AND `substring_match`
