@@ -120,5 +120,17 @@ class TestChunkerIsTheResolvedOne(unittest.TestCase):
         self.assertEqual(resolve_chunking_strategy(S()), "word_window")
 
 
+# The retrieval-denominator test lives in `test_cli_entrypoints.py`,
+# where a real summary is written by main(). The first draft of it was
+# `assertIn('"n_retrieval_scored"', inspect.getsource(runner.main))`
+# plus an assertion that 2556 - 301 == 2255 — a source grep and a
+# statement about two literals, written ONE COMMIT after the sweep that
+# converted six of exactly that shape. Caught in review of its own diff.
+#
+# It is the thirteenth instance and the sharpest evidence for the
+# sweep's own conclusion: the reflex is structural, not inattentive, and
+# the remedy is the periodic grep rather than the intention to do better.
+
+
 if __name__ == "__main__":
     unittest.main()

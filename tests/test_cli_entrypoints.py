@@ -233,6 +233,25 @@ class TestBatchSizeDefault(_CliCase):
     def test_the_flag_still_overrides_downward_for_a_cost_probe(self):
         self.assertEqual(self._summary("--batch-size", "4")["batch_size"], 4)
 
+    def test_the_summary_names_the_retrieval_denominator(self):
+        """A mean without its n invites the wrong denominator.
+
+        `mean_retrieval_f1` averages over rows that HAD retrieval ground
+        truth, not over every row. On the first banked cell that is 2,255
+        of 2,556 — MultiHop's 301 null queries are skipped — and a reader
+        given only the mean assumes 2,556. On NarrativeQA every row is
+        skipped, so the denominator is 0 and the column is n/a rather
+        than a score of zero.
+
+        Read from a summary main() actually wrote, so it fails if the
+        field stops being emitted rather than if a string moves.
+        """
+        summary = self._summary()
+        self.assertEqual(
+            summary["n_retrieval_scored"],
+            summary["n_queries_scored"] - summary["n_retrieval_skipped"],
+        )
+
     def test_zero_is_the_explicit_sequential_opt_out(self):
         """An escape hatch reachable only by editing config is not an
         escape hatch."""

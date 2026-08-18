@@ -828,6 +828,14 @@ def main() -> None:
         "allow_warm_trees": args.allow_warm_trees,
         "n_queries_scored": n_scored,
         "n_retrieval_skipped": sum_retr_skipped,
+        # THE DENOMINATOR, NAMED. mean_retrieval_f1 is over the rows that
+        # HAD retrieval ground truth, not over every row: MultiHop's 301
+        # null queries are skipped, so the mean is over 2,255 of 2,556. A
+        # reader given only the mean assumes the cell's row count, and a
+        # mean without its n is the same defect class as a guard without
+        # its comparison. NarrativeQA makes this stark - every row there
+        # is skipped, so the denominator is zero and the column is n/a.
+        "n_retrieval_scored": n_scored - sum_retr_skipped,
         "mean_retrieval_f1": sum_retr_f1 / n_retr_scored,
         "mean_answer_score": sum_ans / max(1, n_scored),
         # The two parts of the one answer column, so the composition is
