@@ -171,9 +171,35 @@ GEN_MAX_NEW_TOKENS = 512
 # rather than passing it per invocation is what makes "the same batch
 # size in every cell" a property of the code instead of a habit.
 #
-# 16 is the value the banked M1 cell used and the value the L4 headroom
-# measurements were taken at; --batch-size still overrides for probes.
-MATRIX_BATCH_SIZE = 16
+# 0 MEANS SEQUENTIAL, AND SEQUENTIAL IS MEASURED FASTER ON THE ANSWER
+# PATH. Measured 2026-08-18, M2 x MultiHop, 64 queries, L4, cap 16000
+# substrate, allocator fix live:
+#
+#   batch 0  (sequential)      272.4 s   4.2558 s/query   <- fastest
+#   batch 16, padded 16000     330.6 s   5.1654 s/query
+#   batch 16, padded 12000     337.8 s   5.2784 s/query
+#   batch 16, padded 20000     399.9 s   6.2492 s/query
+#
+# Batching costs 21% at its best cap and degrades as the cap grows.
+#
+# WHY, and the codebase predicted it: a batch runs until its LONGEST
+# member stops, so one non-terminating generation makes every member pay
+# the cap (raptor_paper.py, `summarize_paper_style_batch`). At answer
+# time that cap is GEN_MAX_NEW_TOKENS = 512 while a typical MultiHop
+# answer is far shorter, so batching trades a real per-step saving for a
+# much larger tail penalty. Sequential lets every query stop at its own
+# EOS.
+#
+# THE BATCHING WIN IS REAL ONLY WHERE THE CAP IS TIGHT. M4's tree
+# summaries decode at most 100 tokens, so the uncapped-tail failure
+# cannot occur there — and that path has its own knob,
+# `M4Config.summary_batch_size`, which is unaffected by this value and
+# stays at 32.
+#
+# Set here rather than passed per invocation so "the same batch shape in
+# every cell" is a property of the code, not a flag someone remembers.
+# `--batch-size N` still overrides for probes.
+MATRIX_BATCH_SIZE = 0
 GEN_TEMPERATURE = 0.0
 GEN_TOP_P = 1.0
 # fp16, NOT 4-bit. This default was True and it is the b6e35c6 failure

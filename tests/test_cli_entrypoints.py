@@ -202,13 +202,15 @@ class TestBatchSizeDefault(_CliCase):
     The test P9 shipped asserted MATRIX_BATCH_SIZE == 16, which is a
     tautology about a constant and proves nothing about the pipeline: the
     flag still defaulted to None, so a cell launched without an explicit
-    --batch-size fell back to SEQUENTIAL answering. Batch composition can
-    move generated text at temperature 0, so that cell would not have
-    been strictly comparable to the rest of the matrix, and nothing in
-    the run would have said so.
+    --batch-size resolved to something the constant did not name, and
+    nothing in the run would have said so. Batch composition can move
+    generated text at temperature 0, so cells that batch differently are
+    not strictly comparable.
 
     These assertions read what the CLI RESOLVED, from the artifact a real
-    run leaves behind.
+    run leaves behind — which is why they survived the constant CHANGING
+    (16 -> 0, sequential, on the answer-path measurement) while the
+    tautology in test_environment_pinning did not.
     """
 
     def _summary(self, *extra):
@@ -217,7 +219,16 @@ class TestBatchSizeDefault(_CliCase):
             out.with_suffix(".summary.json").read_text(encoding="utf-8"))
 
     def test_no_flag_resolves_to_the_configured_matrix_batch_size(self):
-        self.assertEqual(self._summary()["batch_size"], MATRIX_BATCH_SIZE)
+        """Tracks the CONSTANT through the runner's own resolution.
+
+        `batch_size = args.batch_size if args.batch_size else None`, so a
+        falsy constant selects the sequential path and the summary
+        records None. Asserting the resolved form rather than the raw
+        integer keeps this a statement about the pipeline: set the
+        constant to 8 and have the runner ignore it, and this fails.
+        """
+        self.assertEqual(self._summary()["batch_size"],
+                         MATRIX_BATCH_SIZE or None)
 
     def test_the_flag_still_overrides_downward_for_a_cost_probe(self):
         self.assertEqual(self._summary("--batch-size", "4")["batch_size"], 4)
