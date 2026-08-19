@@ -299,6 +299,70 @@ class BenchmarkRunner:
                     f"{n_done / max(elapsed, 1e-9):.2f} gen-req/s"
                 )
 
+    def _cold_tree_preflight(
+        self, system, units: list, already_done: set
+    ) -> None:
+        """Scan EVERY unit for a warm substrate before indexing anything.
+
+        WHY THIS IS NOT JUST THE PER-UNIT GATE MOVED EARLIER. The
+        per-unit gate aborts on the FIRST warm unit, so discovering N
+        warm substrates costs N session starts. On M4/hotpotqa — 1,000
+        units with ~50 warm from the query slice — that is up to fifty
+        aborts, the worst case in the matrix by a wide margin.
+
+        THE DEEPER REASON, and it is the one that decided the design: the
+        runbook carried a hand-maintained list of warm substrates to
+        delete. On M4/narrativeqa it named TWO and there were THREE. A
+        documented list is a thing that goes stale; an enumeration
+        cannot. So the operator is never asked to consult a list again —
+        the gate computes the set and prints it.
+
+        Read-only and index-free: `substrate_warm_path` writes the corpus
+        layout to a temp dir and hashes it. No embedder, no clustering,
+        no summariser, no GPU.
+
+        Units whose queries are all already banked are SKIPPED, matching
+        the resume rule downstream — a resumed pass does not index them,
+        so a warm substrate there is not a finding.
+        """
+        if not self.require_cold_tree:
+            return
+        if not getattr(system, "has_cacheable_substrate", False):
+            return
+
+        warm: list[tuple[str, str]] = []
+        n_checked = 0
+        for unit in units:
+            if all(q.query_id in already_done for q in unit.queries):
+                continue
+            n_checked += 1
+            path = system.substrate_warm_path(unit.corpus)
+            if path:
+                warm.append((str(unit.corpus_id), path))
+
+        if self.verbose:
+            print(
+                f"[eval] cold-tree preflight: {n_checked} unit(s) checked, "
+                f"{len(warm)} warm"
+            )
+        if not warm:
+            return
+
+        listing = "\n".join(f"  {cid}\n    {p}" for cid, p in warm)
+        raise SystemExit(
+            f"COLD-TREE PREFLIGHT FAILED: {len(warm)} of {n_checked} units "
+            "already have a complete substrate on disk.\n"
+            "ALL of them are listed here so this costs ONE session start, "
+            "not one per warm unit:\n"
+            f"{listing}\n"
+            "A warm substrate may have been built under a different "
+            "topology stack, and nothing in the output records which — so "
+            "the matrix could hold two tree populations with no error "
+            "anywhere. Delete the directories above and re-run, or pass "
+            "--allow-warm-trees if a warm run is intended.\n"
+            "Nothing was indexed; no GPU work was done."
+        )
+
     def run(
         self,
         system: BaseSystem,
@@ -333,6 +397,7 @@ class BenchmarkRunner:
         t_start = time.perf_counter()
 
         already_done = self._existing_query_ids()
+        # (preflight runs below, once `already_done` is known)
         if already_done and self.verbose:
             print(
                 f"[eval] resuming: {len(already_done)} queries already in "
@@ -340,19 +405,20 @@ class BenchmarkRunner:
             )
         mode = "a" if (self.resume and already_done) else "w"
 
+        units = list(benchmark.iter_eval_units(split=split, max_units=max_units))
+        if only_unit:
+            units = [u for u in units
+                     if str(u.corpus_id).startswith(only_unit)]
+        self._cold_tree_preflight(system, units, already_done)
+
         with self.output_path.open(mode, encoding="utf-8") as fout:
             stopped = False
-            for unit_idx, unit in enumerate(
-                benchmark.iter_eval_units(split=split, max_units=max_units)
-            ):
+            for unit_idx, unit in enumerate(units):
                 # TARGETED SINGLE UNIT. Needed because `--max-units N`
                 # cannot address a specific unit on NarrativeQA: its draw
                 # is seeded on N, so `--max-units 1` selects a DIFFERENT
                 # story than the first of the 40-story cell. Filtering by
                 # id leaves the draw intact and picks from within it.
-                if only_unit and not str(unit.corpus_id).startswith(only_unit):
-                    continue
-
                 if self.verbose:
                     print(
                         f"[eval] unit {unit_idx + 1}: corpus_id={unit.corpus_id!r}  "
@@ -401,9 +467,12 @@ class BenchmarkRunner:
                 system.index_items(unit.corpus)
                 index_s = time.perf_counter() - t_index
 
-                # ON THE FIRST WARM UNIT, not after the pass. A 40-story
-                # cell that ran to completion before reporting a warm
-                # tree would have spent the session this protects.
+                # BACKSTOP ONLY since the preflight landed. The preflight
+                # enumerates every unit before anything is indexed, so a
+                # warm substrate should be impossible here — this catches
+                # one that appeared mid-run, or a system whose
+                # `substrate_warm_path` disagrees with what `index()`
+                # actually did.
                 if self.require_cold_tree and getattr(
                     system, "tree_cache_hit", None
                 ):

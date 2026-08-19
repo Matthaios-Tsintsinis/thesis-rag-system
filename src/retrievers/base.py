@@ -431,44 +431,82 @@ class BaseSystem(ABC):
 
         Provenance stamping is a no-op for M1 (self.chunks stays empty).
         """
+        with tempfile.TemporaryDirectory(prefix=f"{self.system_id}_corpus_") as td:
+            td_path = Path(td)
+            layout = self._write_corpus_layout(items, td_path)
+            self.index(td_path)
+
+        self._stamp_provenance(layout)
+
+    def _write_corpus_layout(
+        self, items: Sequence["CorpusItem"], td_path: Path
+    ) -> dict[str, tuple[str, list[tuple[int, int, str]] | None, str]]:
+        """Materialise the per-parent corpus into `td_path`; return the layout.
+
+        EXTRACTED SO THE WARM-SUBSTRATE CHECK CANNOT DIVERGE FROM THE REAL
+        INDEX. `corpus_content_hash` is computed over this directory, so
+        the layout IS a cache-key input; a preflight that wrote the corpus
+        even slightly differently would compute a different key and report
+        warm/cold about a substrate no cell would ever use. One function,
+        both callers — see `substrate_warm_path`.
+        """
         groups = group_items_by_parent(items)
         # filename -> (parent_id, spans | None, span_id_if_single)
         layout: dict[str, tuple[str, list[tuple[int, int, str]] | None, str]] = {}
+        for parent_id, members in groups.items():
+            if len(members) == 1:
+                only = members[0]
+                seed, payload = only.item_id, only.text
+                spans, single_span = None, only.span_id
+            else:
+                seed = parent_id
+                payload, spans = build_parent_payload(members)
+                single_span = ""
+                if clean_text(payload) != payload:
+                    # The offsets in `spans` index `payload`, but the
+                    # chunker will see clean_text(payload). They are
+                    # the same string only while clean_text stays
+                    # idempotent; if that ever breaks, provenance
+                    # would drift silently across the document.
+                    raise RuntimeError(
+                        f"parsing.clean_text is no longer idempotent on "
+                        f"parent {parent_id!r}: the per-parent offsets "
+                        "would not match the text the chunker reads."
+                    )
 
-        with tempfile.TemporaryDirectory(prefix=f"{self.system_id}_corpus_") as td:
-            td_path = Path(td)
-            for parent_id, members in groups.items():
-                if len(members) == 1:
-                    only = members[0]
-                    seed, payload = only.item_id, only.text
-                    spans, single_span = None, only.span_id
-                else:
-                    seed = parent_id
-                    payload, spans = build_parent_payload(members)
-                    single_span = ""
-                    if clean_text(payload) != payload:
-                        # The offsets in `spans` index `payload`, but the
-                        # chunker will see clean_text(payload). They are
-                        # the same string only while clean_text stays
-                        # idempotent; if that ever breaks, provenance
-                        # would drift silently across the document.
-                        raise RuntimeError(
-                            f"parsing.clean_text is no longer idempotent on "
-                            f"parent {parent_id!r}: the per-parent offsets "
-                            "would not match the text the chunker reads."
-                        )
+            filename = f"{_safe_item_filename(seed)}.txt"
+            if filename in layout:
+                n = 1
+                while f"{_safe_item_filename(seed)}_{n}.txt" in layout:
+                    n += 1
+                filename = f"{_safe_item_filename(seed)}_{n}.txt"
+            (td_path / filename).write_text(payload, encoding="utf-8")
+            layout[filename] = (parent_id, spans, single_span)
+        return layout
 
-                filename = f"{_safe_item_filename(seed)}.txt"
-                if filename in layout:
-                    n = 1
-                    while f"{_safe_item_filename(seed)}_{n}.txt" in layout:
-                        n += 1
-                    filename = f"{_safe_item_filename(seed)}_{n}.txt"
-                (td_path / filename).write_text(payload, encoding="utf-8")
-                layout[filename] = (parent_id, spans, single_span)
+    # Systems whose index() writes a cacheable, key-addressed substrate
+    # set this True and override `substrate_warm_path`. M4 is the only
+    # one today; M1/M2/M3 either build nothing or rebuild cheaply.
+    has_cacheable_substrate = False
 
-            self.index(td_path)
+    def substrate_warm_path(self, items: Sequence["CorpusItem"]) -> str | None:
+        """Path of an EXISTING complete substrate for `items`, else None.
 
+        READ-ONLY and index-free: it materialises the corpus layout,
+        computes the cache key, and asks whether that directory is
+        already complete. It never embeds, clusters or summarises.
+
+        Default None means "this system has no cacheable substrate", which
+        is why `has_cacheable_substrate` is a separate flag — None must
+        not be read as "checked and cold".
+        """
+        del items
+        return None
+
+    def _stamp_provenance(
+        self,
+        layout: dict[str, tuple[str, list[tuple[int, int, str]] | None, str]],
+    ) -> None:
         # walk_corpus sets ParsedDocument.doc_id to the path relative to
         # the corpus root, which for this flat temp dir is the filename.
         n_unmapped = 0

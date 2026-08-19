@@ -186,6 +186,9 @@ def _layer_to_unit_type(layer: int) -> str:
 
 class RaptorSystem(BaseSystem):
     system_id = "M4"
+    # M4 is the only system whose index() writes a key-addressed
+    # substrate expensive enough that serving a warm one silently matters.
+    has_cacheable_substrate = True
 
     def __init__(self, config: HarnessConfig = DEFAULT_CONFIG) -> None:
         super().__init__(config)
@@ -225,6 +228,33 @@ class RaptorSystem(BaseSystem):
             extra=extra,
         )
         return CacheDir(paths.cache_dir(), M4_SUBSTRATE_NAMESPACE, key)
+
+    def substrate_warm_path(self, items) -> str | None:
+        """Would this unit's tree be served from cache? Read-only.
+
+        Materialises the corpus layout through the SHARED
+        `_write_corpus_layout`, so the hash this computes is the hash
+        `index_items` would compute — a preflight that wrote the corpus
+        even slightly differently would answer about a substrate no cell
+        would ever use. No embedding, no clustering, no summarisation:
+        writing text files and hashing them.
+
+        Used by the runner's cold-tree PREFLIGHT, which scans every unit
+        before indexing anything so all warm substrates are reported at
+        once. The per-unit gate downstream remains as a backstop.
+        """
+        import tempfile
+
+        if self._resolved is None:
+            self._resolved = resolve_components(
+                self.config.m4, self.config, default_reranker=None
+            )
+        with tempfile.TemporaryDirectory(prefix="M4_warmcheck_") as td:
+            td_path = Path(td)
+            self._write_corpus_layout(items, td_path)
+            chash = corpus_content_hash(td_path)
+        cdir = self._cache_dir(chash)
+        return str(cdir.path) if cdir.is_complete(REQUIRED_FILES) else None
 
     def _guard_index_llm(self) -> None:
         """Refuse to start a tree build with an API index-time LLM.
