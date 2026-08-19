@@ -30,7 +30,7 @@ where the JSON is, at minimum:
 
     {
       "s_per_query": {"M1": 0.5, "M2": 3.7, "M3": 4.0, "M4": 5.0, "M9": 5.8},
-      "n_queries": {"multihop_rag": 2556, "narrativeqa": 1208,
+      "n_queries": {"multihop_rag": 2556, "narrativeqa": 1230,
                     "hotpotqa": 1000, "hotpotqa_pooled": 1000},
       "m4_build_s_per_unit": {"narrativeqa": [82.4, 91.0, ...]}
     }

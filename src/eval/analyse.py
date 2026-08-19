@@ -302,6 +302,14 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
             "mrr": [],
             "ans_score": [],
             "abstained": 0,
+            # THE ANSWER SCORE SPLIT BY ABSTENTION. On a free-form
+            # benchmark a refusal scores 0.0 against every reference by
+            # construction, so a low mean can be measuring how often a
+            # system declined rather than how well it answered. The
+            # split is what tells those two apart, and the mean alone
+            # cannot.
+            "ans_score_abstained": [],
+            "ans_score_answered": [],
             "latency": [],
             "retrieved_unit_types_agg": defaultdict(int),
             "packed_unit_types_agg": defaultdict(int),
@@ -413,8 +421,18 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
                 bucket["mc_unparseable"] += 1
 
         predicted = r.get("predicted_answer", "") or ""
-        if is_abstention(predicted):
+        # PREFER THE RECORDED FLAG. `answer.metadata.abstained` is what the
+        # scorer wrote at run time; recomputing here would silently
+        # re-classify banked rows if the detector ever moves, which is the
+        # kind of drift that is invisible in a mean. Fall back to
+        # recomputation only for rows that predate the field.
+        recorded = ans_md.get("abstained")
+        abstained = bool(recorded) if recorded is not None else is_abstention(predicted)
+        if abstained:
             bucket["abstained"] += 1
+            bucket["ans_score_abstained"].append(float(ans.get("value", 0.0)))
+        else:
+            bucket["ans_score_answered"].append(float(ans.get("value", 0.0)))
 
         # M9 corrective action logging (present only on M9 rows).
         md = r.get("metadata") or {}
@@ -548,6 +566,16 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
                 else None
             ),
             "abstention_rate": b["abstained"] / max(1, n_q),
+            # n AND mean for each side. A mean without its n is the
+            # same defect as a guard without its comparison.
+            "n_abstained": len(b["ans_score_abstained"]),
+            "n_answered": len(b["ans_score_answered"]),
+            "ans_score_abstained_mean": (
+                statistics.mean(b["ans_score_abstained"])
+                if b["ans_score_abstained"] else None),
+            "ans_score_answered_mean": (
+                statistics.mean(b["ans_score_answered"])
+                if b["ans_score_answered"] else None),
             "latency_s_mean": (statistics.mean(b["latency"]) if b["latency"] else None),
             "by_question_type": {
                 qt: {
@@ -652,6 +680,38 @@ def _print_text(rollup: dict[str, Any], *, by_type: bool) -> None:
                 (_fmt(maps.get(10)), 8),
             ]
             print("  ".join(val.ljust(w) for val, w in row))
+
+    # ANSWER SCORE SPLIT BY ABSTENTION.
+    #
+    # Printed unconditionally, because the case it exists for is the case
+    # where nobody thinks to ask for it. On a free-form benchmark a
+    # refusal scores 0.0 against every reference BY CONSTRUCTION, so a low
+    # mean answer score has two completely different readings -- the
+    # system answered badly, or it declined often -- and the micro-mean
+    # cannot distinguish them. Cell 2 (M4/narrativeqa, mean 0.0692) is the
+    # worked example: if most rows are refusals then that number is an
+    # abstention rate wearing an answer-quality label.
+    print("")
+    print("answer score split by abstention")
+    ab_cols = [("system", 8), ("n_abs", 7), ("mean_abs", 9),
+               ("n_ans", 7), ("mean_ans", 9), ("abstain%", 9)]
+    ab_header = "  ".join(name.ljust(w) for name, w in ab_cols)
+    print(ab_header)
+    print("-" * len(ab_header))
+    for sid in rollup["systems"]:
+        st = rollup["systems"][sid]
+        row = [
+            (sid, 8),
+            (str(st.get("n_abstained", 0)), 7),
+            (_fmt(st.get("ans_score_abstained_mean")), 9),
+            (str(st.get("n_answered", 0)), 7),
+            (_fmt(st.get("ans_score_answered_mean")), 9),
+            (f"{st.get('abstention_rate', 0.0):.1%}", 9),
+        ]
+        print("  ".join(val.ljust(w) for val, w in row))
+    print("  a refusal scores 0.0 against free-form references by "
+          "construction;")
+    print("  read mean_ans, not the overall mean, as answer QUALITY.")
 
     # M9 corrective action mix (when present). Compare against the
     # derivation-time mix from scripts/derive_corrective_thresholds.py:
