@@ -302,14 +302,27 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
             "mrr": [],
             "ans_score": [],
             "abstained": 0,
-            # THE ANSWER SCORE SPLIT BY ABSTENTION. On a free-form
-            # benchmark a refusal scores 0.0 against every reference by
-            # construction, so a low mean can be measuring how often a
-            # system declined rather than how well it answered. The
-            # split is what tells those two apart, and the mean alone
-            # cannot.
+            # THE ANSWER SCORE SPLIT BY ABSTENTION, over ANSWERABLE ROWS
+            # ONLY. On a free-form benchmark a refusal scores 0.0 against
+            # every reference by construction, so a low mean can be
+            # measuring how often a system declined rather than how well
+            # it answered.
+            #
+            # NULL ROWS ARE EXCLUDED, and that exclusion is the whole
+            # correctness of this block. On a null query a refusal is the
+            # CORRECT answer and scores 1.0 under `unanswerable_rule`, so
+            # including nulls makes the abstained side a blend of
+            # "correctly refused an unanswerable" and "declined an
+            # answerable" — not an answer-quality figure at all. Measured
+            # on M1 x MultiHop, which inverted the split it was supposed
+            # to explain: mean_abs 0.303 against mean_ans 0.018, 17x the
+            # wrong way, purely because 301 correct null refusals landed
+            # on the abstained side.
             "ans_score_abstained": [],
             "ans_score_answered": [],
+            "n_null_rows": 0,
+            "n_answerable_rows": 0,
+            "abstained_null": 0,
             "latency": [],
             "retrieved_unit_types_agg": defaultdict(int),
             "packed_unit_types_agg": defaultdict(int),
@@ -430,9 +443,21 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
         abstained = bool(recorded) if recorded is not None else is_abstention(predicted)
         if abstained:
             bucket["abstained"] += 1
-            bucket["ans_score_abstained"].append(float(ans.get("value", 0.0)))
+
+        # A NULL ROW is one the loader marked unanswerable, which the P1
+        # contract records as method == "unanswerable_rule". Its score is
+        # a refusal-correctness figure on a different scale from token-F1,
+        # so it is counted but kept OUT of the answer-quality split.
+        if ans.get("method") == "unanswerable_rule":
+            bucket["n_null_rows"] += 1
+            if abstained:
+                bucket["abstained_null"] += 1
         else:
-            bucket["ans_score_answered"].append(float(ans.get("value", 0.0)))
+            bucket["n_answerable_rows"] += 1
+            if abstained:
+                bucket["ans_score_abstained"].append(float(ans.get("value", 0.0)))
+            else:
+                bucket["ans_score_answered"].append(float(ans.get("value", 0.0)))
 
         # M9 corrective action logging (present only on M9 rows).
         md = r.get("metadata") or {}
@@ -568,6 +593,18 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
             "abstention_rate": b["abstained"] / max(1, n_q),
             # n AND mean for each side. A mean without its n is the
             # same defect as a guard without its comparison.
+            #
+            # NAMED FOR THEIR POPULATION: every field below is over
+            # ANSWERABLE rows only. `abstention_rate` above is over ALL
+            # rows and is a different quantity; both are reported because
+            # both are asked for, and neither is allowed to borrow the
+            # other's denominator.
+            "n_null_rows": b["n_null_rows"],
+            "n_answerable_rows": b["n_answerable_rows"],
+            "n_abstained_null": b["abstained_null"],
+            "abstention_rate_answerable": (
+                len(b["ans_score_abstained"]) / b["n_answerable_rows"]
+                if b["n_answerable_rows"] else None),
             "n_abstained": len(b["ans_score_abstained"]),
             "n_answered": len(b["ans_score_answered"]),
             "ans_score_abstained_mean": (
@@ -681,37 +718,59 @@ def _print_text(rollup: dict[str, Any], *, by_type: bool) -> None:
             ]
             print("  ".join(val.ljust(w) for val, w in row))
 
-    # ANSWER SCORE SPLIT BY ABSTENTION.
+    # ANSWER SCORE SPLIT BY ABSTENTION, over ANSWERABLE ROWS ONLY.
     #
     # Printed unconditionally, because the case it exists for is the case
     # where nobody thinks to ask for it. On a free-form benchmark a
-    # refusal scores 0.0 against every reference BY CONSTRUCTION, so a low
-    # mean answer score has two completely different readings -- the
-    # system answered badly, or it declined often -- and the micro-mean
-    # cannot distinguish them. Cell 2 (M4/narrativeqa, mean 0.0692) is the
-    # worked example: if most rows are refusals then that number is an
-    # abstention rate wearing an answer-quality label.
+    # refusal scores 0.0 against every reference BY CONSTRUCTION, so a
+    # low mean answer score has two readings -- answered badly, or
+    # declined often -- and the micro-mean cannot distinguish them.
+    #
+    # NULLS ARE EXCLUDED and the header says so. Including them inverted
+    # the split on M1 x MultiHop (mean_abs 0.303 against mean_ans 0.018)
+    # because a correct refusal on a null scores 1.0 and landed on the
+    # abstained side. The guidance line below is only true once the null
+    # rows are out.
     print("")
-    print("answer score split by abstention")
-    ab_cols = [("system", 8), ("n_abs", 7), ("mean_abs", 9),
-               ("n_ans", 7), ("mean_ans", 9), ("abstain%", 9)]
+    print("answer score split by abstention  [ANSWERABLE ROWS ONLY]")
+    ab_cols = [("system", 8), ("n_able", 7), ("n_abs", 7), ("mean_abs", 9),
+               ("n_ans", 7), ("mean_ans", 9), ("abs%_able", 10),
+               ("n_null", 7)]
     ab_header = "  ".join(name.ljust(w) for name, w in ab_cols)
     print(ab_header)
     print("-" * len(ab_header))
+    any_null = False
     for sid in rollup["systems"]:
         st = rollup["systems"][sid]
+        n_null = st.get("n_null_rows", 0)
+        any_null = any_null or bool(n_null)
+        rate = st.get("abstention_rate_answerable")
         row = [
             (sid, 8),
+            (str(st.get("n_answerable_rows", 0)), 7),
             (str(st.get("n_abstained", 0)), 7),
             (_fmt(st.get("ans_score_abstained_mean")), 9),
             (str(st.get("n_answered", 0)), 7),
             (_fmt(st.get("ans_score_answered_mean")), 9),
-            (f"{st.get('abstention_rate', 0.0):.1%}", 9),
+            ("n/a" if rate is None else f"{rate:.1%}", 10),
+            (str(n_null), 7),
         ]
         print("  ".join(val.ljust(w) for val, w in row))
     print("  a refusal scores 0.0 against free-form references by "
           "construction;")
     print("  read mean_ans, not the overall mean, as answer QUALITY.")
+    if any_null:
+        print("  NULL ROWS ARE EXCLUDED from every column except n_null: on a")
+        print("  null query a refusal is CORRECT and scores 1.0, so including")
+        print("  them would blend refusal-correctness into an answer-quality")
+        print("  figure. Their own mean is mean_answer_score_null in the")
+        print("  run summary.")
+        print("  NOTE THE DENOMINATORS: the summary's")
+        print("  mean_answer_score_answerable is over ALL answerable rows")
+        print("  INCLUDING refusals; mean_ans above is over ATTEMPTED rows")
+        print("  only. Both correct, different populations -- name whichever")
+        print("  the results table uses.")
+    print("")
 
     # M9 corrective action mix (when present). Compare against the
     # derivation-time mix from scripts/derive_corrective_thresholds.py:

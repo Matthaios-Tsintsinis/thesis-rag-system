@@ -18,10 +18,11 @@ from pathlib import Path
 from src.eval.analyse import _aggregate, _iter_records
 
 
-def _row(qid, value, *, predicted, abstained=None):
+def _row(qid, value, *, predicted, abstained=None,
+         system="M4", benchmark="narrativeqa"):
     md = {} if abstained is None else {"abstained": abstained}
     return {
-        "system_id": "M4", "benchmark": "narrativeqa", "split": "validation",
+        "system_id": system, "benchmark": benchmark, "split": "validation",
         "query_id": qid, "predicted_answer": predicted,
         "retrieval": {"skipped": True},
         "answer": {"value": value, "method": "token_f1", "metadata": md},
@@ -97,6 +98,89 @@ class TestTheRecordedFlagWins(unittest.TestCase):
         ])
         (st,) = _aggregate(_iter_records([f]))["systems"].values()
         self.assertEqual(st["n_abstained"], 1)
+
+
+def _null_row(qid, value, *, abstained, system="M1",
+              benchmark="multihop_rag"):
+    """A null query: the loader marked it unanswerable, so P1's contract
+    records method == 'unanswerable_rule' and a CORRECT refusal scores
+    1.0 on a refusal-correctness scale, not a token-F1 one."""
+    return {
+        "system_id": system, "benchmark": benchmark, "split": "validation",
+        "query_id": qid, "predicted_answer": "x",
+        "retrieval": {"skipped": True},
+        "answer": {"value": value, "method": "unanswerable_rule",
+                   "metadata": {"abstained": abstained}},
+    }
+
+
+class TestNullRowsAreExcludedFromTheSplit(unittest.TestCase):
+    """THE DEFECT THIS FORBIDS, measured on M1 x MultiHop.
+
+    With nulls included the split INVERTED — abstained rows scored 0.303
+    against answered rows at 0.018, 17x the wrong way — purely because
+    301 correct null refusals landed on the abstained side. The printed
+    guidance ("read mean_ans as answer QUALITY") was then false on the
+    one benchmark that has nulls.
+    """
+
+    def setUp(self):
+        self.f = _write([
+            _row("a", 0.0, predicted="No answer available.", abstained=True,
+                 system="M1", benchmark="multihop_rag"),
+            _row("b", 0.0, predicted="I don't know.", abstained=True,
+                 system="M1", benchmark="multihop_rag"),
+            _row("c", 0.4, predicted="answered", abstained=False,
+                 system="M1", benchmark="multihop_rag"),
+            _row("d", 0.2, predicted="answered", abstained=False,
+                 system="M1", benchmark="multihop_rag"),
+            # Correct refusals on nulls — 1.0 each, and poison the split
+            # if they are allowed into it.
+            _null_row("n1", 1.0, abstained=True),
+            _null_row("n2", 1.0, abstained=True),
+            _null_row("n3", 0.0, abstained=False),
+        ])
+        (self.st,) = _aggregate(_iter_records([self.f]))["systems"].values()
+
+    def test_the_split_counts_only_answerable_rows(self):
+        self.assertEqual(self.st["n_answerable_rows"], 4)
+        self.assertEqual(self.st["n_null_rows"], 3)
+        self.assertEqual(self.st["n_abstained"] + self.st["n_answered"],
+                         self.st["n_answerable_rows"])
+
+    def test_correct_null_refusals_do_NOT_inflate_the_abstained_mean(self):
+        """The regression in one assertion: 0.0, not (0+0+1+1)/4."""
+        self.assertAlmostEqual(self.st["ans_score_abstained_mean"], 0.0)
+
+    def test_the_split_is_no_longer_inverted(self):
+        """With nulls in, mean_abs exceeded mean_ans. It must not."""
+        self.assertLess(self.st["ans_score_abstained_mean"],
+                        self.st["ans_score_answered_mean"])
+
+    def test_null_abstentions_are_counted_but_kept_separate(self):
+        self.assertEqual(self.st["n_abstained_null"], 2)
+
+    def test_both_abstention_rates_are_reported_with_their_populations(self):
+        """`abstention_rate` is over ALL rows; the answerable one is over
+        answerable rows. Neither may borrow the other's denominator."""
+        self.assertAlmostEqual(self.st["abstention_rate"], 4 / 7)
+        self.assertAlmostEqual(self.st["abstention_rate_answerable"], 2 / 4)
+
+
+class TestBenchmarksWithoutNullsAreUnaffected(unittest.TestCase):
+    """NarrativeQA has no nulls, so the split is over every row and the
+    numbers must not move."""
+
+    def test_no_null_rows_means_the_split_covers_everything(self):
+        f = _write([
+            _row("a", 0.0, predicted="No answer available.", abstained=True),
+            _row("c", 0.4, predicted="answered", abstained=False),
+        ])
+        (st,) = _aggregate(_iter_records([f]))["systems"].values()
+        self.assertEqual(st["n_null_rows"], 0)
+        self.assertEqual(st["n_answerable_rows"], 2)
+        self.assertAlmostEqual(st["abstention_rate"],
+                               st["abstention_rate_answerable"])
 
 
 if __name__ == "__main__":
