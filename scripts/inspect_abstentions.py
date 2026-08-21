@@ -107,6 +107,17 @@ def inspect(path: Path, n_samples: int = 12) -> dict:
             })
 
     mean = lambda xs: statistics.mean(xs) if xs else None  # noqa: E731
+
+    # CREDITED REFUSALS. A row classified PURE REFUSAL asserts nothing
+    # once its hedge is stripped, so on an answerable question it should
+    # score 0.0 every time. Any positive score means the answer scorer
+    # gave a refusal credit, and the SCORE ALONE identifies why: on
+    # MultiHop the canonical "No answer available." normalises to
+    # ["no", "answer", "available"] and the only gold it overlaps is the
+    # bare token "no", which yields EXACTLY 0.5. No join to the gold is
+    # needed to diagnose it.
+    refusal_scores = buckets[PURE_REFUSAL]
+    credited = [x for x in refusal_scores if x > 0]
     return {
         "n_answerable_rows": n_answerable,
         "n_flagged_abstained": n_flagged,
@@ -114,6 +125,12 @@ def inspect(path: Path, n_samples: int = 12) -> dict:
         "pure_refusal": {
             "n": len(buckets[PURE_REFUSAL]),
             "mean_score": mean(buckets[PURE_REFUSAL]),
+            "n_credited": len(credited),
+            "credited_share": (
+                len(credited) / len(refusal_scores) if refusal_scores else None),
+            "credited_score_mass": sum(credited),
+            "score_histogram": dict(
+                sorted(Counter(round(x, 4) for x in refusal_scores).items())),
         },
         "hedged_content": {
             "n": len(buckets[HEDGED_CONTENT]),

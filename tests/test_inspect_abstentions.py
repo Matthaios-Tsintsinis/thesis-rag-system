@@ -115,5 +115,60 @@ class TestInspectSeparatesTheTwoMeanings(unittest.TestCase):
         self.assertIn("insufficient information", hedges)
 
 
+class TestCreditedRefusalsAreSurfaced(unittest.TestCase):
+    """A PURE REFUSAL asserts nothing, so on an ANSWERABLE question it
+    must score 0.0. Anything above zero means the answer scorer credited
+    a refusal, and that has to be visible rather than averaged in.
+
+    MEASURED on MultiHop: the canonical "No answer available." normalises
+    to ["no", "answer", "available"], and among all 2,255 answerable
+    golds the ONLY one it overlaps is the bare token "no" (561 of them,
+    24.9%), which yields exactly 0.5. So the score alone diagnoses it and
+    no join to the gold is needed.
+    """
+
+    def test_the_canonical_refusal_scores_exactly_half_against_gold_no(self):
+        from src.eval.scorers.extractive import token_f1
+
+        self.assertAlmostEqual(token_f1("No answer available.", "no"), 0.5)
+
+    def test_no_other_short_gold_credits_the_refusal(self):
+        from src.eval.scorers.extractive import token_f1
+
+        for gold in ("yes", "before", "after", "Apple", "Google"):
+            self.assertEqual(token_f1("No answer available.", gold), 0.0, gold)
+
+    def test_credited_refusals_are_counted_and_massed(self):
+        out = inspect(_write([
+            _row("a", "No answer available.", 0.0),
+            _row("b", "No answer available.", 0.5),
+            _row("c", "No answer available.", 0.5),
+            _row("d", "No answer available.", 0.0),
+        ]))
+        pr = out["pure_refusal"]
+        self.assertEqual(pr["n"], 4)
+        self.assertEqual(pr["n_credited"], 2)
+        self.assertAlmostEqual(pr["credited_share"], 0.5)
+        self.assertAlmostEqual(pr["credited_score_mass"], 1.0)
+
+    def test_the_histogram_shows_the_two_populations(self):
+        """Identical strings scoring differently is the signature; a mean
+        alone hides it completely."""
+        out = inspect(_write([
+            _row("a", "No answer available.", 0.0),
+            _row("b", "No answer available.", 0.5),
+        ]))
+        self.assertEqual(out["pure_refusal"]["score_histogram"],
+                         {0.0: 1, 0.5: 1})
+        self.assertAlmostEqual(out["pure_refusal"]["mean_score"], 0.25)
+
+    def test_a_clean_cell_reports_no_credited_refusals(self):
+        out = inspect(_write([
+            _row("a", "No answer available.", 0.0),
+            _row("b", "I don't know.", 0.0),
+        ]))
+        self.assertEqual(out["pure_refusal"]["n_credited"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
