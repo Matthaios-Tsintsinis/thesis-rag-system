@@ -732,10 +732,10 @@ def _print_text(rollup: dict[str, Any], *, by_type: bool) -> None:
     # abstained side. The guidance line below is only true once the null
     # rows are out.
     print("")
-    print("answer score split by abstention  [ANSWERABLE ROWS ONLY]")
-    ab_cols = [("system", 8), ("n_able", 7), ("n_abs", 7), ("mean_abs", 9),
-               ("n_ans", 7), ("mean_ans", 9), ("abs%_able", 10),
-               ("n_null", 7)]
+    print("answer score split by HEDGE MARKER  [ANSWERABLE ROWS ONLY]")
+    ab_cols = [("system", 8), ("n_able", 7), ("n_hedged", 9),
+               ("mean_hedged", 12), ("n_plain", 8), ("mean_plain", 11),
+               ("hedge%_able", 12), ("n_null", 7)]
     ab_header = "  ".join(name.ljust(w) for name, w in ab_cols)
     print(ab_header)
     print("-" * len(ab_header))
@@ -748,17 +748,25 @@ def _print_text(rollup: dict[str, Any], *, by_type: bool) -> None:
         row = [
             (sid, 8),
             (str(st.get("n_answerable_rows", 0)), 7),
-            (str(st.get("n_abstained", 0)), 7),
-            (_fmt(st.get("ans_score_abstained_mean")), 9),
-            (str(st.get("n_answered", 0)), 7),
-            (_fmt(st.get("ans_score_answered_mean")), 9),
-            ("n/a" if rate is None else f"{rate:.1%}", 10),
+            (str(st.get("n_abstained", 0)), 9),
+            (_fmt(st.get("ans_score_abstained_mean")), 12),
+            (str(st.get("n_answered", 0)), 8),
+            (_fmt(st.get("ans_score_answered_mean")), 11),
+            ("n/a" if rate is None else f"{rate:.1%}", 12),
             (str(n_null), 7),
         ]
         print("  ".join(val.ljust(w) for val, w in row))
-    print("  a refusal scores 0.0 against free-form references by "
-          "construction;")
-    print("  read mean_ans, not the overall mean, as answer QUALITY.")
+    print("  `abstained` IS A VOCABULARY MARKER, NOT A REFUSAL RATE.")
+    print("  It records that the prediction OPENED with a hedge clause. A")
+    print("  row can be flagged and still answer correctly -- \"I don't know")
+    print("  the year, but the answer is Tesla\" is flagged AND scores well.")
+    print("  So mean_hedged is the quality of HEDGED answers, not the cost")
+    print("  of refusing, and the two readings differ by benchmark.")
+    print("  Run scripts/inspect_abstentions.py to see which this cell is:")
+    print("  it splits the flagged rows into pure refusals and hedged")
+    print("  answers using the null rule's own machinery.")
+    print("  A refusal scores 0.0 against free-form references by")
+    print("  construction; read mean_plain as unhedged answer QUALITY.")
     if any_null:
         print("  NULL ROWS ARE EXCLUDED from every column except n_null: on a")
         print("  null query a refusal is CORRECT and scores 1.0, so including")
