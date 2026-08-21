@@ -170,5 +170,63 @@ class TestCreditedRefusalsAreSurfaced(unittest.TestCase):
         self.assertEqual(out["pure_refusal"]["n_credited"], 0)
 
 
+class TestTheSupplementaryFigure(unittest.TestCase):
+    """Required beside the primary on every MultiHop cell.
+
+    The primary stays token-F1 exactly as frozen. This is the same rows
+    with the credited-refusal mass removed, computed post-hoc — no scorer
+    change, no freeze violation, no matrix split.
+    """
+
+    def setUp(self):
+        rows = [
+            _row("a", "No answer available.", 0.0),
+            _row("b", "No answer available.", 0.5),
+            _row("c", "No answer available.", 0.5),
+            _row("d", "No answer available.", 0.0),
+        ]
+        rows += [_row(f"e{i}", "Google", 0.1, abstained=False)
+                 for i in range(6)]
+        self.out = inspect(_write(rows))
+
+    def test_the_primary_is_the_plain_answerable_mean(self):
+        """(4 refusals contributing 1.0 + 6 answers contributing 0.6)/10."""
+        self.assertAlmostEqual(self.out["answerable_mean"], 0.16)
+
+    def test_the_supplementary_removes_only_the_credited_mass(self):
+        self.assertAlmostEqual(
+            self.out["answerable_mean_excluding_credited"], 0.06)
+
+    def test_the_credited_share_is_reported(self):
+        self.assertAlmostEqual(
+            self.out["credited_share_of_answerable_mass"], 1.0 / 1.6)
+
+    def test_the_share_depends_on_refusal_rate_so_it_cannot_cancel(self):
+        """The confound in one assertion: two systems with the SAME
+        answers but different refusal rates get different credited
+        shares, so the artifact does not subtract out of a comparison."""
+        few = inspect(_write(
+            [_row("a", "No answer available.", 0.5)]
+            + [_row(f"e{i}", "Google", 0.1, abstained=False)
+               for i in range(6)]))
+        many = inspect(_write(
+            [_row(f"a{i}", "No answer available.", 0.5) for i in range(4)]
+            + [_row(f"e{i}", "Google", 0.1, abstained=False)
+               for i in range(6)]))
+        self.assertNotAlmostEqual(
+            few["credited_share_of_answerable_mass"],
+            many["credited_share_of_answerable_mass"])
+        self.assertGreater(many["credited_share_of_answerable_mass"],
+                           few["credited_share_of_answerable_mass"])
+
+    def test_a_clean_cell_leaves_the_two_figures_equal(self):
+        out = inspect(_write([
+            _row("a", "No answer available.", 0.0),
+            _row("b", "Google", 0.4, abstained=False),
+        ]))
+        self.assertAlmostEqual(out["answerable_mean"],
+                               out["answerable_mean_excluding_credited"])
+
+
 if __name__ == "__main__":
     unittest.main()
