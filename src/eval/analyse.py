@@ -267,6 +267,25 @@ def _non_leaf_summary(bucket: dict) -> dict[str, Any]:
     micro = (non_leaf / total) if total else None
     per_query = bucket["m4_non_leaf_share"]
     lo, hi = PAPER_NON_LEAF_SHARE_BAND
+
+    # TREE-BUILDING POPULATION ONLY — added 2026-08-22 after the gate FAILED
+    # on M4/hotpotqa at 16.4% micro against the 18.5-57.0% band.
+    #
+    # WHY BOTH FIGURES ARE REPORTED AND NEITHER REPLACES THE OTHER. A unit
+    # that fell at or below the stop condition has NO summary nodes by
+    # construction, so it contributes leaves to the denominator and zero to
+    # the numerator. Pooling those units with tree-building ones therefore
+    # measures a MIXTURE, and the paper's band describes RAPTOR trees. If
+    # the tree-building figure lands in band, the all-rows number is a
+    # reporting artifact of mixing two populations. If it is STILL out of
+    # band, that is a real property of RAPTOR on small corpora and belongs
+    # in the discussion -- the split is diagnostic, not an escape hatch,
+    # and it is reported either way so a reader can see which case holds.
+    tb_counts = bucket.get("retrieved_unit_types_treebuilding_agg") or {}
+    tb_total = sum(tb_counts.values())
+    tb_non_leaf = sum(v for k, v in tb_counts.items() if k != "chunk")
+    tb_micro = (tb_non_leaf / tb_total) if tb_total else None
+    tb_per_query = bucket.get("m4_non_leaf_share_treebuilding") or []
     return {
         "micro": micro,
         "macro": statistics.mean(per_query) if per_query else None,
@@ -274,6 +293,18 @@ def _non_leaf_summary(bucket: dict) -> dict[str, Any]:
         "n_non_leaf": non_leaf,
         "in_band": (lo <= micro <= hi) if (micro is not None and non_leaf) else None,
         "band": [lo, hi],
+        "micro_treebuilding": tb_micro,
+        "macro_treebuilding": (
+            statistics.mean(tb_per_query) if tb_per_query else None
+        ),
+        "n_units_treebuilding": tb_total,
+        "n_non_leaf_treebuilding": tb_non_leaf,
+        "n_queries_treebuilding": len(tb_per_query),
+        "in_band_treebuilding": (
+            (lo <= tb_micro <= hi)
+            if (tb_micro is not None and tb_non_leaf)
+            else None
+        ),
         # .get() rather than [] so a partial bucket (a caller checking one
         # field, or a rollup built under an older aggregate shape) reads
         # as "no trips" instead of raising.
@@ -325,6 +356,8 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
             "abstained_null": 0,
             "latency": [],
             "retrieved_unit_types_agg": defaultdict(int),
+            # Same counter restricted to rows whose unit BUILT a tree.
+            "retrieved_unit_types_treebuilding_agg": defaultdict(int),
             "packed_unit_types_agg": defaultdict(int),
             "by_type_chunk_counts": defaultdict(list),
             "by_type_retr_f1": defaultdict(list),
@@ -362,6 +395,9 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
             # per-query list is the finer-grained version, present only
             # on newer rows.
             "m4_non_leaf_share": [],
+            # Per-query shares restricted to tree-building rows, for the
+            # macro figure's counterpart.
+            "m4_non_leaf_share_treebuilding": [],
             "m4_expansion_rows": 0,
             # Flat-index rows: the corpus fell at or below the layer stop
             # condition, so M4 ran as flat dense retrieval. Counted per
@@ -384,8 +420,26 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
         bucket["input_tokens"].append(int(r.get("n_input_tokens", 0)))
         bucket["latency"].append(float(r.get("latency_s", 0.0)))
 
+        # DEGENERACY IS READ HERE, not at the m4_* block below, because the
+        # unit-type accumulation happens in this statement and the
+        # tree-building-only aggregate has to fork at the same point. Read
+        # from the row's own metadata, never recomputed — instance 13 of the
+        # recurring defect was the analyser deriving this flag itself
+        # instead of reading what the scorer recorded.
+        _row_degenerate = bool(
+            (r.get("metadata") or {}).get("m4_tree_degenerate")
+        )
+
         for ut, n in (r.get("retrieved_unit_types") or {}).items():
             bucket["retrieved_unit_types_agg"][ut] += int(n)
+            # SECOND AGGREGATE OVER TREE-BUILDING UNITS ONLY. A degenerate
+            # unit contributes leaves and, by construction, zero summary
+            # nodes, so including it in a micro-average mechanically
+            # depresses the non-leaf share of a population it never had a
+            # tree in. Both figures are reported; neither replaces the
+            # other. See `_non_leaf_summary`.
+            if not _row_degenerate:
+                bucket["retrieved_unit_types_treebuilding_agg"][ut] += int(n)
         for ut, n in (r.get("packed_unit_types") or {}).items():
             bucket["packed_unit_types_agg"][ut] += int(n)
 
@@ -484,6 +538,8 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
         m4_share = md.get("m4_non_leaf_share")
         if m4_share is not None:
             bucket["m4_non_leaf_share"].append(float(m4_share))
+            if not md.get("m4_tree_degenerate"):
+                bucket["m4_non_leaf_share_treebuilding"].append(float(m4_share))
         if md.get("m4_summary_expansion"):
             bucket["m4_expansion_rows"] += 1
         if md.get("m4_tree_degenerate"):
@@ -931,6 +987,43 @@ def _print_text(rollup: dict[str, Any], *, by_type: bool) -> None:
                 f"  {sid}: micro={nl['micro']:.1%} "
                 f"({nl['n_non_leaf']}/{nl['n_units']} units){macro}  {verdict}"
             )
+            # THE SPLIT FIGURE, printed whenever the cell holds BOTH
+            # populations. Degenerate units carry leaves and no summaries,
+            # so an all-rows micro-average of a mixed cell understates the
+            # non-leaf share of the trees that exist. Both lines are
+            # reported; the caption says which population each describes.
+            if nl.get("n_units_treebuilding") and nl.get("degenerate_rows"):
+                tb_verdict = (
+                    "IN BAND" if nl.get("in_band_treebuilding") else "OUT OF BAND"
+                )
+                tb_macro = (
+                    f"  macro={nl['macro_treebuilding']:.1%}"
+                    if nl.get("macro_treebuilding") is not None
+                    else ""
+                )
+                print(
+                    f"  {sid}: micro={nl['micro_treebuilding']:.1%} "
+                    f"({nl['n_non_leaf_treebuilding']}/"
+                    f"{nl['n_units_treebuilding']} units){tb_macro}  "
+                    f"{tb_verdict}   <- TREE-BUILDING UNITS ONLY "
+                    f"({nl['n_queries_treebuilding']} rows; "
+                    f"{nl['degenerate_rows']} degenerate rows excluded)"
+                )
+                if nl.get("in_band_treebuilding") and not nl["in_band"]:
+                    print(
+                        f"  {sid}: the all-rows figure is a REPORTING "
+                        "ARTIFACT of mixing two populations - the trees "
+                        "that exist are in band. Report the tree-building "
+                        "figure and state the mixture."
+                    )
+                elif nl.get("in_band_treebuilding") is False:
+                    print(
+                        f"  {sid}: *** OUT OF BAND ON TREE-BUILDING UNITS "
+                        "TOO - this is NOT a mixing artifact. RAPTOR's node "
+                        "distribution on corpora this small sits outside "
+                        "what the paper observed. FINDING, for the "
+                        "discussion; do not explain it away. ***"
+                    )
             if nl["degenerate_rows"]:
                 # The loudest thing in this report, deliberately. A flat
                 # M4 still retrieves, still answers, and still produces a

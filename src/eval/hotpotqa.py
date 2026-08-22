@@ -36,20 +36,41 @@ VARIANT B — `hotpotqa_pooled` — pooled shards.
 
 # === DEVIATIONS AND LIMITS — thesis footnote ===
 #
-# 0. M4 ON VARIANT A IS A REAL RAPTOR RESULT, with a 3.6% flat tail.
-#    Measured over all 1,000 units: 18,235 leaves, min 2 / p25 15 /
-#    median 18 / p75 21 / max 37. RAPTOR stops when a layer holds
+# 0. M4 ON VARIANT A IS A REAL RAPTOR RESULT, with an 8.3% flat tail.
+#    MEASURED FROM THE BANKED CELL by `analyse` counting
+#    `metadata.m4_tree_degenerate` (2026-08-22); leaf population 17,443,
+#    median 17, max 37. RAPTOR stops when a layer holds
 #    <= reduction_dimension + 1 = 11 nodes, so:
 #
-#      964/1000 units (96.4%) build a 2-layer hierarchy
-#       36/1000 units  (3.6%) fall at or below the threshold and are
+#      917/1000 units (91.7%) build a 2-layer hierarchy
+#       83/1000 units  (8.3%) fall at or below the threshold and are
 #                             scored on flat dense retrieval with M4's
 #                             own components
 #
-#    The results caption states the 3.6%. Reported rather than dropped:
-#    an empty cell in a 5x4 matrix invites the question the label answers
+#    THE EARLIER 964/36 (3.6%) FIGURE IS DEAD — it predates the
+#    single-item-rule corpus layout in `BaseSystem.index_items` and
+#    describes a population this code no longer produces. It must not
+#    appear in the thesis or in any caption.
+#
+#    The results caption states the 8.3%. Reported rather than dropped:
+#    an empty cell in the matrix invites the question the label answers
 #    in place, and RAPTOR's behaviour at corpus sizes near its own stop
 #    condition is a regime the paper never tests.
+#
+# 0b. THE APP. I NON-LEAF GATE FAILS ON THIS CELL, and the failure is
+#    reported rather than resolved. Measured over all 1,000 units:
+#    16.4% micro / 15.6% macro against the paper's 18.5-57.0% band.
+#    The 83 degenerate units contribute leaves and zero summary nodes, so
+#    they mechanically depress a micro-average over a MIXED population,
+#    and `analyse` therefore reports the gate twice — over all rows, and
+#    over the 917 tree-building rows alone. Whichever way the second
+#    figure lands, BOTH are reported and the caption names the population
+#    each describes. If the tree-building figure is in band, the all-rows
+#    number is a reporting artifact of mixing populations; if it is not,
+#    RAPTOR's node distribution on ~18-leaf corpora sits outside what the
+#    paper observed, which is a FINDING for the discussion and not
+#    something to explain away. The split exists to tell those two cases
+#    apart, not to rescue one of them.
 #
 # 1. RESIDUAL COMPARABILITY GAP, even on variant A. Our generator is a
 #    non-fine-tuned Qwen2.5-7B and our retrieval unit is a 100-token
@@ -253,6 +274,24 @@ def hotpot_token_f1(predicted: str, gold: str) -> float:
     person." vs "yes" (gold-side, where the fall-through would have paid
     0.2222). `TestYesNoGuard` in tests/test_hotpotqa.py pins both against
     its own transcription of the reference.
+
+    MEASURED EFFECT ON RUN DATA -- `mean_hedged = 0.000` over 369 rows of
+    banked cell 6 (M4/hotpotqa, 2026-08-22). This is the guard working,
+    observed rather than argued: where the gold is `yes` or `no`, exact
+    match is the only way to score, so a hedged answer collects NOTHING.
+    Not one of 369 hedged rows scored above zero.
+
+    THE CONTRAST IS THE POINT, and it belongs beside this number whenever
+    it is quoted. On MultiHop the same class of answer takes the 0.5
+    credited-refusal payment, because that benchmark's golds include the
+    bare token "no" and the canonical refusal shares exactly one token
+    with it -- and MultiHop's own scorer would pay 1.0. Same harness,
+    same hedge detector, opposite payoffs, and the difference is entirely
+    the presence or absence of an official sentinel guard. It is also why
+    the two answer columns must never be pooled or compared row-for-row.
+    Adopting the guard at `68f6056` was a fidelity fix; 369 rows scoring
+    zero where they would otherwise have earned partial credit is what
+    that fix cost, stated rather than absorbed.
 
     MEASURED REACH on the preregistered sample (seed 20260805, 2026-08-18,
     counted with this module's own normaliser): 61 of 1,000 questions

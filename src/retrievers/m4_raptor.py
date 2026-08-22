@@ -32,60 +32,73 @@ Pipeline, end to end:
 #    option to question ...") is replaced by the harness-wide answer
 #    prompt, whose exact abstention string is load-bearing for the
 #    unanswerable / abstention scorers across every benchmark.
-# 4. MINIMUM CORPUS SIZE — a fraction of HotpotQA-distractor units falls
-#    below it, and THE FRACTION IS PENDING MEASUREMENT. Both figures this
-#    comment has carried are SUPERSEDED (2026-08-22,
-#    docs/FINAL_FIDELITY_AUDIT.md AF-7):
+# 4. MINIMUM CORPUS SIZE — 83 of 1,000 HotpotQA-distractor units (8.3%)
+#    fall below it. MEASURED FROM BANKED CELL 6 by `analyse` counting
+#    `metadata.m4_tree_degenerate` on the rows the cell actually produced
+#    (2026-08-22). So:
 #
-#      SUPERSEDED — 18,235 leaves, 36/1000 (3.6%) degenerate, median 18.
-#        Measured 2026-08-16, but from an inventory that predates the
-#        single-item-rule corpus layout now in `BaseSystem.index_items`.
-#      SUPERSEDED — 17,443 leaves, 83/1000 (8.3%) degenerate, median 17.
-#        Re-derived 2026-08-22 under current code. An ESTIMATE from a
-#        re-run of the chunker, not a reading of the banked cell.
+#      917/1000 (91.7%) build a 2-layer hierarchy
+#       83/1000  (8.3%) fall at or below the 11-leaf stop condition
 #
-#    WHY THE FIRST DRIFTED, since the cause is what localises it: the
-#    same re-derivation reproduced MultiHop's leaf population EXACTLY
-#    (16,523, matching the banked cell) while HotpotQA moved. A
-#    benchmark-specific change is therefore implicated rather than a
-#    chunker change, and the layout promotion is exactly that — its own
-#    docstring in retrievers/base.py says it "changes HotpotQA".
+#    THE OLD 3.6% (36/1000) FIGURE IS DEAD. Not superseded pending
+#    something — dead. It was computed on 2026-08-16 from an inventory
+#    that predates the single-item-rule corpus layout now in
+#    `BaseSystem.index_items`, so it describes a population this code no
+#    longer produces. It must not appear anywhere.
 #
-#    THE AUTHORITATIVE NUMBER IS `analyse` OVER BANKED CELL 6, which
-#    counts `metadata.m4_tree_degenerate` on rows the cell actually
-#    produced. Neither superseded figure may appear in the thesis, and
-#    caption 3 cites the measured count. Update this block and the
-#    runner's --benchmark help text when it lands.
+#    HOW THE DRIFT WAS LOCALISED, kept because the method is the useful
+#    part: a re-derivation under current code reproduced MultiHop's leaf
+#    population EXACTLY (16,523, matching its banked cell) while HotpotQA
+#    moved to 17,443 leaves / 83 degenerate. A benchmark-specific change
+#    was therefore implicated rather than a chunker change — and the
+#    layout promotion is exactly that, its own docstring in
+#    retrievers/base.py saying it "changes HotpotQA". The re-derivation's
+#    83 then matched the banked count exactly, which is what makes the
+#    diagnosis more than a coincidence.
+#
+#    `analyse` over a banked cell stays the authority for any cell that
+#    has run; `scripts/measure_chunk_population.py` estimates one that
+#    has not. Never quote the estimate for a cell that has run.
 #
 #    RAPTOR stops when a layer holds `<= reduction_dimension + 1` = 11
 #    nodes, checked BEFORE the first clustering pass. So the cell is
-#    OVERWHELMINGLY A REAL RAPTOR RESULT — and that conclusion does NOT
-#    depend on which figure above is right: the great majority of units
-#    build layer 1 (the largest, 37 leaves, gives layer_sizes {0:15, 1:3}
-#    at 15 leaves and scales from there), while the tail yields layer 0
-#    only — no UMAP, no GMM, no summaries — and is scored on flat dense
-#    retrieval with M4's OWN components (mpnet, 100-token chunks,
-#    2,000-token budget), which is NOT M2, whose embedder, chunker and
-#    context budget all differ.
+#    OVERWHELMINGLY A REAL RAPTOR RESULT: 917 units build layer 1 (the
+#    largest, 37 leaves, gives layer_sizes {0:15, 1:3} at 15 leaves and
+#    scales from there), while 83 yield layer 0 only — no UMAP, no GMM,
+#    no summaries — and are scored on flat dense retrieval with M4's OWN
+#    components (mpnet, 100-token chunks, 2,000-token budget), which is
+#    NOT M2, whose embedder, chunker and context budget all differ.
 #
-#    State the MEASURED fraction rather than characterising the cell as
-#    "mixed": the tail is small either way and naming it as a mix
-#    overstates it. `analyse` reports the per-cell degenerate-row count
-#    at run time and the results caption carries that number.
+#    State the 8.3% rather than characterising the cell as "mixed": the
+#    tail is small and naming it as a mix overstates it. `analyse`
+#    reports the per-cell degenerate-row count at run time and the
+#    results caption carries that number.
+#
+#    THE 83 ALSO MATTER FOR THE APP. I GATE, which FAILED on this cell at
+#    16.4% micro / 15.6% macro against the paper's 18.5-57.0%. A
+#    degenerate unit contributes leaves and zero summaries, so it
+#    mechanically depresses a micro-average over a mixed population.
+#    `analyse` therefore reports the gate BOTH over all rows and over
+#    tree-building rows only, and the caption states which population
+#    each figure describes. The split is a diagnostic, not an excuse: if
+#    the 917-unit figure is still out of band, that is a real property of
+#    RAPTOR on ~18-leaf corpora and belongs in the discussion.
 #
 #    The paper never tests this regime — RAPTOR's own corpora are far
 #    above the threshold — so the small-corpus tail is a measured
 #    property of the method, reportable as such.
-# 4. Summarisation temperature is 0.0; the reference leaves it unset
+# 5. Summarisation temperature is 0.0; the reference leaves it unset
 #    (=1.0). Infrastructure contract: a cache key must determine the
 #    artifact it names. Consequence recorded — the reference's own trees
 #    are not reproducible run to run.
-# 5. UMAP is seeded and the re-cluster recursion is depth-guarded; the
-#    reference does neither. See the micro-divergence block in
-#    src/raptor_paper.py for all four, with reasoning.
-# 6. Chunk terminators are restored rather than discarded. See ruling 1
-#    and its newline sub-ruling in src/raptor_paper.py.
-# 7. NO SPARSE RETRIEVAL. The paper's collapsed retrieval is dense cosine
+# 6. UMAP is seeded and the re-cluster recursion is depth-guarded; the
+#    reference does neither. See the numbered micro-divergence block in
+#    src/raptor_paper.py for all SEVEN, with reasoning.
+# 7. Chunk terminators are restored rather than discarded (ruling 1 and
+#    its newline sub-ruling), and the pieces of an over-long sentence
+#    are placed in DOCUMENT ORDER rather than the reference's order
+#    (ruling 1b). Both in src/raptor_paper.py.
+# 8. NO SPARSE RETRIEVAL. The paper's collapsed retrieval is dense cosine
 #    only, so this rebuild drops the BM25 index and the opt-in
 #    dense+BM25 RRF first stage that the previous M4 carried. Both
 #    existed because M4 used to SHARE a substrate with M7, which needs
@@ -94,7 +107,7 @@ Pipeline, end to end:
 #    reason. rrf_k / first_stage_top_k remain on M4Config only so that
 #    existing callers construct.
 #
-# 8. Retrieval budget RESTORED (professor-approved 2026-08-02), M4 ONLY.
+# 9. Retrieval budget RESTORED (professor-approved 2026-08-02), M4 ONLY.
 #    The paper fills a 2,000-token context budget (~top-20 nodes)
 #    rather than taking a fixed top-k. M1/M2/M3/M9 stay at natural
 #    top-15 — their papers specify no budget, so moving them would be a
@@ -113,9 +126,12 @@ Pipeline, end to end:
 # descendants' atoms would inflate recall while collapsing precision, and
 # would destroy MultiHop's document ranking outright. The consequence is
 # real and must be reported: M4's retrieval-F1 is NOT directly comparable
-# to systems that return only leaf chunks, because 18.5-57% of its
-# retrieved units (paper App. I) are unscoreable by construction. The
-# leaf-expanded diagnostic twin exists to quantify exactly that gap.
+# to systems that return only leaf chunks, because its summary units are
+# unscoreable by construction. The PAPER's band for that share is 18.5-57%
+# (App. I); our MEASURED share is per-cell and is reported by `analyse`
+# (NarrativeQA 25.5% micro, in band; HotpotQA-distractor 16.4% over all
+# rows, below band, with the tree-building-only figure reported beside
+# it). The leaf-expanded diagnostic twin exists to quantify the gap.
 
 Cache: M4 owns `cache/M4_RAPTOR/<key>/`, its own namespace. It no longer
 shares the RAPTOR/ namespace with the frozen M7 — the tree schema, the
