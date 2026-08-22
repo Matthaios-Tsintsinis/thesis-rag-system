@@ -1498,10 +1498,28 @@ def _topology_env_id() -> str:
     unrelated test-only dependency moved, which is invalidation without
     a reason. A missing package resolves to "absent" rather than raising:
     this runs at import time on hosts that never build a tree.
+
+    THE INTERPRETER IS NAMED TOO, added 2026-08-19 after it drifted
+    unguarded. Cells 1-5 built under CPython 3.12.13 and cell 6 under
+    3.13.15 with every package version identical, so the lockfile hash
+    was unchanged, the pin reported OK, and both trees shared a cache
+    key. **Identical package versions are not identical package code**:
+    cp312 and cp313 ship different compiled wheels for numpy, numba and
+    llvmlite, and UMAP's JIT paths are where a last-digit float move can
+    flip a GMM argmax on a near-tie.
+
+    Only MAJOR.MINOR is keyed. A patch bump (3.12.13 -> 3.12.14) does
+    not change the ABI or the wheel tag, so keying the patch would force
+    cold rebuilds for a change that cannot move topology — invalidation
+    without a reason, the same argument that keeps this to three
+    packages. The full version including the patch is still CHECKED by
+    `pin_environment` and recorded per cell; it is the KEY that is
+    coarser, deliberately.
     """
+    import sys
     from importlib.metadata import PackageNotFoundError, version
 
-    parts = []
+    parts = [f"python={sys.version_info.major}.{sys.version_info.minor}"]
     for pkg in ("umap-learn", "scikit-learn", "numpy"):
         try:
             parts.append(f"{pkg}={version(pkg)}")

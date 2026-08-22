@@ -122,6 +122,31 @@ def write_lockfile(out: Path) -> int:
     return 0
 
 
+def locked_python(text: str) -> str | None:
+    """The interpreter version `write_lockfile` recorded, or None.
+
+    IT WAS ALWAYS IN THE FILE. `write_lockfile` has always emitted
+    `# python=3.12.13`, and NOTHING EVER READ IT: `lockfile_hash` strips
+    comments by design (so a comment cannot read as an environment
+    change) and `check_lockfile` skipped every line starting with `#`.
+    A value that was written correctly and consumed by nothing — the
+    fourteenth instance of this project's recurring defect, and the one
+    that let cells 1-5 run on CPython 3.12.13 and cell 6 on 3.13.15 with
+    the pin reporting OK both times.
+
+    Parsed from the comment RATHER THAN promoted to a requirement line,
+    deliberately: a `python==3.12.13` line would enter `lockfile_hash`
+    and move it off `17878bc8740173be`, firing the environment gate on
+    every remaining cell and orphaning the hash recorded in six banked
+    summaries. The data is already on disk; only the reader was missing.
+    """
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("#") and "python=" in line:
+            return line.split("python=", 1)[1].strip() or None
+    return None
+
+
 def check_lockfile(lockfile: Path) -> int:
     text = lockfile.read_text(encoding="utf-8")
     installed = _installed()
@@ -139,7 +164,27 @@ def check_lockfile(lockfile: Path) -> int:
         elif have != want:
             mismatches.append(f"{pkg}: locked {want}, installed {have}")
 
+    # THE INTERPRETER IS A PINNED INPUT. Identical package VERSIONS do
+    # not mean identical package CODE: cp312 and cp313 install different
+    # compiled wheels for numpy, numba, llvmlite and torch, and UMAP's
+    # JIT-compiled paths are exactly where a float can move in its last
+    # digits and flip a GMM argmax on a near-tie. Counted with the
+    # packages so `checked N pinned` is honest about what was checked.
+    want_py = locked_python(text)
+    have_py = sys.version.split()[0]
+    if want_py is None:
+        print("[pin] WARN: this lockfile predates the python check and "
+              "records no interpreter; regenerate it to gain the guard")
+    else:
+        checked += 1
+        if have_py != want_py:
+            mismatches.append(
+                f"python: locked {want_py}, running {have_py} "
+                "(different compiled wheels; M4 topology is not claimed "
+                "to reproduce across interpreters)")
+
     print(f"[pin] lockfile_hash={lockfile_hash(text)}")
+    print(f"[pin] python={have_py} (locked {want_py or 'UNRECORDED'})")
     print(f"[pin] gpu={gpu_model()}")
     print(f"[pin] checked {checked} pinned package(s)")
     if mismatches:
