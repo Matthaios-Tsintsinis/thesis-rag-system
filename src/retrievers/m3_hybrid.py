@@ -160,7 +160,14 @@ class HybridRRFSystem(BaseSystem):
         # lexical overlap) from the sparse list before fusion. Benign — such
         # a doc sits at the bottom of the top-K list and contributes only
         # ~1/(rrf_k+rank) to fusion; arguably more correct (a doc sharing no
-        # query terms earns no sparse credit). Applied uniformly in M3/M4/M7.
+        # query terms earns no sparse credit).
+        #
+        # SCOPE, corrected 2026-08-22 (docs/FINAL_FIDELITY_AUDIT.md AF-4).
+        # This previously read "Applied uniformly in M3/M4/M7", which has
+        # been false since the 2026-07-29 M4 paper rebuild: RAPTOR's
+        # collapsed retrieval is dense-only, so M4 has no BM25 leg and no
+        # sparse list for this filter to apply to (M4 deviation 7). The
+        # filter lives in M3 and M7 only.
         sparse_ranking = [i for i in order.tolist() if bm25_scores[i] > 0]
 
         fused = rrf_fuse([dense_ranking, sparse_ranking], k=cfg.rrf_k)[:k]

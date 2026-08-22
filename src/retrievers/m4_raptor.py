@@ -32,26 +32,46 @@ Pipeline, end to end:
 #    option to question ...") is replaced by the harness-wide answer
 #    prompt, whose exact abstention string is load-bearing for the
 #    unanswerable / abstention scorers across every benchmark.
-# 4. MINIMUM CORPUS SIZE — 3.6% of HotpotQA-distractor units fall below
-#    it. MEASURED over all 1,000 units (2026-08-16):
+# 4. MINIMUM CORPUS SIZE — a fraction of HotpotQA-distractor units falls
+#    below it, and THE FRACTION IS PENDING MEASUREMENT. Both figures this
+#    comment has carried are SUPERSEDED (2026-08-22,
+#    docs/FINAL_FIDELITY_AUDIT.md AF-7):
 #
-#      18,235 leaves total; min 2, p25 15, median 18, p75 21, max 37
-#      964/1000 units build a 2-layer hierarchy
-#       36/1000 (3.6%) fall at or below the 11-leaf stop threshold
+#      SUPERSEDED — 18,235 leaves, 36/1000 (3.6%) degenerate, median 18.
+#        Measured 2026-08-16, but from an inventory that predates the
+#        single-item-rule corpus layout now in `BaseSystem.index_items`.
+#      SUPERSEDED — 17,443 leaves, 83/1000 (8.3%) degenerate, median 17.
+#        Re-derived 2026-08-22 under current code. An ESTIMATE from a
+#        re-run of the chunker, not a reading of the banked cell.
+#
+#    WHY THE FIRST DRIFTED, since the cause is what localises it: the
+#    same re-derivation reproduced MultiHop's leaf population EXACTLY
+#    (16,523, matching the banked cell) while HotpotQA moved. A
+#    benchmark-specific change is therefore implicated rather than a
+#    chunker change, and the layout promotion is exactly that — its own
+#    docstring in retrievers/base.py says it "changes HotpotQA".
+#
+#    THE AUTHORITATIVE NUMBER IS `analyse` OVER BANKED CELL 6, which
+#    counts `metadata.m4_tree_degenerate` on rows the cell actually
+#    produced. Neither superseded figure may appear in the thesis, and
+#    caption 3 cites the measured count. Update this block and the
+#    runner's --benchmark help text when it lands.
 #
 #    RAPTOR stops when a layer holds `<= reduction_dimension + 1` = 11
 #    nodes, checked BEFORE the first clustering pass. So the cell is
-#    OVERWHELMINGLY A REAL RAPTOR RESULT: 964 units build layer 1 (the
-#    largest, 37 leaves, gives layer_sizes {0:15, 1:3} at 15 leaves and
-#    scales from there), while 36 units yield layer 0 only — no UMAP, no
-#    GMM, no summaries — and are scored on flat dense retrieval with M4's
-#    OWN components (mpnet, 100-token chunks, 2,000-token budget), which
-#    is NOT M2, whose embedder, chunker and context budget all differ.
+#    OVERWHELMINGLY A REAL RAPTOR RESULT — and that conclusion does NOT
+#    depend on which figure above is right: the great majority of units
+#    build layer 1 (the largest, 37 leaves, gives layer_sizes {0:15, 1:3}
+#    at 15 leaves and scales from there), while the tail yields layer 0
+#    only — no UMAP, no GMM, no summaries — and is scored on flat dense
+#    retrieval with M4's OWN components (mpnet, 100-token chunks,
+#    2,000-token budget), which is NOT M2, whose embedder, chunker and
+#    context budget all differ.
 #
-#    State the 3.6% rather than characterising the cell as "mixed": the
-#    tail is small and naming it as a mix overstates it. `analyse` reports
-#    the per-cell degenerate-row count at run time and the results caption
-#    carries the fraction.
+#    State the MEASURED fraction rather than characterising the cell as
+#    "mixed": the tail is small either way and naming it as a mix
+#    overstates it. `analyse` reports the per-cell degenerate-row count
+#    at run time and the results caption carries that number.
 #
 #    The paper never tests this regime — RAPTOR's own corpora are far
 #    above the threshold — so the small-corpus tail is a measured

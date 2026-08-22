@@ -32,11 +32,15 @@ the shared harness chunker at this commit, so NO cache key moves.
 #   - over-long sentence: sub-split on , ; : and, if a
 #     sub-phrase is still over budget, emit it oversized
 #     (the 100-token bound is SOFT, not a hard truncation) -> FOLLOWED
+#   - PLACEMENT of those over-long-sentence pieces         -> DIVERGED, see below
 #   - delimiter handling                                   -> DIVERGED, see below
 #
-# DIVERGENCE FROM REFERENCE CODE, ALIGNMENT WITH PAPER TEXT
-# (ruled 2026-07-29; the single place this module knowingly departs
-# from the reference implementation):
+# DIVERGENCES FROM REFERENCE CODE, ALIGNMENT WITH PAPER TEXT
+# (ruling 1 dated 2026-07-29; ruling 1b added 2026-08-22 by the final
+# fidelity audit, which found the second one. Both depart from the
+# reference implementation in the SAME direction: toward the paper's
+# stated behaviour and away from an artifact of the reference's regex
+# and control flow.):
 #
 #   The reference does `re.split("|".join(map(re.escape, [".", "!",
 #   "?", "\\n"])), text)`. `re.split` on a pattern with NO capturing
@@ -80,6 +84,44 @@ the shared harness chunker at this commit, so NO cache key moves.
 #   100-token chunks hold roughly 1-3% less prose than the reference's
 #   would. This is a direct and unavoidable consequence of ruling 1 and
 #   is recorded rather than corrected.
+#
+#   RULING 1b — OVER-LONG-SENTENCE PLACEMENT (added 2026-08-22, found by
+#   the final fidelity audit; see docs/FINAL_FIDELITY_AUDIT.md AF-2).
+#
+#   The reference SUB-SPLITS an over-long sentence the way we do, but it
+#   PLACES the resulting pieces differently, and the difference is
+#   structural rather than cosmetic. `split_text` appends them straight
+#   to `chunks` from inside the `token_count > max_tokens` branch, while
+#   `current_chunk` — holding the sentences that PRECEDE the long one —
+#   keeps accumulating and is flushed later. Two consequences follow,
+#   both verified against a verbatim transcription of the reference:
+#     (a) the long sentence's pieces are emitted BEFORE the chunk holding
+#         the text that came before them, so the chunk list is NOT in
+#         document order;
+#     (b) the sentences flanking the long one are packed TOGETHER, across
+#         it, as though the long sentence were not between them.
+#   Ours routes every piece through one packer in document order, so a
+#   sub-phrase may share a chunk with an ordinary neighbouring sentence
+#   and the output stays ordered.
+#
+#   WE FOLLOW THE PAPER. It describes "short, contiguous texts" and says
+#   only that an over-long sentence moves to the next chunk; nothing in
+#   it asks for reordering, and reordered chunks are contiguous in
+#   neither sense. As with ruling 1, the reference behaviour reads as an
+#   artifact of its control flow — an append inside a branch — rather
+#   than a design decision: there is no comment, no test and no consumer
+#   that wants document-order-scrambled chunks.
+#
+#   INCIDENCE, measured on the real corpora (2026-08-22, through the
+#   pipeline's own layout and chunker) — this fires only where a single
+#   sentence exceeds the 100-token budget:
+#     MultiHop-RAG           45 of 70,455 sentences  (0.064%)
+#     HotpotQA-distractor   137 of 46,855 sentences  (0.292%, 107/1000 units)
+#     HotpotQA-pooled       137 of 46,720 sentences  (0.293%)
+#     NarrativeQA           PENDING — run-host measurement (the audit host
+#                           has no complete local copy of the dataset)
+#   Uniform across all four M4 cells, and M4 is the only system using this
+#   chunker, so no cross-system asymmetry arises.
 #
 # CACHE DISCIPLINE. The 100-token size is carried on the EXISTING
 # `ChunkingConfig.chunk_words` field (read as TOKENS under
@@ -400,6 +442,30 @@ def split_text_raptor(
 #      `gmm_final_fit_failures` counts downward steps in the final fit.
 #      Non-zero is a FINDING to report, not noise: it means the BIC
 #      search was run over a reduced candidate set.
+#
+# (vi) DUPLICATE-EMBEDDING MEMBERSHIP. Added 2026-08-22 by the final
+#      fidelity audit (docs/FINAL_FIDELITY_AUDIT.md AF-3). The reference
+#      recovers local-cluster membership by VALUE matching --
+#      `np.where((embeddings == local_cluster_embeddings_[:, None]).all(-1))`
+#      -- so two nodes whose texts are BYTE-IDENTICAL have identical
+#      embeddings and each receives the UNION of the other's cluster
+#      labels. Ours tracks membership by INDEX, so duplicates keep their
+#      own labels. Observable only where a unit holds byte-identical
+#      chunk texts; measured incidence 2026-08-22: MultiHop 73/16,523
+#      chunks (0.44%), HotpotQA-distractor 21/17,443 (0.12%), pooled
+#      21/17,396 (0.12%). The reference's form is also O(n^2) in the layer
+#      size. Recorded as a divergence rather than adopted: label-union for
+#      coincidentally identical text is an artifact of the lookup
+#      strategy, not a stated behaviour.
+#
+#(vii) SMALL-n ENTRY GUARD in `_two_stage_labels`. Added to this list
+#      2026-08-22 (AF-6); the guard itself predates it. `n <= dim + 1`
+#      returns a single cluster before any UMAP call. The reference's
+#      MODULE-level `perform_clustering` has no such check and would
+#      raise inside UMAP for tiny n; it is unreachable at the reference's
+#      own defaults only because the builder's stop condition fires
+#      first. Impossibility class, same as (iv) and (v). Reachable here
+#      only via recursion on a tiny oversized cluster.
 #
 # The reference's SEED INCONSISTENCY is reproduced exactly, not fixed:
 # `random_state=224` for the BIC search, `random_state=0` for the final

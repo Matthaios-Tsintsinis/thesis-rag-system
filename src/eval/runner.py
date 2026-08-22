@@ -381,11 +381,15 @@ def main() -> None:
         choices=sorted(BENCHMARK_REGISTRY),
         help="Benchmark id. hotpotqa = standard distractor, one corpus per "
         "question. M4 there is a REAL RAPTOR result with a small flat "
-        "tail, MEASURED over all 1,000 units: 964 (96.4%) build a 2-layer "
-        "hierarchy, 36 (3.6%) fall at or below RAPTOR's own stop "
-        "condition (<= reduction_dimension + 1 = 11 leaves) and are "
-        "scored on flat dense retrieval. Leaves: min 2 / median 18 / "
-        "max 37. analyse reports the degenerate count per cell. "
+        "tail: most units build a 2-layer hierarchy, while a minority "
+        "falls at or below RAPTOR's own stop condition "
+        "(<= reduction_dimension + 1 = 11 leaves) and is scored on flat "
+        "dense retrieval. THE SIZE OF THAT TAIL IS PENDING MEASUREMENT: "
+        "the earlier 36/1000 (3.6%) figure predates the single-item-rule "
+        "corpus layout and a 2026-08-22 re-derivation estimates 83/1000 "
+        "(8.3%); BOTH ARE SUPERSEDED and analyse over the banked cell is "
+        "authoritative (see m4_raptor.py deviation 4). analyse reports "
+        "the degenerate count per cell. "
         "hotpotqa_pooled = shards of 100 questions (a real tree, but NOT "
         "comparable to published HotpotQA).",
     )

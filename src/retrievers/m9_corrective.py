@@ -10,7 +10,7 @@ cost). Pipeline:
              max >= tau_high  -> CORRECT    (trust the pool)
              max <  tau_low   -> INCORRECT  (pool failed; replace)
              otherwise        -> AMBIGUOUS  (mixed; augment)
-        -> INCORRECT: one gpt-4o-mini query rewrite (temperature 0)
+        -> INCORRECT: one SHARED-GENERATOR query rewrite (temperature 0)
            re-runs the SAME M3 retriever; new pool REPLACES the old.
            AMBIGUOUS: rewrite + re-retrieve, union with the original
            pool (deduped by chunk_id), rerank the union.
@@ -56,7 +56,7 @@ m9_n_strips_kept / m9_n_strips_total.
 # 2. Corrective action. The paper falls back to WEB SEARCH (external
 #    knowledge) when retrieval is judged Incorrect/Ambiguous. Our
 #    benchmarks are closed-corpus, so the corrective action is
-#    corpus-internal re-retrieval: a gpt-4o-mini query rewrite
+#    corpus-internal re-retrieval: a shared-generator query rewrite
 #    (keyword-style, temperature 0) re-runs the same hybrid retriever.
 #    The rewrite itself is paper-faithful — the paper uses ChatGPT
 #    keyword extraction to form its web queries — and does NOT conflict
@@ -68,8 +68,17 @@ m9_n_strips_kept / m9_n_strips_total.
 #    measure exactly this. The rewrite introduces mild retrieval
 #    nondeterminism (temperature 0); same smoke-test tolerance as M7.
 #
-# 3. Generator. Shared gpt-4o-mini final generator (professor-locked,
-#    harness-level), not the paper's generators.
+# 3. Generator. The shared harness final generator (harness-level, held
+#    constant across every system), not the paper's generators.
+#
+# MODEL NOTE, corrected 2026-08-22 (docs/FINAL_FIDELITY_AUDIT.md AF-8).
+# This block named gpt-4o-mini in three places for the rewrite call and
+# the final generator. That has been stale since 2026-08-02: gpt-4o-mini
+# is removed from the project entirely and the rewrite resolves
+# `self.config.generation` — the same local model every other system
+# reads (Qwen2.5-7B-Instruct today, whatever `--generator` sets
+# otherwise). Cosmetic only; M9 is WITHDRAWN (PREREGISTRATION
+# ADDENDUM 6) and no M9 cell is produced or reported.
 #
 # 4. Base retriever. The paper layers its corrective loop over a
 #    Contriever-class dense retriever (Self-RAG setup, Wikipedia); this
@@ -301,7 +310,7 @@ class CorrectiveRAGSystem(BaseSystem):
     # --- corrective retrieval -------------------------------------------------
 
     def _rewrite_query(self, query: str) -> str | None:
-        """One gpt-4o-mini rewrite call via the shared generate() router.
+        """One rewrite call via the shared generate() router.
 
         Returns the rewritten query, or None on failure / empty output
         (callers fall back to the original pool — a rewrite failure

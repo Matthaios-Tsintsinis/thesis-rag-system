@@ -229,9 +229,30 @@ def hotpot_token_f1(predicted: str, gold: str) -> float:
     free-form and where a prediction of 'no' against a real answer is an
     ordinary wrong answer rather than a sentinel mismatch.
 
-    DIRECTION, and it is one-way: the guard can only ever ZERO a score
-    the fall-through would have granted. It cannot raise one. So this
-    can lower a HotpotQA answer column and can never inflate it.
+    BOTH OFFICIAL BRANCHES ARE IMPLEMENTED. The guard fires when EITHER
+    side is a sentinel and the two differ -- a sentinel PREDICTION
+    against a real gold, and a sentinel GOLD against a non-matching
+    prediction. `hotpot_token_f1_prf` expresses the reference's two
+    early returns as one equivalent condition,
+    `np_ != ng_ and (np_ in _HOTPOT_SENTINELS or ng_ in _HOTPOT_SENTINELS)`,
+    which is the same predicate the reference reaches in two statements.
+
+    DIRECTION OF EFFECT, and it is one-way -- WHICH IS NOT THE SAME AS
+    ONE-SIDED, and the phrasing matters because "one-way" read as
+    "one branch" would describe a defect this code does not have. The
+    guard is two-sided in its CONDITION and one-way in its EFFECT: it
+    can only ever ZERO a score the fall-through would have granted, and
+    can never raise one. So it can lower a HotpotQA answer column and
+    can never inflate it.
+
+    VERIFIED, not asserted (2026-08-22, docs/SCORER_COMPARISON.md): a
+    three-way battery -- a freshly transcribed `hotpot_evaluate_v1.f1_score`,
+    this function, and hand-computed values -- agrees 12/12 to 1e-9, and
+    the battery includes one case per branch: "no" vs "November 2016"
+    (prediction-side) and "Yes, both films were directed by the same
+    person." vs "yes" (gold-side, where the fall-through would have paid
+    0.2222). `TestYesNoGuard` in tests/test_hotpotqa.py pins both against
+    its own transcription of the reference.
 
     MEASURED REACH on the preregistered sample (seed 20260805, 2026-08-18,
     counted with this module's own normaliser): 61 of 1,000 questions
