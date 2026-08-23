@@ -28,8 +28,9 @@ one's provenance. Two selectors, combinable:
                            old HotpotQA era records env=None).
   --from-summary PATH      reads the banked cell's `.summary.json` and keeps
                            only manifests whose `created_at` falls inside
-                           that cell's RUN WINDOW - [timestamp - elapsed_s -
-                           30 min, timestamp + 30 min]. This is the
+                           that cell's RUN WINDOW - [timestamp - 30 min,
+                           timestamp + elapsed_s + 30 min]; the summary
+                           timestamp marks the run's START. This is the
                            discriminator where probe builds share the cell's
                            env string (NarrativeQA: five probe builds plus
                            the banked one under identical stacks). The
@@ -134,10 +135,25 @@ def _stats_of(m: dict) -> dict | None:
 
 
 def _run_window(summary_path: Path, slack_s: int = 1800):
-    """[start - slack, end + slack] of the banked cell run, from its
-    summary. The summary `timestamp` is stamped at write time (the END of
-    the run) and `elapsed_s` is the run wall clock, so start = end -
-    elapsed_s."""
+    """[start - slack, start + elapsed + slack] of the banked cell run.
+
+    THE TIMESTAMP MARKS THE RUN'S START, NOT ITS END. `runner.py` captures
+    `stamp` at entry (line ~604, for output-file naming) -- roughly 150
+    lines before the run loop's own clock starts -- and only WRITES it
+    into the summary at the end. The first version of this function read
+    "written at the end" as "marks the end" and subtracted `elapsed_s`,
+    shifting the window one run-length too early. Caught on real data:
+    cell 2's manifests (created 23:13-23:37 UTC) matched a window whose
+    parsed timestamp was 23:09 -- four minutes BEFORE the first manifest,
+    impossible for an end-stamp on a three-hour run. So:
+
+        start  = parse(timestamp)
+        end    = start + elapsed_s
+        window = [start - slack, end + slack]
+
+    Timestamps: the stamp is the runner host's local time and manifests
+    are UTC; on the Colab run host local time IS UTC, and this script is
+    run-host-only for exactly that class of reason."""
     from datetime import datetime, timedelta, timezone
 
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
@@ -148,10 +164,10 @@ def _run_window(summary_path: Path, slack_s: int = 1800):
             f"[cpp] {summary_path} lacks timestamp/elapsed_s -- cannot "
             "derive a run window; fall back to --pick-env"
         )
-    end = datetime.strptime(str(stamp), "%Y%m%d-%H%M%S").replace(
+    start = datetime.strptime(str(stamp), "%Y%m%d-%H%M%S").replace(
         tzinfo=timezone.utc
     )
-    start = end - timedelta(seconds=float(elapsed))
+    end = start + timedelta(seconds=float(elapsed))
     pad = timedelta(seconds=slack_s)
     return (start - pad, end + pad)
 
