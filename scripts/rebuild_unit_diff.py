@@ -14,11 +14,18 @@ CPython 3.12.13 and its tree shape is diffed against the banked manifest:
   DIFFERENT -> cell 6 RE-RUNS under 3.12.13 (~2.67 h, one session).
 
 GUARDS, because a comparison that cannot fail for the right reason has not
-passed:
+passed. The FIRST one is the root refusal; the other four are downstream
+of it:
 
-  * REFUSES to run unless the ACTIVE interpreter equals the lockfile's
-    `# python=` line exactly. A rebuild under 3.13 would diff a tree
-    against itself and prove nothing.
+  * REFUSES to run unless the WHOLE locked environment checks out — the
+    full `check_lockfile`, all pinned packages AND the `# python=` line,
+    before any dataset or model import. The script's entire purpose is
+    proving a tree reproduces under the locked stack, so a rebuild in a
+    drifted environment proves nothing about the interpreter question.
+    Earned, not hypothetical: the first run printed "interpreter 3.12.13
+    == locked", indexed 1,206 manifests, and then died on
+    `ModuleNotFoundError: datasets` — an interpreter-only check had
+    approved an environment that was missing half the stack.
   * REFUSES to run unless THESIS_CACHE_DIR points somewhere OTHER than the
     baseline cache root — the rebuild must never write into, or warm-hit
     from, the banked namespace.
@@ -26,6 +33,8 @@ passed:
     package tokens must equal the current stack's (python tokens excluded
     — the interpreter is the variable under test; banked cell-6 manifests
     predate the python token anyway).
+  * REFUSES a cache HIT on the throwaway dir — a hit means nothing was
+    rebuilt and the run proves nothing.
   * The unit is matched by corpus_hash, never by cache path — the
     substrate key moved at e907d68 by design.
 
@@ -81,26 +90,30 @@ def _env_package_tokens(env: str | None) -> tuple[str, ...]:
     return tuple(sorted(t for t in toks if not t.startswith("python=")))
 
 
-def _assert_locked_interpreter(lockfile: Path) -> str:
-    from scripts.pin_environment import locked_python
+def _assert_locked_environment(lockfile: Path) -> str:
+    """The root refusal: the FULL pin check, not the interpreter alone.
+
+    `check_lockfile` covers every pinned package (ABSENT counts as a
+    mismatch) plus the `# python=` line, and prints its own mismatch
+    list. An interpreter-only check once approved an environment missing
+    `datasets` entirely; the crash arrived after 1,206 manifests were
+    indexed, as a ModuleNotFoundError instead of a refusal."""
+    from scripts.pin_environment import check_lockfile
 
     if not lockfile.exists():
         raise SystemExit(
             f"[rebuild] no lockfile at {lockfile} — the rebuild is only "
-            "meaningful against the locked interpreter; copy "
+            "meaningful against the locked environment; copy "
             "requirements.lock from Drive first"
         )
-    want = locked_python(lockfile.read_text(encoding="utf-8"))
-    have = sys.version.split()[0]
-    if want is None:
-        raise SystemExit("[rebuild] lockfile records no interpreter")
-    if have != want:
+    if check_lockfile(lockfile) != 0:
         raise SystemExit(
-            f"[rebuild] REFUSING: running python {have}, locked {want}. "
-            "A rebuild under the wrong interpreter diffs a tree against "
-            "itself and proves nothing. Enter the 3.12.13 environment."
+            "[rebuild] REFUSING: this is not the locked environment (the "
+            "mismatch list is printed above). A rebuild under a drifted "
+            "stack proves nothing about the interpreter question — fix "
+            "the environment (handoff §1b Block F), then re-run."
         )
-    return have
+    return sys.version.split()[0]
 
 
 def compare_stats(baseline: dict, rebuilt: dict) -> list[str]:
@@ -147,9 +160,9 @@ def main() -> None:
         print("[rebuild] WARN: THESIS_CACHE_DIR is unset; active cache is "
               f"{active_root} — confirm this is a throwaway location.")
 
-    have_py = _assert_locked_interpreter(Path(args.lockfile))
-    print(f"[rebuild] interpreter {have_py} == locked; active cache "
-          f"{active_root}")
+    have_py = _assert_locked_environment(Path(args.lockfile))
+    print(f"[rebuild] full environment == locked (python {have_py}); "
+          f"active cache {active_root}")
 
     by_hash = _index_manifests(baseline_root)
 

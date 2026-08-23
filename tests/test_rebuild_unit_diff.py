@@ -15,7 +15,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts.rebuild_unit_diff import _env_package_tokens, compare_stats
+from scripts.rebuild_unit_diff import (
+    _assert_locked_environment,
+    _env_package_tokens,
+    compare_stats,
+)
 
 
 BASE = {
@@ -66,6 +70,49 @@ class TestCompareStats(unittest.TestCase):
         diffs = compare_stats(BASE, rebuilt)
         self.assertEqual(len(diffs), 1)
         self.assertIn("n_summary_nodes", diffs[0])
+
+
+class TestRootRefusal(unittest.TestCase):
+    """The fifth refusal, and the one the others depend on: the FULL pin
+    check runs before any dataset or model import. An interpreter-only
+    check once approved an environment with `datasets` entirely absent;
+    the failure arrived 1,206 manifests later as a ModuleNotFoundError
+    instead of a refusal. These tests drive the real `check_lockfile`
+    against real lockfiles on disk."""
+
+    def test_a_drifted_lockfile_refuses_with_systemexit(self):
+        """A pin the running environment cannot satisfy, under the CORRECT
+        interpreter line — so the refusal is about the PACKAGES, proving
+        the check is wider than the interpreter."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            lock = Path(td) / "requirements.lock"
+            lines = [
+                "# python=" + sys.version.split()[0],
+                "numpy==0.0.0.impossible",
+                "",
+            ]
+            lock.write_text("\n".join(lines), encoding="utf-8")
+            with self.assertRaises(SystemExit):
+                _assert_locked_environment(lock)
+
+    def test_a_snapshot_of_this_environment_passes(self):
+        """`write_lockfile` snapshots the running environment, so checking
+        it back must succeed — the refusal fails for the right reason and
+        only that reason."""
+        import tempfile
+        from scripts.pin_environment import write_lockfile
+        with tempfile.TemporaryDirectory() as td:
+            lock = Path(td) / "requirements.lock"
+            write_lockfile(lock)
+            self.assertEqual(
+                _assert_locked_environment(lock),
+                __import__("sys").version.split()[0],
+            )
+
+    def test_a_missing_lockfile_refuses(self):
+        with self.assertRaises(SystemExit):
+            _assert_locked_environment(Path("no-such-lockfile-anywhere"))
 
 
 class TestEnvPackageTokens(unittest.TestCase):
