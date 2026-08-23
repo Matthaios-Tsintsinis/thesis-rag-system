@@ -789,6 +789,25 @@ class RaptorSystem(BaseSystem):
                 self._index_stats.get("bic_fit_failures", 0)
             ),
         })
+        # AVAILABILITY, for the App. I gate's ceiling diagnostic (AF-10).
+        # The paper's 18.5-57.0% band describes what fraction of RETRIEVED
+        # nodes are non-leaf, but that fraction cannot exceed what the
+        # POOL offers: a ~18-leaf unit carries one summary layer of ~3
+        # nodes, so its pool is ~14-17% non-leaf and the band's floor may
+        # be unreachable at that depth. Recording the pool composition per
+        # ROW lets `analyse` print retrieved share BESIDE available share,
+        # so "below the band" and "below availability" stop being the
+        # same sentence. On small corpora retrieval also returns most of
+        # the pool, which drives retrieved share toward available share
+        # mechanically — the pool size is recorded so a reader can see
+        # when the statistic has lost that discriminative power.
+        n_chunks = int(self._index_stats.get("flat_n_chunks") or 0)
+        n_summaries = int(self._index_stats.get("flat_n_summaries") or 0)
+        pool = n_chunks + n_summaries
+        prepared.extra.update({
+            "m4_pool_n_nodes": pool,
+            "m4_pool_non_leaf_available": (n_summaries / pool) if pool else None,
+        })
         return prepared
 
     # answer() inherits the BaseSystem default: retrieved node TEXT —

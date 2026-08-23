@@ -19,9 +19,35 @@ unit's corpus hash through the pipeline's own layout (`_write_corpus_layout`
 AMBIGUITY IS SURFACED, NEVER RESOLVED SILENTLY. The old bank is never deleted,
 so one corpus_hash can match manifests from several build eras. When that
 happens the script lists every candidate with its `build_env` and creation
-time and refuses to aggregate unless `--pick-env SUBSTRING` selects exactly
-one per unit. A silently-picked wrong-era tree would be a wrong number wearing
-a measured one's provenance.
+time and refuses to aggregate unless a selector reduces it to one per unit. A
+silently-picked wrong-era tree would be a wrong number wearing a measured
+one's provenance. Two selectors, combinable:
+
+  --pick-env SUBSTRING     matches on the manifest's build_env string.
+                           Sufficient where the eras differ by stack (the
+                           old HotpotQA era records env=None).
+  --from-summary PATH      reads the banked cell's `.summary.json` and keeps
+                           only manifests whose `created_at` falls inside
+                           that cell's RUN WINDOW - [timestamp - elapsed_s -
+                           30 min, timestamp + 30 min]. This is the
+                           discriminator where probe builds share the cell's
+                           env string (NarrativeQA: five probe builds plus
+                           the banked one under identical stacks). The
+                           window is READ from the summary, never
+                           hand-typed. Timestamps: the summary's stamp is
+                           the runner host's local time and manifests are
+                           UTC; on the Colab run host local time IS UTC,
+                           and this script is run-host-only for exactly
+                           that class of reason.
+
+ALSO REPORTED: POOL AVAILABILITY (the AF-10 ceiling diagnostic). Each
+manifest carries the collapsed pool's composition (`flat_n_chunks`,
+`flat_n_summaries`), so the cell-level non-leaf AVAILABILITY - the fraction
+of the pool that is non-leaf, i.e. the ceiling on any retrieved non-leaf
+share - aggregates here for cells whose ROWS predate the per-row
+availability field. Compare it against `analyse`'s retrieved share: if
+retrieved >= available, the App. I band presupposes tree depth and the
+summary preference is intact conditional on availability.
 
 AGGREGATION. Per-unit `gate_children_per_parent` is the mean over that unit's
 summary nodes, and `n_summary_nodes_at_index` is how many there are, so:
@@ -107,6 +133,44 @@ def _stats_of(m: dict) -> dict | None:
     return st if isinstance(st, dict) else None
 
 
+def _run_window(summary_path: Path, slack_s: int = 1800):
+    """[start - slack, end + slack] of the banked cell run, from its
+    summary. The summary `timestamp` is stamped at write time (the END of
+    the run) and `elapsed_s` is the run wall clock, so start = end -
+    elapsed_s."""
+    from datetime import datetime, timedelta, timezone
+
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    stamp = summary.get("timestamp")
+    elapsed = summary.get("elapsed_s")
+    if not stamp or elapsed is None:
+        raise SystemExit(
+            f"[cpp] {summary_path} lacks timestamp/elapsed_s -- cannot "
+            "derive a run window; fall back to --pick-env"
+        )
+    end = datetime.strptime(str(stamp), "%Y%m%d-%H%M%S").replace(
+        tzinfo=timezone.utc
+    )
+    start = end - timedelta(seconds=float(elapsed))
+    pad = timedelta(seconds=slack_s)
+    return (start - pad, end + pad)
+
+
+def _created_in(m: dict, window) -> bool:
+    from datetime import datetime, timezone
+
+    raw = m.get("created_at")
+    if not raw:
+        return False
+    try:
+        ts = datetime.fromisoformat(str(raw))
+    except ValueError:
+        return False
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return window[0] <= ts <= window[1]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--benchmark", required=True, choices=BENCHMARKS)
@@ -116,11 +180,20 @@ def main() -> None:
     ap.add_argument("--pick-env", default=None,
                     help="substring of build_env selecting ONE manifest when a "
                          "corpus_hash matches several build eras")
+    ap.add_argument("--from-summary", default=None,
+                    help="path to the banked cell's .summary.json; keeps only "
+                         "manifests created inside that cell's run window")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
     cache_root = Path(args.cache_root) if args.cache_root else paths.cache_dir()
     by_hash = _index_manifests(cache_root)
+
+    window = None
+    if args.from_summary:
+        window = _run_window(Path(args.from_summary))
+        print(f"[cpp] run window from summary: {window[0].isoformat()} -> "
+              f"{window[1].isoformat()}")
 
     system = RaptorSystem()  # config only; no model, no GPU
     per_unit: list[dict] = []
@@ -135,6 +208,8 @@ def main() -> None:
         if args.pick_env:
             cands = [m for m in cands
                      if args.pick_env in str((m.get("extra") or {}).get("build_env", ""))]
+        if window is not None:
+            cands = [m for m in cands if _created_in(m, window)]
         if not cands:
             missing.append(str(u.corpus_id))
             continue
@@ -150,12 +225,16 @@ def main() -> None:
         if st is None:
             missing.append(str(u.corpus_id))
             continue
+        n_leaf_pool = int(st.get("flat_n_chunks") or 0)
+        n_sum_pool = int(st.get("flat_n_summaries") or 0)
         per_unit.append({
             "corpus_id": str(u.corpus_id),
             "parents": int(st.get("n_summary_nodes_at_index") or 0),
             "mean_cpp": float(st.get("gate_children_per_parent") or 0.0),
             "mean_summary_tokens": float(st.get("gate_mean_summary_tokens") or 0.0),
             "degenerate": bool(st.get("degenerate_no_tree")),
+            "pool_leaves": n_leaf_pool,
+            "pool_summaries": n_sum_pool,
         })
 
     if ambiguous:
@@ -177,6 +256,20 @@ def main() -> None:
     sum_tok = (sum(r["mean_summary_tokens"] * r["parents"] for r in tree_units)
                / total_parents if total_parents else None)
 
+    # Pool availability over TREE-BUILDING units (AF-10 ceiling): micro =
+    # all summary nodes over all pool nodes; macro = mean per-unit fraction.
+    tb_pool_total = sum(r["pool_leaves"] + r["pool_summaries"] for r in tree_units)
+    tb_pool_sum = sum(r["pool_summaries"] for r in tree_units)
+    avail_micro = (tb_pool_sum / tb_pool_total) if tb_pool_total else None
+    per_unit_avail = [
+        r["pool_summaries"] / (r["pool_leaves"] + r["pool_summaries"])
+        for r in tree_units
+        if (r["pool_leaves"] + r["pool_summaries"]) > 0
+    ]
+    avail_macro = (sum(per_unit_avail) / len(per_unit_avail)
+                   if per_unit_avail else None)
+    mean_pool = (tb_pool_total / len(tree_units)) if tree_units else None
+
     n_expected = len(per_unit) + len(missing)
     complete = not missing
     result = {
@@ -196,6 +289,9 @@ def main() -> None:
         "in_range_micro": (PAPER_RANGE[0] <= micro <= PAPER_RANGE[1])
                           if micro is not None else None,
         "mean_summary_tokens_micro": sum_tok,
+        "pool_non_leaf_available_micro": avail_micro,
+        "pool_non_leaf_available_macro": avail_macro,
+        "pool_mean_size_treebuilding": mean_pool,
         "coverage_complete": complete,
     }
 
@@ -219,6 +315,13 @@ def main() -> None:
         print(f"  mean summary tokens    {sum_tok:.1f}   (paper's 131 was measured "
               "under ITS summariser; ours caps completions at 100 -- "
               "informational, not a gate)")
+        if avail_micro is not None:
+            print(f"  pool non-leaf avail.   micro {avail_micro:.1%} / "
+                  f"macro {avail_macro:.1%}   mean pool "
+                  f"{mean_pool:.1f} nodes   <- CEILING on any retrieved "
+                  "non-leaf share (AF-10): compare analyse output for the "
+                  "tree-building retrieved share against this, not only "
+                  "against the paper band")
     else:
         print("  no tree-building units matched -- nothing to aggregate")
     if not complete:

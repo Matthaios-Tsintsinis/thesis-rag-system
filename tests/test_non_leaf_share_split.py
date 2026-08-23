@@ -31,8 +31,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.eval.analyse import _aggregate, _print_text
 
 
-def _row(qid, *, chunks, summaries, degenerate):
-    """One M4 row. `retrieved_unit_types` is what the gate reads."""
+def _row(qid, *, chunks, summaries, degenerate, pool=None):
+    """One M4 row. `retrieved_unit_types` is what the gate reads.
+
+    `pool` = (n_leaf_nodes, n_summary_nodes) of the unit's collapsed
+    index, feeding the availability fields; omitted = a pre-availability
+    row, as every banked cell's rows are.
+    """
     total = chunks + summaries
     unit_types = {"chunk": chunks}
     if summaries:
@@ -54,6 +59,16 @@ def _row(qid, *, chunks, summaries, degenerate):
         "metadata": {
             "m4_non_leaf_share": summaries / total if total else 0.0,
             "m4_tree_degenerate": degenerate,
+            **(
+                {
+                    "m4_pool_n_nodes": pool[0] + pool[1],
+                    "m4_pool_non_leaf_available": (
+                        pool[1] / (pool[0] + pool[1])
+                    ),
+                }
+                if pool is not None
+                else {}
+            ),
         },
     }
 
@@ -162,6 +177,66 @@ class TestVerdictsPrintBothWays(unittest.TestCase):
             _row("t2", chunks=8, summaries=2, degenerate=False),
         ])
         self.assertNotIn("TREE-BUILDING UNITS ONLY", out)
+
+
+class TestAvailabilityCeiling(unittest.TestCase):
+    """The AF-10 diagnostic: retrieved share printed BESIDE what the pool
+    offered, so "below the band" and "below availability" cannot be
+    conflated. Rows without the field (every banked cell) must leave the
+    report unchanged."""
+
+    def _report(self, rows):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            _print_text(_aggregate(rows), by_type=False)
+        return buf.getvalue()
+
+    def test_availability_mean_is_the_hand_computed_value(self):
+        # pools: 18 leaves + 3 summaries -> 3/21; 16 + 4 -> 4/20
+        rows = [
+            _row("t1", chunks=8, summaries=2, degenerate=False, pool=(18, 3)),
+            _row("t2", chunks=8, summaries=2, degenerate=False, pool=(16, 4)),
+        ]
+        nl = _aggregate(rows)["systems"]["M4"]["non_leaf"]
+        self.assertAlmostEqual(
+            nl["pool_available_mean"], (3 / 21 + 4 / 20) / 2
+        )
+        self.assertAlmostEqual(nl["pool_size_mean"], (21 + 20) / 2)
+
+    def test_treebuilding_availability_excludes_degenerate_rows(self):
+        rows = [
+            _row("t1", chunks=8, summaries=2, degenerate=False, pool=(18, 3)),
+            _row("d1", chunks=10, summaries=0, degenerate=True, pool=(10, 0)),
+        ]
+        nl = _aggregate(rows)["systems"]["M4"]["non_leaf"]
+        self.assertAlmostEqual(nl["pool_available_mean"], (3 / 21 + 0.0) / 2)
+        self.assertAlmostEqual(
+            nl["pool_available_mean_treebuilding"], 3 / 21
+        )
+
+    def test_retrieved_at_or_above_availability_prints_the_conditional_verdict(self):
+        # retrieved share 2/10 = 20% >= availability 3/21 = 14.3%
+        out = self._report(
+            [_row("t1", chunks=8, summaries=2, degenerate=False, pool=(18, 3))]
+        )
+        self.assertIn("ceiling for the retrieved share", out)
+        self.assertIn("summary preference is intact", out)
+
+    def test_retrieved_below_availability_does_not_print_it(self):
+        # retrieved 1/100 = 1% < availability 3/21 = 14.3% -- the verdict
+        # must NOT fire, or the diagnostic would be an unconditional excuse.
+        out = self._report(
+            [_row("t1", chunks=99, summaries=1, degenerate=False, pool=(18, 3))]
+        )
+        self.assertIn("ceiling for the retrieved share", out)
+        self.assertNotIn("summary preference is intact", out)
+
+    def test_rows_without_the_field_print_no_availability_line(self):
+        """Banked cells: field absent, report unchanged."""
+        out = self._report(
+            [_row("t1", chunks=8, summaries=2, degenerate=False)]
+        )
+        self.assertNotIn("pool availability", out)
 
 
 if __name__ == "__main__":

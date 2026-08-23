@@ -305,6 +305,19 @@ def _non_leaf_summary(bucket: dict) -> dict[str, Any]:
             if (tb_micro is not None and tb_non_leaf)
             else None
         ),
+        # Availability means (rows carrying m4_pool_non_leaf_available).
+        "pool_available_mean": (
+            statistics.mean(bucket.get("m4_pool_available") or [])
+            if bucket.get("m4_pool_available") else None
+        ),
+        "pool_available_mean_treebuilding": (
+            statistics.mean(bucket.get("m4_pool_available_treebuilding") or [])
+            if bucket.get("m4_pool_available_treebuilding") else None
+        ),
+        "pool_size_mean": (
+            statistics.mean(bucket.get("m4_pool_sizes") or [])
+            if bucket.get("m4_pool_sizes") else None
+        ),
         # .get() rather than [] so a partial bucket (a caller checking one
         # field, or a rollup built under an older aggregate shape) reads
         # as "no trips" instead of raising.
@@ -398,6 +411,14 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
             # Per-query shares restricted to tree-building rows, for the
             # macro figure's counterpart.
             "m4_non_leaf_share_treebuilding": [],
+            # AVAILABILITY (AF-10 ceiling diagnostic): what fraction of the
+            # unit's POOL is non-leaf, and how big the pool is. Present
+            # only on rows written after the field landed; older banked
+            # cells read availability from their manifests instead
+            # (scripts/report_children_per_parent.py).
+            "m4_pool_available": [],
+            "m4_pool_available_treebuilding": [],
+            "m4_pool_sizes": [],
             "m4_expansion_rows": 0,
             # Flat-index rows: the corpus fell at or below the layer stop
             # condition, so M4 ran as flat dense retrieval. Counted per
@@ -540,6 +561,13 @@ def _aggregate(records: Iterable[dict]) -> dict[str, Any]:
             bucket["m4_non_leaf_share"].append(float(m4_share))
             if not md.get("m4_tree_degenerate"):
                 bucket["m4_non_leaf_share_treebuilding"].append(float(m4_share))
+        m4_avail = md.get("m4_pool_non_leaf_available")
+        if m4_avail is not None:
+            bucket["m4_pool_available"].append(float(m4_avail))
+            if not md.get("m4_tree_degenerate"):
+                bucket["m4_pool_available_treebuilding"].append(float(m4_avail))
+        if md.get("m4_pool_n_nodes") is not None:
+            bucket["m4_pool_sizes"].append(int(md["m4_pool_n_nodes"]))
         if md.get("m4_summary_expansion"):
             bucket["m4_expansion_rows"] += 1
         if md.get("m4_tree_degenerate"):
@@ -1023,6 +1051,41 @@ def _print_text(rollup: dict[str, Any], *, by_type: bool) -> None:
                         "distribution on corpora this small sits outside "
                         "what the paper observed. FINDING, for the "
                         "discussion; do not explain it away. ***"
+                    )
+            # AVAILABILITY CEILING (AF-10 diagnostic). The band's floor is
+            # unreachable when the POOL itself is barely non-leaf: a
+            # ~18-leaf unit carries one summary layer of ~3 nodes, so its
+            # pool is ~14-17% non-leaf regardless of retrieval preference.
+            # Printed whenever rows carry the availability field, so
+            # "retrieved below the band" and "retrieved below what was
+            # available" stop being conflated. If retrieved >= available,
+            # the finding is that the App. I band PRESUPPOSES tree depth -
+            # conditional on availability the summary preference is intact.
+            if nl.get("pool_available_mean") is not None:
+                avail = nl["pool_available_mean"]
+                line = f"  {sid}: pool availability mean={avail:.1%}"
+                if nl.get("pool_available_mean_treebuilding") is not None:
+                    line += (
+                        f"  tree-building={nl['pool_available_mean_treebuilding']:.1%}"
+                    )
+                if nl.get("pool_size_mean") is not None:
+                    line += f"  mean pool size={nl['pool_size_mean']:.1f} nodes"
+                print(line + "   <- ceiling for the retrieved share")
+                ref = (
+                    nl.get("micro_treebuilding")
+                    if nl.get("micro_treebuilding") is not None
+                    else nl.get("micro")
+                )
+                cmp_avail = (
+                    nl.get("pool_available_mean_treebuilding")
+                    if nl.get("pool_available_mean_treebuilding") is not None
+                    else avail
+                )
+                if ref is not None and ref >= cmp_avail:
+                    print(
+                        f"  {sid}: retrieved share >= availability - the "
+                        "App. I band presupposes tree depth; conditional "
+                        "on availability the summary preference is intact."
                     )
             if nl["degenerate_rows"]:
                 # The loudest thing in this report, deliberately. A flat
