@@ -147,16 +147,74 @@ def locked_python(text: str) -> str | None:
     return None
 
 
+def _pip_check_conflicts() -> list[str]:
+    """`pip check` conflict lines for THIS interpreter, [] when clean.
+
+    Why this exists: torchvision 0.28.0 was installed against torch
+    2.13.0, torch was then downgraded to the locked 2.11.0+cu128
+    underneath it, and its C++ extension could no longer register
+    `torchvision::nms` — transformers imports torchvision through
+    `image_utils` when present, so `PreTrainedModel` failed and the
+    embedder never loaded. torchvision is not in the lockfile, so
+    `[pin] OK` printed over an environment pip itself knew was broken.
+    Pip HAD warned at install time; nothing enforced. One subprocess
+    closes the class.
+
+    A failure to RUN pip check degrades to a warning, never a crash —
+    this is a gate's helper, and a helper that can take the gate down
+    with it is a second defect."""
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            [sys.executable, "-m", "pip", "check"],
+            capture_output=True, text=True, timeout=120,
+        )
+    except Exception as e:  # pip missing, timeout, sandboxing
+        print(f"[pin] WARN: could not run pip check ({type(e).__name__}: "
+              f"{e}); dependency conflicts were NOT screened")
+        return []
+    if out.returncode == 0:
+        return []
+    return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+
+
+def classify_conflicts(
+    conflicts: list[str], locked_names: list[str]
+) -> tuple[list[str], list[str]]:
+    """Split pip-check conflict lines into (failing, warn-only).
+
+    A conflict FAILS the pin when it names a LOCKED package — pip is then
+    reporting that a package the lock vouches for has a violated
+    contract, and printing OK over that is a gate reporting success
+    incorrectly. A conflict among packages the lock never mentions is
+    printed as a warning only: the run host's system python routinely
+    carries preinstalled-package conflicts that touch nothing the matrix
+    uses, and a gate that fails on those blocks cells for noise."""
+    failing: list[str] = []
+    warn: list[str] = []
+    names = [n.lower() for n in locked_names]
+    for line in conflicts:
+        low = line.lower()
+        if any(n in low for n in names):
+            failing.append(line)
+        else:
+            warn.append(line)
+    return failing, warn
+
+
 def check_lockfile(lockfile: Path) -> int:
     text = lockfile.read_text(encoding="utf-8")
     installed = _installed()
     mismatches: list[str] = []
     checked = 0
+    locked_names: list[str] = []
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "==" not in line:
             continue
         pkg, _, want = line.partition("==")
+        locked_names.append(pkg.strip())
         have = installed.get(pkg.strip().lower())
         checked += 1
         if have is None:
@@ -182,6 +240,16 @@ def check_lockfile(lockfile: Path) -> int:
                 f"python: locked {want_py}, running {have_py} "
                 "(different compiled wheels; M4 topology is not claimed "
                 "to reproduce across interpreters)")
+
+    # THE RESOLVER'S OWN VERDICT, screened after the version loop so the
+    # locked-name list is complete. See _pip_check_conflicts for the
+    # torchvision incident this exists because of.
+    failing, warn_only = classify_conflicts(_pip_check_conflicts(),
+                                            locked_names)
+    for line in failing:
+        mismatches.append(f"pip check: {line}")
+    for line in warn_only:
+        print(f"[pin] WARN (pip check, unlocked packages): {line}")
 
     print(f"[pin] lockfile_hash={lockfile_hash(text)}")
     print(f"[pin] python={have_py} (locked {want_py or 'UNRECORDED'})")
