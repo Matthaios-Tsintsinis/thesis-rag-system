@@ -179,6 +179,23 @@ def _pip_check_conflicts() -> list[str]:
     return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
 
 
+def _canon(name: str) -> str:
+    """PEP 503-ish canonical form: case and -/_ are not identity."""
+    return name.strip().lower().replace("_", "-")
+
+
+def _line_package_tokens(line: str) -> set[str]:
+    """Candidate package names in a pip-check line, as WHOLE tokens.
+
+    Tokens must start with a letter (versions like 3.14.0 drop out) and
+    may carry the characters package names carry. English words in the
+    line ("requires", "installed") ride along harmlessly — they collide
+    with no locked name."""
+    import re
+
+    return {_canon(t) for t in re.findall(r"[A-Za-z][A-Za-z0-9._-]*", line)}
+
+
 def classify_conflicts(
     conflicts: list[str], locked_names: list[str]
 ) -> tuple[list[str], list[str]]:
@@ -190,13 +207,23 @@ def classify_conflicts(
     incorrectly. A conflict among packages the lock never mentions is
     printed as a warning only: the run host's system python routinely
     carries preinstalled-package conflicts that touch nothing the matrix
-    uses, and a gate that fails on those blocks cells for noise."""
+    uses, and a gate that fails on those blocks cells for noise.
+
+    MATCHING IS BY WHOLE PACKAGE TOKEN, NOT SUBSTRING — the first
+    version used substring matching and misclassified
+    "docling-ibm-models ... requires torchvision, which is not
+    installed." as FAILING, because locked "torch" is a substring of
+    "torchvision". Neither named package was in the lock; under the
+    stated rule that line is a WARNING. The same substring defect was
+    latent in the other direction: locked "transformers" would have
+    matched every "sentence-transformers" line. Tokens are compared
+    canonicalised (case and -/_ folded), so "rank_bm25" matches locked
+    "rank-bm25" while "torchvision" no longer matches "torch"."""
     failing: list[str] = []
     warn: list[str] = []
-    names = [n.lower() for n in locked_names]
+    names = {_canon(n) for n in locked_names}
     for line in conflicts:
-        low = line.lower()
-        if any(n in low for n in names):
+        if _line_package_tokens(line) & names:
             failing.append(line)
         else:
             warn.append(line)

@@ -71,6 +71,54 @@ class TestClassification(unittest.TestCase):
         self.assertEqual(classify_conflicts([], LOCKED), ([], []))
 
 
+class TestTokenMatching(unittest.TestCase):
+    """The second incident, and the fix's contract. Substring matching
+    classified the line below as FAILING because locked "torch" is a
+    substring of "torchvision" — the rebuild's root refusal then stopped a
+    run the stated rule should have let through with a warning. Matching
+    is now by whole canonicalised package token."""
+
+    DOCLING_LINE = (
+        "docling-ibm-models 3.14.0 requires torchvision, "
+        "which is not installed."
+    )
+
+    def test_the_docling_incident_line_is_a_warning(self):
+        """Neither docling-ibm-models nor torchvision is locked; the
+        intended classification is WARN. This is the exact line that was
+        misclassified as FAILING on the run host (2026-08-23)."""
+        failing, warn = classify_conflicts([self.DOCLING_LINE], LOCKED)
+        self.assertEqual(failing, [])
+        self.assertEqual(warn, [self.DOCLING_LINE])
+
+    def test_torchvision_does_not_match_locked_torch(self):
+        """The root cause, isolated: a line naming ONLY torchvision must
+        not fail a lock that names only torch."""
+        line = "somepkg 1.0 requires torchvision, which is not installed."
+        failing, warn = classify_conflicts([line], ["torch"])
+        self.assertEqual(failing, [])
+        self.assertEqual(warn, [line])
+
+    def test_sentence_transformers_does_not_match_locked_transformers(self):
+        """The same defect in the other direction, latent until now."""
+        line = ("sentence-transformers 5.0.0 requires transformers-fork, "
+                "which is not installed.")
+        failing, warn = classify_conflicts([line], ["transformers"])
+        self.assertEqual(failing, [])
+        self.assertEqual(warn, [line])
+
+    def test_a_locked_name_as_a_whole_token_still_fails(self):
+        """The screen must not have been weakened: the FIRST incident's
+        line names torch exactly and must still fail."""
+        failing, _ = classify_conflicts([TORCHVISION_LINE], ["torch"])
+        self.assertEqual(failing, [TORCHVISION_LINE])
+
+    def test_hyphen_underscore_and_case_are_folded(self):
+        line = "otherpkg 1.0 requires rank_bm25==0.2.2, but you have rank-bm25 0.1.0."
+        failing, _ = classify_conflicts([line], ["Rank-BM25"])
+        self.assertEqual(failing, [line])
+
+
 class TestSubprocessSmoke(unittest.TestCase):
     def test_pip_check_runs_and_returns_a_list(self):
         """The helper must never crash the gate: whatever this
