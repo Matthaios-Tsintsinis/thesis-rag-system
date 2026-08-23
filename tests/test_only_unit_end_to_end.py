@@ -163,6 +163,17 @@ class TestOnlyUnit(unittest.TestCase):
         self.assertEqual(len(rows), QUERIES_PER_UNIT)
         self.assertTrue(all(r["query_id"].startswith("u3") for r in rows))
 
+    def test_rows_record_the_packed_set_identity(self):
+        """packed_ids: the field added after a per-row M2-vs-M3 set
+        comparison proved unrecoverable from banked rows. Driven through
+        the REAL runner: every row must carry the ids, in order, matching
+        n_packed — the pipeline reads the chunks, not a constant."""
+        _, rows, _ = self._run("--only-unit", "u1")
+        for r in rows:
+            ids = r["metadata"]["packed_ids"]
+            self.assertEqual(len(ids), r["n_packed"])
+            self.assertTrue(all(isinstance(i, str) and i for i in ids))
+
     def test_retrieval_is_not_skipped(self):
         summary, rows, _ = self._run("--only-unit", "story03")
         self.assertEqual(summary["n_retrieval_skipped"], 0)

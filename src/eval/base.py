@@ -541,7 +541,22 @@ class BenchmarkRunner:
                         # carried (e.g. M9's corrective-action logging).
                         # System keys are namespaced by convention
                         # ("m9_*") so loader metadata can't collide.
-                        metadata={**q.metadata, **(ar.extra or {})},
+                        #
+                        # packed_ids: the IDENTITY of the packed set, in
+                        # prompt order. Added 2026-08-24 after a per-row
+                        # M2-vs-M3 set comparison turned out to be
+                        # UNRECOVERABLE from banked rows — they carried
+                        # counts and unit-type distributions, but the ids
+                        # existed only at run time and nothing recorded
+                        # them (the recurring lesson, again). Eval-time
+                        # metadata only; NOT in any cache key.
+                        metadata={
+                            **q.metadata,
+                            **(ar.extra or {}),
+                            "packed_ids": [
+                                r.chunk.chunk_id for r in ar.packed
+                            ],
+                        },
                     )
                     fout.write(
                         json.dumps(asdict(scored), ensure_ascii=False) + "\n"
