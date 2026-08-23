@@ -118,8 +118,11 @@ the shared harness chunker at this commit, so NO cache key moves.
 #     MultiHop-RAG           45 of 70,455 sentences  (0.064%)
 #     HotpotQA-distractor   137 of 46,855 sentences  (0.292%, 107/1000 units)
 #     HotpotQA-pooled       137 of 46,720 sentences  (0.293%)
-#     NarrativeQA           PENDING — run-host measurement (the audit host
-#                           has no complete local copy of the dataset)
+#     NarrativeQA             2 of 386,791 sentences (0.0005%) — measured on
+#                           the run host 2026-08-23; 0/40 units degenerate.
+#                           The narrative-prose regime barely produces a
+#                           100-token sentence, so the divergence is close
+#                           to unreachable there.
 #   Uniform across all four M4 cells, and M4 is the only system using this
 #   chunker, so no cross-system asymmetry arises.
 #
@@ -453,7 +456,7 @@ def split_text_raptor(
 #      own labels. Observable only where a unit holds byte-identical
 #      chunk texts; measured incidence 2026-08-22: MultiHop 73/16,523
 #      chunks (0.44%), HotpotQA-distractor 21/17,443 (0.12%), pooled
-#      21/17,396 (0.12%). The reference's form is also O(n^2) in the layer
+#      21/17,396 (0.12%), NarrativeQA 0 (run host, 2026-08-23). The reference's form is also O(n^2) in the layer
 #      size. Recorded as a divergence rather than adopted: label-union for
 #      coincidentally identical text is an artifact of the lookup
 #      strategy, not a stated behaviour.
