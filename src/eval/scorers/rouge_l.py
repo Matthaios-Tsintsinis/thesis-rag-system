@@ -130,7 +130,9 @@ def build_evaluator(rouge_module: Any | None = None) -> Any:
             import rouge as rouge_module  # type: ignore[no-redef]
         except ImportError as e:  # pragma: no cover - exercised by absence
             raise ImportError(
-                "ROUGE-L needs the `rouge` package (pip install rouge). It "
+                "ROUGE-L needs the `rouge` MODULE from the py-rouge "
+                "package (pip install py-rouge -- NOT the package named "
+                "rouge, whose constructor lacks these kwargs). It "
                 "is deliberately absent from requirements.txt/"
                 "requirements.lock: the lockfile hash is pinned mid-matrix "
                 "and ROUGE-L is a post-hoc column, so no cell run requires "

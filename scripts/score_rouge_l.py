@@ -20,7 +20,13 @@ truncation, Porter stemming, alpha 0.5, weight_factor 1.2, max over
 references — with one declared departure: no `round(..., 2)`. See that
 module for the reasoning.
 
-    pip install rouge     # deliberately NOT in requirements.lock
+    pip install py-rouge  # deliberately NOT in requirements.lock
+                          # NOTE the package NAME: py-rouge installs the
+                          # module `rouge` with the AllenNLP-compatible
+                          # constructor (weight_factor, apply_best, ...).
+                          # The PyPI package literally named `rouge` is a
+                          # DIFFERENT library whose Rouge() lacks these
+                          # kwargs and fails with a TypeError.
 
 USAGE
 
