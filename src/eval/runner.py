@@ -151,6 +151,118 @@ def _git_commit_short() -> str:
         return "unknown"
 
 
+def assert_bank_generator_consistent(output_dir: Path, generator: str) -> None:
+    """Refuse to write a cell into a bank another generator owns.
+
+    ADDENDUM 2's Llama column is a SEPARATE bank (p11), and the plan
+    documents noted that output-dir separation was enforced by
+    convention only — a Llama cell written into p10 would sit beside
+    Qwen cells with nothing but a filename convention keeping analysis
+    from pooling them. This gate is DATA-DRIVEN rather than a name
+    registry: it reads the generator every existing summary in the
+    output directory records, and refuses on any mismatch with the
+    resolved generator — which also guards the reverse mistake (a Qwen
+    cell into p11) and any future third column, with no code change.
+
+    Summaries predating model_revisions, or unreadable ones, are skipped
+    with a warning rather than trusted: an unreadable file cannot vouch
+    for the bank, but it cannot convict it either — the P10 bank is
+    complete and every one of its summaries records the generator.
+    """
+    out = Path(output_dir)
+    if not out.is_dir():
+        return
+    mismatched: list[str] = []
+    for sp in sorted(out.glob("*.summary.json")):
+        try:
+            summary = json.loads(sp.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"[eval] WARN: unreadable summary {sp.name} during the "
+                  f"bank-generator check: {e}")
+            continue
+        g = (summary.get("model_revisions") or {}).get("generator")
+        if g is None:
+            print(f"[eval] WARN: {sp.name} records no generator; it cannot "
+                  "vouch for this bank")
+            continue
+        if str(g) != generator:
+            mismatched.append(f"{sp.name}: {g}")
+    if mismatched:
+        listing = "\n  ".join(mismatched[:8])
+        more = "" if len(mismatched) <= 8 else f"\n  ... {len(mismatched) - 8} more"
+        raise SystemExit(
+            f"PREFLIGHT FAILED: the output directory {out} already holds "
+            f"cells from a DIFFERENT generator than the resolved "
+            f"{generator!r}:\n  {listing}{more}\n"
+            "  Per ADDENDUM 2 the columns are separate banks — write the "
+            "Llama column into its own directory (outputs/p11), never "
+            "into p10, and vice versa."
+        )
+
+
+def assert_generator_accessible(model_id: str) -> None:
+    """Fail LOUDLY before GPU time if the hub will not serve the model.
+
+    Built for meta-llama/Llama-3.1-8B-Instruct, a GATED repo: without a
+    granted license and a valid HF_TOKEN the failure otherwise arrives
+    mid-session as a 401 inside from_pretrained, after the session's
+    setup blocks are already paid for. Local-path and API-routed models
+    are skipped (nothing to gate). Errors that mean "no access" —
+    gated/401/403/not-found — FAIL with the fix steps; errors that mean
+    "hub unreachable" WARN and continue, because a locally cached model
+    is a legitimate way to run and a preflight must not add a network
+    single-point-of-failure to an offline-capable path.
+    """
+    if "/" not in str(model_id):
+        return
+    low = str(model_id).lower()
+    if low.startswith(("gpt-", "chatgpt-", "o1", "o3", "o4")):
+        return
+    try:
+        from huggingface_hub import HfApi
+        from huggingface_hub.errors import (
+            GatedRepoError,
+            HfHubHTTPError,
+            RepositoryNotFoundError,
+        )
+    except Exception as e:  # hub not importable: nothing to check with
+        print(f"[eval] WARN: huggingface_hub unavailable for the access "
+              f"preflight ({type(e).__name__}); model access NOT verified")
+        return
+    try:
+        HfApi().model_info(str(model_id))
+        print(f"[eval] PREFLIGHT: hub access to {model_id} verified")
+    except (GatedRepoError, RepositoryNotFoundError) as e:
+        raise SystemExit(
+            f"PREFLIGHT FAILED: no access to {model_id!r} "
+            f"({type(e).__name__}).\n"
+            "  For a gated repo (meta-llama/*):\n"
+            "  1. open the model page with the SAME account as the token "
+            "and accept the license;\n"
+            "  2. create a READ token at huggingface.co/settings/tokens;\n"
+            "  3. export HF_TOKEN=<token> in the session BEFORE this "
+            "runner starts (Colab: store it in Secrets and export in "
+            "Block F2).\n"
+            "  Verified access prints a PREFLIGHT line; nothing loads "
+            "until it does."
+        )
+    except HfHubHTTPError as e:
+        code = getattr(getattr(e, "response", None), "status_code", None)
+        if code in (401, 403):
+            raise SystemExit(
+                f"PREFLIGHT FAILED: HTTP {code} for {model_id!r} — the "
+                "token is missing, expired, or the license is not "
+                "accepted. See the gated-repo steps above (export "
+                "HF_TOKEN before the runner starts)."
+            )
+        print(f"[eval] WARN: hub returned HTTP {code} for {model_id}; "
+              "access not verified (a locally cached model still works)")
+    except Exception as e:  # network down, DNS, proxy
+        print(f"[eval] WARN: hub unreachable ({type(e).__name__}: {e}); "
+              f"access to {model_id} not verified — a locally cached "
+              "model still works")
+
+
 def assert_environment_pinned(
     lockfile: Path,
     *,
@@ -692,6 +804,14 @@ def main() -> None:
             f"{harness_cfg.generation.max_new_tokens} tokens (verified after "
             "each answer)"
         )
+
+    # TWO REPLICATION GATES, both before any model loads (ADDENDUM 2
+    # activation, 2026-08-24). Order matters: the bank check is pure disk
+    # and runs first; the hub check may touch the network.
+    assert_bank_generator_consistent(
+        Path(args.output).parent, harness_cfg.generation.model
+    )
+    assert_generator_accessible(harness_cfg.generation.model)
 
     system_cls = SYSTEM_REGISTRY[args.system]
     system: BaseSystem = system_cls(config=harness_cfg)
