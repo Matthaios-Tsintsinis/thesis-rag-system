@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.eval.runner import (
     assert_bank_generator_consistent,
+    assert_bank_gpu_consistent,
     assert_generator_accessible,
 )
 
@@ -77,6 +78,63 @@ class TestBankGeneratorGate(unittest.TestCase):
                 assert_bank_generator_consistent(d, LLAMA)
             self.assertIn("hotpotqa_M2_validation.summary.json",
                           str(cm.exception))
+
+
+class TestBankGpuGate(unittest.TestCase):
+    """Instance 16: the GPU string was recorded per-cell since P9 and
+    compared by nothing — a T4 silently replaced the L4 and only the OOM
+    caught it. Same data-driven shape as the generator gate; the current
+    GPU is injectable so the tests never depend on this host's hardware."""
+
+    @staticmethod
+    def _gpu_summary(d: Path, name: str, gpu: str | None) -> None:
+        body: dict = {"n_queries_scored": 1}
+        if gpu is not None:
+            body["environment"] = {"gpu": gpu}
+        (d / name).write_text(json.dumps(body), encoding="utf-8")
+
+    def test_the_t4_incident_refuses(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            self._gpu_summary(d, "a.summary.json", "NVIDIA L4")
+            with self.assertRaises(SystemExit) as cm:
+                assert_bank_gpu_consistent(d, current_gpu="Tesla T4")
+            msg = str(cm.exception)
+            self.assertIn("Tesla T4", msg)
+            self.assertIn("NVIDIA L4", msg)
+            self.assertIn("--allow-gpu-mismatch", msg)
+
+    def test_matching_hardware_passes(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            self._gpu_summary(d, "a.summary.json", "NVIDIA L4")
+            assert_bank_gpu_consistent(d, current_gpu="NVIDIA L4")
+
+    def test_the_first_cell_into_an_empty_bank_sets_the_hardware(self):
+        with tempfile.TemporaryDirectory() as td:
+            assert_bank_gpu_consistent(Path(td), current_gpu="Tesla T4")
+
+    def test_the_flag_downgrades_to_a_loud_pass(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            self._gpu_summary(d, "a.summary.json", "NVIDIA L4")
+            assert_bank_gpu_consistent(
+                d, current_gpu="Tesla T4", allow_mismatch=True
+            )  # no raise; loudness is the print, recording is the summary field
+
+    def test_an_unknown_current_gpu_warns_but_cannot_fail(self):
+        """Absence of measurement is not a measured change — and the
+        agent host (no CUDA) must be able to import and drive main()."""
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            self._gpu_summary(d, "a.summary.json", "NVIDIA L4")
+            assert_bank_gpu_consistent(d, current_gpu="unknown")
+
+    def test_summaries_without_the_field_cannot_convict(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            self._gpu_summary(d, "old.summary.json", None)
+            assert_bank_gpu_consistent(d, current_gpu="Tesla T4")
 
 
 class TestAccessGateRouting(unittest.TestCase):

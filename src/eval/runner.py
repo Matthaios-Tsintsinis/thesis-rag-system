@@ -200,18 +200,111 @@ def assert_bank_generator_consistent(output_dir: Path, generator: str) -> None:
         )
 
 
-def assert_generator_accessible(model_id: str) -> None:
-    """Fail LOUDLY before GPU time if the hub will not serve the model.
+def assert_bank_gpu_consistent(
+    output_dir: Path,
+    *,
+    allow_mismatch: bool = False,
+    current_gpu: str | None = None,
+) -> None:
+    """Refuse to add a cell to a bank on DIFFERENT hardware.
 
-    Built for meta-llama/Llama-3.1-8B-Instruct, a GATED repo: without a
-    granted license and a valid HF_TOKEN the failure otherwise arrives
-    mid-session as a 401 inside from_pretrained, after the session's
-    setup blocks are already paid for. Local-path and API-routed models
-    are skipped (nothing to gate). Errors that mean "no access" —
-    gated/401/403/not-found — FAIL with the fix steps; errors that mean
-    "hub unreachable" WARN and continue, because a locally cached model
-    is a legitimate way to run and a preflight must not add a network
-    single-point-of-failure to an offline-capable path.
+    Instance 16 of the recurring lesson, caught by an incident rather
+    than a review: Colab silently assigned a Tesla T4 (14.56 GiB) to a
+    P11 canary, Llama-8B fp16 OOM'd at weight load (266/291 shards) —
+    and the pin gate had printed `gpu=Tesla T4` and said OK, because the
+    GPU string has been RECORDED per-cell since P9 and compared by
+    NOTHING. Had the model fit, the cell would have banked a hardware
+    confound: fp16 numerics differ across GPU architectures, and every
+    P10 cell ran on NVIDIA L4.
+
+    Data-driven like the bank-generator gate: the first cell into an
+    empty bank SETS the hardware; every later cell must match the GPU
+    strings the bank's summaries record. `--allow-gpu-mismatch` is the
+    deliberate escape — loud, and recorded in the cell summary — for a
+    ruled exception, never a default. A current GPU of "unknown" (no
+    CUDA visible) WARNS rather than fails: that is an absence of
+    measurement, not a measured change, and cells cannot run without a
+    GPU anyway.
+    """
+    out = Path(output_dir)
+    if not out.is_dir():
+        return
+    if current_gpu is None:
+        try:
+            from scripts.pin_environment import gpu_model
+
+            current_gpu = gpu_model()
+        except Exception as e:
+            print(f"[eval] WARN: could not resolve the GPU for the bank "
+                  f"check ({type(e).__name__}); hardware NOT verified")
+            return
+    if not current_gpu or current_gpu == "unknown":
+        print("[eval] WARN: no CUDA device visible; the bank's hardware "
+              "consistency was NOT verified")
+        return
+
+    bank_gpus: set[str] = set()
+    for sp in sorted(out.glob("*.summary.json")):
+        try:
+            summary = json.loads(sp.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"[eval] WARN: unreadable summary {sp.name} during the "
+                  f"bank-GPU check: {e}")
+            continue
+        g = (summary.get("environment") or {}).get("gpu")
+        if g:
+            bank_gpus.add(str(g))
+    if not bank_gpus:
+        return  # empty bank, or summaries predate the field: this cell sets it
+    if len(bank_gpus) > 1:
+        print(f"[eval] WARN: the bank already holds MULTIPLE GPU strings "
+              f"{sorted(bank_gpus)} — inspect before trusting any "
+              "cross-cell comparison")
+    if current_gpu in bank_gpus:
+        print(f"[eval] PREFLIGHT: GPU {current_gpu!r} matches the bank")
+        return
+    if allow_mismatch:
+        print(
+            f"[eval] *** GPU MISMATCH ALLOWED BY FLAG: running on "
+            f"{current_gpu!r} against a bank built on {sorted(bank_gpus)}. "
+            "This cell is a HARDWARE CONFOUND relative to its bank and the "
+            "summary records the override. ***"
+        )
+        return
+    raise SystemExit(
+        f"PREFLIGHT FAILED: this host's GPU is {current_gpu!r} but the "
+        f"bank at {out} was built on {sorted(bank_gpus)}.\n"
+        "  fp16 numerics differ across GPU architectures — a cell run on "
+        "different hardware is a confound inside its own column (the P11 "
+        "canary drew a Tesla T4 this way and OOM'd; had it fit, it would "
+        "have banked silently).\n"
+        "  Fix: set the runtime accelerator to the bank's GPU and re-run. "
+        "A DELIBERATE hardware change is --allow-gpu-mismatch, which is "
+        "loud and recorded in the summary."
+    )
+
+
+def assert_generator_accessible(model_id: str) -> None:
+    """Fail LOUDLY before GPU time if the hub will not serve the model's
+    FILES — probed by downloading a gated file, never by repo metadata.
+
+    Earned twice. First: without a granted license and a valid HF_TOKEN
+    the failure arrives mid-session as a 401 inside from_pretrained,
+    after the setup blocks are paid for. Second, the sharper one: the
+    original probe called `model_info`, which SUCCEEDS on gated repos —
+    the metadata is public, only the files are gated — so it printed
+    "verified" over a 403-bound run (the operator fetched the revision
+    sha days BEFORE the license was granted, through this very gap). The
+    probe is now `hf_hub_download` of `config.json`: a file the license
+    actually gates. A cache-satisfied download counts as verified, which
+    is correct — cached files are how an offline run works.
+
+    Local-path and API-routed models are skipped (nothing to gate).
+    Errors that mean "no access" — gated/401/403/not-found — FAIL with
+    the fix steps; errors that mean "hub unreachable" WARN and continue,
+    because a locally cached model is a legitimate way to run and a
+    preflight must not add a network single-point-of-failure to an
+    offline-capable path.
     """
     if "/" not in str(model_id):
         return
@@ -219,8 +312,9 @@ def assert_generator_accessible(model_id: str) -> None:
     if low.startswith(("gpt-", "chatgpt-", "o1", "o3", "o4")):
         return
     try:
-        from huggingface_hub import HfApi
+        from huggingface_hub import hf_hub_download
         from huggingface_hub.errors import (
+            EntryNotFoundError,
             GatedRepoError,
             HfHubHTTPError,
             RepositoryNotFoundError,
@@ -230,8 +324,16 @@ def assert_generator_accessible(model_id: str) -> None:
               f"preflight ({type(e).__name__}); model access NOT verified")
         return
     try:
-        HfApi().model_info(str(model_id))
-        print(f"[eval] PREFLIGHT: hub access to {model_id} verified")
+        # A GATED FILE, never repo metadata: model_info succeeds on gated
+        # repos (metadata is public, files are not) and once printed
+        # "verified" over a 403-bound run. config.json is tiny and sits
+        # behind the same license as the weights.
+        hf_hub_download(str(model_id), "config.json")
+        print(f"[eval] PREFLIGHT: hub FILE access to {model_id} verified "
+              "(config.json served or cached)")
+    except EntryNotFoundError:
+        print(f"[eval] WARN: {model_id} has no config.json to probe; "
+              "FILE access NOT verified")
     except (GatedRepoError, RepositoryNotFoundError) as e:
         raise SystemExit(
             f"PREFLIGHT FAILED: no access to {model_id!r} "
@@ -474,6 +576,16 @@ def main() -> None:
             "every M4 cell to build cold. Recorded in the summary, so a "
             "cell can never claim a cold build it did not do."
         ),
+    )
+    parser.add_argument(
+        "--allow-gpu-mismatch",
+        action="store_true",
+        help="run on a GPU other than the one this bank's summaries "
+             "record. LOUD and recorded in the summary - fp16 numerics "
+             "differ across architectures, so this cell becomes a "
+             "declared hardware confound within its bank. Exists because "
+             "Colab silently swapped an L4 for a T4 once and only the "
+             "OOM caught it.",
     )
     parser.add_argument(
         "--lockfile",
@@ -811,6 +923,9 @@ def main() -> None:
     assert_bank_generator_consistent(
         Path(args.output).parent, harness_cfg.generation.model
     )
+    assert_bank_gpu_consistent(
+        Path(args.output).parent, allow_mismatch=args.allow_gpu_mismatch
+    )
     assert_generator_accessible(harness_cfg.generation.model)
 
     system_cls = SYSTEM_REGISTRY[args.system]
@@ -949,6 +1064,7 @@ def main() -> None:
         "max_units": args.max_units,
         "only_unit": args.only_unit,
         "allow_warm_trees": args.allow_warm_trees,
+        **({"gpu_mismatch_allowed": True} if args.allow_gpu_mismatch else {}),
         "n_queries_scored": n_scored,
         "n_retrieval_skipped": sum_retr_skipped,
         # THE DENOMINATOR, NAMED. mean_retrieval_f1 is over the rows that
