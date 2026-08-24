@@ -129,6 +129,47 @@ def score_file(
     }
 
 
+def _punkt_fix_message() -> str:
+    """Both fix paths for a missing punkt_tab, spelled out.
+
+    Measured on the run host (2026-08-24), and both traps are real:
+    (a) py-rouge tokenizes via NLTK, and punkt_tab is neither bundled
+    with nltk nor in requirements.lock; (b) on proxied hosts NLTK's
+    downloader REFUSES the fetch (SSRF protection) and
+    nltk.download(..., quiet=True) fails SILENTLY -- a verification
+    one-liner printed "nltk ok" over a refused download, which is
+    exactly the check-that-cannot-fail-for-the-right-reason pattern.
+    Hence a real preflight and this message, instead of download advice
+    that can lie."""
+    return (
+        "ROUGE-L needs the NLTK 'punkt_tab' tokenizer data, which is not "
+        "bundled and not in requirements.lock. Two fix paths:\n"
+        "  (1) allow the downloader through the proxy, then download:\n"
+        "        NLTK_ALLOW_PROXIED_URLOPEN=1 python -c "
+        "\"import nltk; nltk.download('punkt_tab')\"\n"
+        "      (do NOT pass quiet=True -- on a refused fetch it fails "
+        "SILENTLY)\n"
+        "  (2) fetch the zip directly and unpack it yourself:\n"
+        "        https://raw.githubusercontent.com/nltk/nltk_data/"
+        "gh-pages/packages/tokenizers/punkt_tab.zip\n"
+        "      unzip into ~/nltk_data/tokenizers/ so that "
+        "~/nltk_data/tokenizers/punkt_tab/english/ exists."
+    )
+
+
+def _assert_punkt() -> None:
+    """Preflight that can actually fail: resolve the tokenizer data path
+    BEFORE any scoring, and refuse with both fix paths if it is absent.
+    `nltk.data.find` raises LookupError on a missing resource; nothing
+    here trusts a download call's silence."""
+    import nltk
+
+    try:
+        nltk.data.find("tokenizers/punkt_tab/english/")
+    except LookupError:
+        raise SystemExit("[rouge] PREFLIGHT FAILED.\n" + _punkt_fix_message())
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--input", required=True, help="cell JSONL")
@@ -136,6 +177,7 @@ def main() -> None:
     ap.add_argument("--json", action="store_true", help="emit JSON only")
     args = ap.parse_args()
 
+    _assert_punkt()
     out = score_file(Path(args.input), load_gold(args.split))
     if args.json:
         print(json.dumps(out, indent=2))

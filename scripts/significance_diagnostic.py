@@ -66,10 +66,23 @@ CAVEATS THE OUTPUT CANNOT SHOW YOU
     retrieval score is skipped; retrieval rows there are empty by
     construction, not by failure.
   * M1 is closed-book and has no retrieval at all.
-  * narrativeqa_M4 was never completed, so its pairs are absent.
-  * These are gpt-4o-mini-era answer scores. Retrieval deltas are
-    generator-independent and survive a generator change; ANSWER deltas
-    do not, and must be re-measured under the local generators.
+  * ANSWER-DELTA PROVENANCE IS READ, NOT ASSERTED. An earlier version
+    printed a hardcoded "gpt-4o-mini-era, must be re-measured" note --
+    written when that was true and still printing over the local-Qwen
+    P10 bank (instance 15 of the recurring lesson: the summaries beside
+    every JSONL RECORD the generator, and the note ignored them). The
+    generator line is now derived from the sibling .summary.json files;
+    disagreement across cells prints every distinct value, because two
+    generators in one bank would itself be a finding.
+  * THE MULTIHOP ANSWER FAMILY INCLUDES THE 301 NULL ROWS at their
+    declared pure-refusal scores (n = 2,556). That is the frozen P1
+    contract: null-rule scores are first-class answer scores, and the
+    tested family matches the reported primary column. There is NO
+    answerable-only family here -- adding one after seeing results
+    would be selecting an analysis conditioned on the outcome; if one
+    is ever wanted it must land as a clearly-labelled post-hoc
+    supplementary aligned with the caption-7 supplementary mean, by
+    explicit ruling.
 """
 
 from __future__ import annotations
@@ -170,6 +183,40 @@ def paired_deltas(
         if a[k][metric] is not None and b[k][metric] is not None
     ]
     return np.asarray(vals, dtype=float)
+
+
+def _generator_note(root: Path) -> str:
+    """The answer-delta provenance line, READ from the sibling summaries.
+
+    Never a hardcoded era claim: the previous version printed
+    "gpt-4o-mini-era, must be re-measured" over a local-Qwen bank because
+    the string was written when it was true and consumed nothing. Every
+    cell summary records model_revisions.generator; this reads them all
+    and reports what is actually there, including disagreement -- two
+    generators in one bank would itself be a finding, not a formatting
+    problem."""
+    gens: set[str] = set()
+    n_read = 0
+    for sp in sorted(root.glob("*.summary.json")):
+        try:
+            summary = json.loads(sp.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        n_read += 1
+        g = (summary.get("model_revisions") or {}).get("generator")
+        if g:
+            gens.add(str(g))
+    if not n_read:
+        return ("Answer-delta generator: NO summaries found beside the "
+                "JSONLs -- provenance unrecorded here.")
+    if not gens:
+        return (f"Answer-delta generator: unrecorded in the {n_read} "
+                "summaries read.")
+    if len(gens) == 1:
+        return f"Answer deltas were produced under generator: {gens.pop()}."
+    return ("WARNING -- answer deltas span MULTIPLE generators: "
+            + ", ".join(sorted(gens))
+            + ". Cross-generator answer deltas are not comparable.")
 
 
 def permutation_p(d: np.ndarray, rng: np.random.Generator, n_perm: int = N_PERM) -> float:
@@ -321,8 +368,13 @@ def main() -> None:
     print(
         "NOTE: 'SUPPORTED' = Holm-adjusted permutation p < alpha AND the "
         "bootstrap CI excludes zero. 'marginal' = one of the two only. "
-        "Retrieval deltas are generator-independent; answer deltas are "
-        "gpt-4o-mini-era and must be re-measured under the local generators."
+        "Retrieval deltas are generator-independent. "
+        + _generator_note(root)
+    )
+    print(
+        "NOTE: the MultiHop answer family includes its 301 null rows at "
+        "their declared pure-refusal scores (n=2,556) -- the tested "
+        "family is the reported primary column, per the frozen contract."
     )
 
 
