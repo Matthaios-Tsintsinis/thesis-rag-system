@@ -67,7 +67,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src import paths
-from src.retrievers.m4_raptor import RaptorSystem
+from src.retrievers.m4_raptor import M4_SUBSTRATE_NAMESPACE, RaptorSystem
 from src.cache import corpus_content_hash
 from scripts.report_children_per_parent import (
     BENCHMARKS,
@@ -121,6 +121,14 @@ def main() -> None:
     ap.add_argument("--expect-parents-b", type=int, default=None)
     ap.add_argument("--expect-degenerate", type=int, default=None,
                     help="banked degenerate count; asserted for BOTH eras")
+    ap.add_argument("--emit-dirs-a", default=None,
+                    help="AFTER the aggregate assertions pass, write era A's "
+                         "matched cache directory paths (one per line) to "
+                         "this file -- the deletion list for a ruled purge. "
+                         "Refused unless era A and era B resolve to DISJOINT "
+                         "directory sets, so the other era's trees are "
+                         "provably untouchable by anything consuming the "
+                         "list.")
     args = ap.parse_args()
 
     if not (args.summary_a or args.pick_env_a) or not (args.summary_b or args.pick_env_b):
@@ -165,10 +173,12 @@ def main() -> None:
             if st is None:
                 missing.append((tag, str(u.corpus_id)))
                 continue
-            per_era[tag] = st
+            per_era[tag] = {"st": st, "dir": sel[0]["_dir"]}
         if len(per_era) == 2:
             rows.append({"corpus_id": str(u.corpus_id),
-                         "a": per_era["A"], "b": per_era["B"]})
+                         "a": per_era["A"]["st"], "b": per_era["B"]["st"],
+                         "dir_a": per_era["A"]["dir"],
+                         "dir_b": per_era["B"]["dir"]})
 
     if ambiguous:
         raise SystemExit(f"[diff] REFUSING: {len(ambiguous)} (era, unit) pairs "
@@ -205,6 +215,24 @@ def main() -> None:
         raise SystemExit("[diff] PROBE INVALID -- selected manifests do not "
                          "reproduce the banked aggregates; the diff below "
                          "would compare the wrong trees:\n  " + "\n  ".join(bad))
+
+
+    if args.emit_dirs_a:
+        dirs_a = {r["dir_a"] for r in rows}
+        dirs_b = {r["dir_b"] for r in rows}
+        overlap = dirs_a & dirs_b
+        if overlap:
+            raise SystemExit(f"[diff] REFUSING to emit: {len(overlap)} "
+                             "directories are matched by BOTH eras -- the "
+                             "selectors do not separate the eras and a "
+                             "deletion list would be unsafe.")
+        ns = cache_root / M4_SUBSTRATE_NAMESPACE
+        out = Path(args.emit_dirs_a)
+        out.write_text("".join(str(ns / d) + "\n" for d in sorted(dirs_a)),
+                       encoding="utf-8")
+        print(f"[diff] wrote {len(dirs_a)} era-A directory paths to {out} "
+              f"(era B holds {len(dirs_b)} distinct directories; sets "
+              "disjoint)")
 
     # --- the diff -------------------------------------------------------
     diffs = []
