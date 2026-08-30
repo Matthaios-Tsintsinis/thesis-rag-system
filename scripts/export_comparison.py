@@ -90,7 +90,7 @@ def _recall_from_sidecar(bank: Path, stem: str, expected_n: int) -> dict:
     """recall@K recomputed from the sidecar ROWS (the banked artifact,
     written by replay_retrieval behind its per-row gate). Refuses -- by
     ruling, NEVER falls back to hit@5 -- when the sidecar is missing."""
-    side = bank / f"{stem}.rankings.jsonl"
+    side = bank / f"rankings.{stem}.jsonl"
     if not side.is_file():
         _fail(f"{stem}: sidecar {side} is MISSING -- run "
               "scripts.replay_retrieval first; by ruling this exporter "

@@ -27,9 +27,16 @@ def _rc(rank, atoms):
     return RetrievedChunk(chunk=c, score=1.0 / (rank + 1), rank=rank)
 
 
+def _rc_multi(rank, atom_lists):
+    c = Chunk(chunk_id=f"c{rank}", doc_id="d", text="t", n_words=1,
+              position=rank, gold_provenance=tuple(atom_lists))
+    return RetrievedChunk(chunk=c, score=1.0 / (rank + 1), rank=rank)
+
+
 FIXTURES = [
     # (retrieved atom stamps in rank order, gold atoms)
     ([("a", "<w>")], {("a", "<w>")}),
+    # duplicate document across ranks: dedup credits it ONCE
     ([("a", "<w>"), ("b", "<w>"), ("a", "<w>"), ("c", "<w>")],
      {("b", "<w>"), ("c", "<w>")}),
     ([("x", "<w>"), ("y", "<w>"), ("z", "<w>")], {("q", "<w>")}),
@@ -61,6 +68,31 @@ class TestCollapseOracle(unittest.TestCase):
             if len(gold) == 2 and st["hit_at_k"][5] == 1.0:
                 self.assertGreaterEqual(st["recall_at_k"][5], 0.5)
 
+    def test_summary_node_never_credited_and_dup_gold_counted_once(self):
+        # rank 0: a SUMMARY NODE (no provenance -- exactly how M4's
+        # summary units appear); rank 1 + rank 3: the SAME gold doc
+        # twice; rank 2: a non-gold doc. Oracle + mirror must agree, the
+        # summary node must contribute nothing, and the duplicated gold
+        # doc must be counted at most once (recall capped at 1/n_gold
+        # per doc).
+        retrieved = [
+            _rc_multi(0, []),                     # summary node
+            _rc(1, [("g", "<w>")]),
+            _rc(2, [("x", "<w>")]),
+            _rc(3, [("g", "<w>")]),               # duplicate of rank 1
+        ]
+        gold = frozenset({("g", "<w>"), ("h", "<w>")})
+        oracle = score_retrieval_rank_aware(retrieved, gold,
+                                            k_values=(1, 5, 10))
+        ranking = collapse_to_doc_ranking(retrieved)
+        self.assertEqual(ranking, [("g", "<w>"), ("x", "<w>")])
+        mine = rank_stats_from_ranking(ranking, gold, (1, 5, 10))
+        self.assertEqual(mine["mrr"], oracle["mrr"])
+        for k in (1, 5, 10):
+            self.assertEqual(mine["hit_at_k"][k], oracle["hit_at_k"][k])
+        # dup gold counted once: recall@5 = 1/2, never 2/2
+        self.assertEqual(mine["recall_at_k"][5], 0.5)
+
     def test_recall_values(self):
         stamps = [("a", "<w>"), ("b", "<w>"), ("c", "<w>"), ("d", "<w>"),
                   ("e", "<w>"), ("f", "<w>")]
@@ -73,15 +105,16 @@ class TestCollapseOracle(unittest.TestCase):
         self.assertEqual(st["recall_at_k"][10], 1.0)
 
 
-class _Replayed:
-    def __init__(self, **kw):
-        self.skipped = kw.get("skipped", False)
-        self.f1 = kw.get("f1", 0.5)
-        self.recall = kw.get("recall", 0.5)
-        self.precision = kw.get("precision", 0.5)
-        self.mrr = kw.get("mrr", 1.0)
-        self.hit_at_k = kw.get("hit_at_k", {1: 1.0})
-        self.map_at_k = kw.get("map_at_k", {1: 1.0})
+from src.eval.types import RetrievalScore
+
+
+def _Replayed(**kw):
+    """The REAL production dataclass (the GoldAnswer standard), with the
+    row-gate fields defaulted to the banked fixture's values."""
+    base = dict(skipped=False, f1=0.5, recall=0.5, precision=0.5,
+                mrr=1.0, hit_at_k={1: 1.0}, map_at_k={1: 1.0})
+    base.update(kw)
+    return RetrievalScore(**base)
 
 
 class TestRowGate(unittest.TestCase):

@@ -5,9 +5,15 @@ MAP@K / MRR) and never written to any row, so recall@5 was not
 derivable post-hoc. This tool re-runs RETRIEVAL ONLY over the warm
 substrates for the 18 ranked cells (M2/M3/M4 x MultiHop / HotpotQA /
 pooled x both generators), writes each cell's per-row document ranking
-to a SIDECAR beside the banked cell (`<stem>.rankings.jsonl` +
-`<stem>.rankings.summary.json`; the banked JSONL is never opened for
-writing), and computes recall@{1,5,10}. Once the sidecars exist, recall
+to a SIDECAR beside the banked cell (`rankings.<stem>.jsonl` +
+`rankings.<stem>.json`; the banked JSONL is never opened for writing),
+and computes recall@{1,5,10}. THE SIDECAR NAMES ARE GLOB-SAFE BY
+AUDIT: they begin with `rankings.` and end without `.summary.json`, so
+they match NONE of the bank's discovery patterns -- not the bank
+gates' `*.summary.json` (runner.py), not aggregate's rglob, and not
+significance_diagnostic's `{bench}_{sys}_*.jsonl` fallback. A
+`<stem>.rankings.summary.json` name would have been swept into the
+bank-gate population; found and renamed in the pre-flight audit. Once the sidecars exist, recall
 at any K is derivable forever and this replay never needs repeating.
 
 THE GATE — the new artifact earns trust by re-deriving the old one
@@ -188,8 +194,8 @@ def replay_cell(bank: Path, generator: str, benchmark_name: str,
     stem = f"{benchmark_name}_{system_id}_validation"
     spath = bank / f"{stem}.summary.json"
     jpath = bank / f"{stem}.jsonl"
-    side_rows = bank / f"{stem}.rankings.jsonl"
-    side_sum = bank / f"{stem}.rankings.summary.json"
+    side_rows = bank / f"rankings.{stem}.jsonl"
+    side_sum = bank / f"rankings.{stem}.json"
     if not spath.is_file() or not jpath.is_file():
         _fail(f"missing banked cell {stem} in {bank}")
     if side_rows.exists() and not force:
@@ -202,6 +208,23 @@ def replay_cell(bank: Path, generator: str, benchmark_name: str,
         _fail(f"{stem}: generator {summary.get('generator')!r} != bank's "
               f"{generator!r}")
     banked = _load_banked_rows(jpath)
+
+    # KEY-COMPONENT IDENTITY: the substrate key folds the topology env;
+    # asserting the replay host's resolved env string equals the banked
+    # cell's recorded one proves the replay computes the SAME key the
+    # cell banked under (the warm probe then proves the artifact exists
+    # under it). Skipped only when the summary predates the field.
+    banked_env = summary.get("tree_build_env")
+    if banked_env:
+        try:
+            from src.raptor_paper import PAPER_TREE_BUILD_ENV
+        except Exception:
+            PAPER_TREE_BUILD_ENV = None
+        if PAPER_TREE_BUILD_ENV is not None and PAPER_TREE_BUILD_ENV != banked_env:
+            _fail(f"{stem}: replay host topology env "
+                  f"{PAPER_TREE_BUILD_ENV!r} != banked {banked_env!r} -- "
+                  "the substrate key would differ from the cell's; run "
+                  "under the pinned stack (blocks E/F)")
 
     cfg = replace(
         DEFAULT_CONFIG,

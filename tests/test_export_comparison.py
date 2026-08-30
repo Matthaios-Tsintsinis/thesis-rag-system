@@ -103,7 +103,7 @@ def _write_cell(bank: Path, generator, benchmark, system):
 def _write_sidecar(bank: Path, benchmark, system):
     # replay-produced rankings: 4 rank-scored rows, recall@5 0.5 each
     stem = f"{benchmark}_{system}_validation"
-    with (bank / f"{stem}.rankings.jsonl").open("w", encoding="utf-8") as f:
+    with (bank / f"rankings.{stem}.jsonl").open("w", encoding="utf-8") as f:
         for i in range(4):
             f.write(json.dumps({
                 "query_id": f"q{i}", "n_gold": 2,
@@ -131,8 +131,15 @@ def _fixture(tmp: Path):
 
 class TestComparison(unittest.TestCase):
     def test_em_immunity_of_the_credited_refusal(self):
-        self.assertNotEqual(normalize_qasper_answer(CANON),
-                            normalize_qasper_answer("no"))
+        # executed on the REAL frozen normaliser, all three gold surface
+        # forms that pay token-F1 0.5 on MultiHop
+        for gold in ("no", "No", "no."):
+            self.assertNotEqual(normalize_qasper_answer(CANON),
+                                normalize_qasper_answer(gold), gold)
+        # and the same-function-object guarantee, not a copy
+        from src.eval.scorers.extractive import (
+            normalize_qasper_answer as frozen)
+        self.assertIs(normalize_qasper_answer, frozen)
 
     def test_gold_texts_extracts_strings_from_real_gold_objects(self):
         q = _query("qx", ("alpha", "beta"))
@@ -200,7 +207,7 @@ class TestComparison(unittest.TestCase):
     def test_refuses_missing_sidecar(self):
         with TemporaryDirectory() as td:
             p10, p11, gm, rec = _fixture(Path(td))
-            (p11 / "hotpotqa_M4_validation.rankings.jsonl").unlink()
+            (p11 / "rankings.hotpotqa_M4_validation.jsonl").unlink()
             with self.assertRaises(SystemExit) as cm:
                 build_comparison(p10, p11, gm, recorded=rec)
             self.assertIn("sidecar", str(cm.exception))
@@ -209,7 +216,7 @@ class TestComparison(unittest.TestCase):
         # recall@5 > hit@5 is impossible; a sidecar claiming it is a bug
         with TemporaryDirectory() as td:
             p10, p11, gm, rec = _fixture(Path(td))
-            stem = p10 / "hotpotqa_M2_validation.rankings.jsonl"
+            stem = p10 / "rankings.hotpotqa_M2_validation.jsonl"
             rows_ = [json.loads(l) for l in
                      stem.read_text(encoding="utf-8").strip().splitlines()]
             for r in rows_:
