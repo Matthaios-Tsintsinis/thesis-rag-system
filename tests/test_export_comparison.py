@@ -13,10 +13,12 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from src.eval.scorers.extractive import normalize_qasper_answer
+from src.eval.types import EvalQuery, GoldAnswer
 from scripts.export_comparison import (
     ROW_ORDER,
     build_comparison,
     checksum_line,
+    gold_texts,
     write_outputs,
 )
 from scripts.export_matrix import BENCHMARKS, LLAMA, QWEN, SYSTEMS
@@ -50,10 +52,26 @@ def _cell_rows(benchmark, system):
     return rows
 
 
-GOLDS = {"q0": ("no",),                 # credited under token-F1; EM must be 0
-         "q1": ("paris",),
-         "q2": ("paris", "france"),     # max over references
-         "q3": ("answer",)}             # article stripped by the normaliser
+def _query(qid, texts):
+    """A REAL EvalQuery holding REAL GoldAnswer objects. The first
+    shipped exporter passed GoldAnswer objects into the normaliser and
+    the fixture hid it by feeding strings; the map now derives through
+    `gold_texts` over the production types, so that defect class fails
+    here first."""
+    return EvalQuery(
+        query_id=qid, question_text="q?", parent_scope=None,
+        gold_answers=tuple(GoldAnswer(answer_type="free_form",
+                                      free_form=t) for t in texts),
+        gold_passage_sets=(), question_type="free_form", metadata={})
+
+
+GOLD_QUERIES = (
+    _query("q0", ("no",)),              # credited under token-F1; EM must be 0
+    _query("q1", ("paris",)),
+    _query("q2", ("paris", "france")),  # max over references
+    _query("q3", ("answer",)),          # article stripped by the normaliser
+)
+GOLDS = {str(q.query_id): gold_texts(q) for q in GOLD_QUERIES}
 
 
 def _write_cell(bank: Path, generator, benchmark, system):
@@ -100,6 +118,19 @@ class TestComparison(unittest.TestCase):
     def test_em_immunity_of_the_credited_refusal(self):
         self.assertNotEqual(normalize_qasper_answer(CANON),
                             normalize_qasper_answer("no"))
+
+    def test_gold_texts_extracts_strings_from_real_gold_objects(self):
+        q = _query("qx", ("alpha", "beta"))
+        out = gold_texts(q)
+        self.assertEqual(out, ("alpha", "beta"))
+        for t in out:
+            self.assertIsInstance(t, str)
+        # empty free_form is filtered, never normalised
+        empty = EvalQuery(
+            query_id="qe", question_text="q?", parent_scope=None,
+            gold_answers=(GoldAnswer(answer_type="free_form", free_form=""),),
+            gold_passage_sets=(), question_type="free_form", metadata={})
+        self.assertEqual(gold_texts(empty), ())
 
     def test_happy_path(self):
         with TemporaryDirectory() as td:

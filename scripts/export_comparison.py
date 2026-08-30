@@ -1,5 +1,6 @@
 """Export the per-dataset comparison tables (COMPARISON.md + .csv):
-rows LLM/flat/raptor/bm25-hybrid per generator, columns F1 | EM | rank@5.
+rows LLM/flat/raptor/bm25-hybrid per generator, columns F1 | EM | hit@5
+(labelled hit@5 everywhere, by ruling -- never R@5).
 
 POST-HOC, AND SAYS SO. EM was never a pre-registered metric; it is
 computed here after the fact from the banked JSONL rows, under the
@@ -224,6 +225,23 @@ def write_outputs(rows: list[dict], out_dir: Path) -> tuple[Path, Path]:
     return csv_path, md_path
 
 
+def gold_texts(q) -> tuple[str, ...]:
+    """Gold reference TEXTS for one EvalQuery.
+
+    `gold_answers` holds GoldAnswer dataclasses, not strings — every
+    live benchmark writes the reference text into `free_form` (HotpotQA
+    stores its yes/no golds there as text too; see hotpotqa.py's own
+    score_answer), so this mirrors the frozen scorers' read
+    (`gold.free_form`) rather than inventing a second convention. The
+    first shipped version passed the OBJECTS through and TypeError-ed on
+    the first real cell while the tests fed strings — the fixture now
+    goes through this function against real GoldAnswer objects so that
+    class cannot recur.
+    """
+    return tuple(g.free_form for g in (q.gold_answers or ())
+                 if getattr(g, "free_form", ""))
+
+
 def _gold_maps_from_loaders() -> dict[str, dict[str, tuple[str, ...]]]:
     from scripts.report_children_per_parent import _benchmark
     maps: dict[str, dict[str, tuple[str, ...]]] = {}
@@ -231,7 +249,7 @@ def _gold_maps_from_loaders() -> dict[str, dict[str, tuple[str, ...]]]:
         m: dict[str, tuple[str, ...]] = {}
         for unit in _benchmark(benchmark).iter_eval_units(split="validation"):
             for q in unit.queries:
-                golds = tuple(g for g in (q.gold_answers or ()) if g)
+                golds = gold_texts(q)
                 if golds:
                     m[str(q.query_id)] = golds
         maps[benchmark] = m
