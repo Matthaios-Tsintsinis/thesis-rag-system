@@ -82,7 +82,33 @@ DATASET_LABEL = {"multihop_rag": "MHR", "narrativeqa": "NQA",
                  "hotpotqa_pooled": "HPQA-pooled"}
 CSV_COLUMNS = ["generator", "benchmark", "system", "label",
                "f1_primary", "f1_supplementary", "em", "n_em_population",
-               "hit_at_5", "recall_at_5", "n_rank_population"]
+               "hit_at_5", "recall_at_1", "recall_at_5", "recall_at_10",
+               "n_rank_population"]
+
+
+def _recall_from_sidecar(bank: Path, stem: str, expected_n: int) -> dict:
+    """recall@K recomputed from the sidecar ROWS (the banked artifact,
+    written by replay_retrieval behind its per-row gate). Refuses -- by
+    ruling, NEVER falls back to hit@5 -- when the sidecar is missing."""
+    side = bank / f"{stem}.rankings.jsonl"
+    if not side.is_file():
+        _fail(f"{stem}: sidecar {side} is MISSING -- run "
+              "scripts.replay_retrieval first; by ruling this exporter "
+              "refuses rather than falling back to hit@5")
+    sums = {"1": 0.0, "5": 0.0, "10": 0.0}
+    n = 0
+    with side.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            r = json.loads(line)
+            for k in sums:
+                sums[k] += float(r["recall_at_k"][k])
+            n += 1
+    if n != expected_n:
+        _fail(f"{stem}: sidecar holds {n} rows, expected {expected_n}")
+    return {k: sums[k] / n for k in sums}
 
 
 def _em_and_hit5(bank: Path, benchmark: str, system: str,
@@ -164,6 +190,19 @@ def build_comparison(p10: Path, p11: Path,
                                      .read_text(encoding="utf-8"))
                 extra = _em_and_hit5(bank, benchmark, system,
                                      gold_maps[benchmark], summary)
+                ranked_cell = system != "M1" and benchmark != "narrativeqa"
+                recall = (_recall_from_sidecar(
+                              bank, stem, extra["n_rank_population"])
+                          if ranked_cell else None)
+                if ranked_cell:
+                    h5 = float(extra["hit_at_5"])
+                    if recall["5"] > h5 + 1e-12:
+                        _fail(f"{stem}: recall@5 {recall['5']} > hit@5 "
+                              f"{h5} -- impossible; a bug, not a finding")
+                    if (benchmark != "multihop_rag"
+                            and recall["5"] < h5 / 2 - 1e-12):
+                        _fail(f"{stem}: recall@5 {recall['5']} < hit@5/2 "
+                              "on a two-gold benchmark -- impossible")
                 rows.append({
                     "generator": generator, "benchmark": benchmark,
                     "system": system, "label": label,
@@ -173,7 +212,12 @@ def build_comparison(p10: Path, p11: Path,
                     "n_em_population": extra["n_em_population"],
                     "hit_at_5": ("" if extra["hit_at_5"] is None
                                  else repr(round(extra["hit_at_5"], 10))),
-                    "recall_at_5": "",   # NOT derivable from the bank; see module docstring
+                    "recall_at_1": ("" if recall is None
+                                    else repr(round(recall["1"], 10))),
+                    "recall_at_5": ("" if recall is None
+                                    else repr(round(recall["5"], 10))),
+                    "recall_at_10": ("" if recall is None
+                                     else repr(round(recall["10"], 10))),
                     "n_rank_population": ("" if extra["n_rank_population"]
                                           is None
                                           else extra["n_rank_population"]),
@@ -212,11 +256,11 @@ def write_outputs(rows: list[dict], out_dir: Path) -> tuple[Path, Path]:
                 "answerable rows only). **EM is immune to the "
                 "credited-refusal artifact by construction** — a bare "
                 "\"no\" gold against the canonical refusal string is NOT "
-                "an EM match. **The rank@5 column is hit@5** (banked per "
-                "row); recall@5 is NOT derivable post-hoc — the depth-50 "
-                "ranking was consumed at run time and never banked — so "
-                "that column is deliberately empty rather than "
-                "approximated. \"bm25\" = M3, the hybrid dense+BM25 RRF "
+                "an EM match. **R@5 = recall@5 from replayed "
+                "rankings, gated against banked hit@K/MRR/set-F1** "
+                "(scripts/replay_retrieval.py sidecars; the exporter "
+                "REFUSES when a sidecar is missing, never falls back to "
+                "hit@5, which now lives in the CSV only). \"bm25\" = M3, the hybrid dense+BM25 RRF "
                 "system. Retrieval figures are generator-identical by "
                 "construction for M2/M3 (bit-identity proven); M4's are "
                 "tree-dependent and legitimately differ per generator. "
@@ -227,17 +271,18 @@ def write_outputs(rows: list[dict], out_dir: Path) -> tuple[Path, Path]:
                 sub = [r for r in rows if r["generator"] == generator
                        and r["benchmark"] == benchmark]
                 f.write(f"## {DATASET_LABEL[benchmark]} — {generator}\n\n")
-                f.write("| system | F1 | EM | hit@5 |\n|---|---|---|---|\n")
+                f.write("| system | F1 | EM | R@5 |\n|---|---|---|---|\n")
                 for r in sub:
                     f1 = _fmt(r["f1_primary"])
                     if benchmark == "multihop_rag":
                         f1 += f" ({_fmt(r['f1_supplementary'])})"
                     f.write(f"| {r['label']} | {f1} | {_fmt(r['em'])} | "
-                            f"{_fmt(r['hit_at_5'], 3)} |\n")
+                            f"{_fmt(r['recall_at_5'], 3)} |\n")
                 f.write("\n")
         f.write("MultiHop F1 cells show primary (supplementary) per "
-                "caption 7. hit@5 n/a for LLM rows (no retrieval) and all "
-                "NQA rows (no retrieval ground truth).\n")
+                "caption 7. R@5 n/a for LLM rows (no retrieval) and all "
+                "NQA rows (no retrieval ground truth); hit@5 and "
+                "recall@1/@10 are recorded in the CSV, not tabled.\n")
     return csv_path, md_path
 
 

@@ -100,6 +100,19 @@ def _write_cell(bank: Path, generator, benchmark, system):
             f.write(json.dumps(r) + "\n")
 
 
+def _write_sidecar(bank: Path, benchmark, system):
+    # replay-produced rankings: 4 rank-scored rows, recall@5 0.5 each
+    stem = f"{benchmark}_{system}_validation"
+    with (bank / f"{stem}.rankings.jsonl").open("w", encoding="utf-8") as f:
+        for i in range(4):
+            f.write(json.dumps({
+                "query_id": f"q{i}", "n_gold": 2,
+                "gold": [["a", "<w>"], ["b", "<w>"]],
+                "doc_ranking": [["a", "<w>"], ["x", "<w>"]],
+                "recall_at_k": {"1": 0.5, "5": 0.5, "10": 0.5},
+            }) + chr(10))
+
+
 def _fixture(tmp: Path):
     p10, p11 = tmp / "p10", tmp / "p11"
     p10.mkdir()
@@ -108,6 +121,8 @@ def _fixture(tmp: Path):
         for benchmark in BENCHMARKS:
             for system in SYSTEMS:
                 _write_cell(bank, generator, benchmark, system)
+                if system != "M1" and benchmark != "narrativeqa":
+                    _write_sidecar(bank, benchmark, system)
     recorded = {(g, b, s): (1, 0.5)
                 for g in (QWEN, LLAMA) for b in BENCHMARKS for s in SYSTEMS}
     gold_maps = {b: dict(GOLDS) for b in BENCHMARKS}
@@ -152,9 +167,10 @@ class TestComparison(unittest.TestCase):
             m2 = by[(QWEN, "hotpotqa", "M2")]
             self.assertEqual(float(m2["hit_at_5"]), 0.75)
             self.assertEqual(m2["n_rank_population"], 4)
+            self.assertEqual(float(m2["recall_at_5"]), 0.5)
+            self.assertEqual(float(m2["recall_at_1"]), 0.5)
             self.assertEqual(by[(QWEN, "narrativeqa", "M2")]["hit_at_5"], "")
-            for r in rows:
-                self.assertEqual(r["recall_at_5"], "")
+            self.assertEqual(by[(QWEN, "narrativeqa", "M2")]["recall_at_5"], "")
 
     def test_checksum_counts(self):
         with TemporaryDirectory() as td:
@@ -162,9 +178,10 @@ class TestComparison(unittest.TestCase):
             rows = build_comparison(p10, p11, gm, recorded=rec)
             line = checksum_line(rows)
             self.assertIn("rows=32", line)
-            # hit@5 filled for 3 systems x 3 ranked benchmarks x 2 gens
+            # 3 systems x 3 ranked benchmarks x 2 gens
             self.assertIn("hit_at_5:18", line)
-            self.assertIn("recall_at_5:0", line)
+            self.assertIn("recall_at_5:18", line)
+            self.assertIn("recall_at_1:18", line)
             self.assertIn("em:32", line)
 
     def test_md_output(self):
@@ -177,6 +194,32 @@ class TestComparison(unittest.TestCase):
             self.assertEqual(md.count("## "), 8)      # eight tables
             self.assertIn(checksum_line(rows), md)
             self.assertIn("bm25-hybrid", md)
+            self.assertIn("| system | F1 | EM | R@5 |", md)
+            self.assertNotIn("| system | F1 | EM | hit@5 |", md)
+
+    def test_refuses_missing_sidecar(self):
+        with TemporaryDirectory() as td:
+            p10, p11, gm, rec = _fixture(Path(td))
+            (p11 / "hotpotqa_M4_validation.rankings.jsonl").unlink()
+            with self.assertRaises(SystemExit) as cm:
+                build_comparison(p10, p11, gm, recorded=rec)
+            self.assertIn("sidecar", str(cm.exception))
+
+    def test_refuses_recall_bound_violation(self):
+        # recall@5 > hit@5 is impossible; a sidecar claiming it is a bug
+        with TemporaryDirectory() as td:
+            p10, p11, gm, rec = _fixture(Path(td))
+            stem = p10 / "hotpotqa_M2_validation.rankings.jsonl"
+            rows_ = [json.loads(l) for l in
+                     stem.read_text(encoding="utf-8").strip().splitlines()]
+            for r in rows_:
+                r["recall_at_k"]["5"] = 1.0    # mean 1.0 > hit@5 0.75
+            stem.write_text(
+                chr(10).join(json.dumps(r) for r in rows_) + chr(10),
+                encoding="utf-8")
+            with self.assertRaises(SystemExit) as cm:
+                build_comparison(p10, p11, gm, recorded=rec)
+            self.assertIn("impossible", str(cm.exception))
 
     def test_refuses_missing_gold(self):
         with TemporaryDirectory() as td:
