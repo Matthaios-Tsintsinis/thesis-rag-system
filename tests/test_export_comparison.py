@@ -186,13 +186,43 @@ class TestComparison(unittest.TestCase):
                 build_comparison(p10, p11, gm, recorded=rec)
             self.assertIn("no gold", str(cm.exception))
 
-    def test_refuses_rank_population_mismatch(self):
+    def test_refuses_self_inconsistent_summary(self):
         with TemporaryDirectory() as td:
             p10, p11, gm, rec = _fixture(Path(td))
             stem = p10 / "hotpotqa_M3_validation.summary.json"
             s = json.loads(stem.read_text(encoding="utf-8"))
             s["n_retrieval_scored"] = 9
             stem.write_text(json.dumps(s), encoding="utf-8")
+            with self.assertRaises(SystemExit) as cm:
+                build_comparison(p10, p11, gm, recorded=rec)
+            self.assertIn("self-inconsistent", str(cm.exception))
+
+    def test_old_schema_without_n_retrieval_scored_passes(self):
+        # the ab0c7c0-era summaries predate the key; absence must be
+        # DERIVED around, never coerced to zero (the incident of
+        # 2026-08-31: a value that does not exist, consumed as if it did)
+        with TemporaryDirectory() as td:
+            p10, p11, gm, rec = _fixture(Path(td))
+            stem = p10 / "multihop_rag_M4_validation.summary.json"
+            s = json.loads(stem.read_text(encoding="utf-8"))
+            del s["n_retrieval_scored"]
+            stem.write_text(json.dumps(s), encoding="utf-8")
+            rows = build_comparison(p10, p11, gm, recorded=rec)
+            by = {(r["generator"], r["benchmark"], r["system"]): r
+                  for r in rows}
+            self.assertEqual(
+                by[(QWEN, "multihop_rag", "M4")]["n_rank_population"], 4)
+
+    def test_refuses_row_side_rank_shortfall(self):
+        with TemporaryDirectory() as td:
+            p10, p11, gm, rec = _fixture(Path(td))
+            jpath = p10 / "hotpotqa_M2_validation.jsonl"
+            lines = jpath.read_text(encoding="utf-8").strip().splitlines()
+            rows = [json.loads(l) for l in lines]
+            rows[0]["retrieval"] = {"skipped": True}   # lose one ranked row
+            jpath.write_text(
+                "\n".join(json.dumps(r) for r in rows) + "\n",
+                encoding="utf-8")
             with self.assertRaises(SystemExit) as cm:
                 build_comparison(p10, p11, gm, recorded=rec)
             self.assertIn("rank population", str(cm.exception))

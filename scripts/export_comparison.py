@@ -123,10 +123,26 @@ def _em_and_hit5(bank: Path, benchmark: str, system: str,
               f"{expected_em}")
     out = {"em": em_sum / n_em, "n_em_population": n_em}
     if system != "M1" and benchmark != "narrativeqa":
-        expected_rank = int(summary.get("n_retrieval_scored") or 0)
+        # The expected rank population is DERIVED from n_answerable --
+        # a field hard-indexed by read_cell and therefore proven present
+        # in all 32 summaries -- because rank-aware rows are exactly the
+        # answerable rows on every ranked benchmark. The first version
+        # read summary.get("n_retrieval_scored") or 0: the oldest banked
+        # summary (ab0c7c0 era) predates that key, and the coerced zero
+        # refused a correct cell -- a value that does not exist,
+        # consumed as if it did (the recurring shape, inverted). Absent
+        # fields are never defaulted: where the key exists it is
+        # CROSS-CHECKED, where it does not the derived population
+        # stands, and the row-side count is the hard gate either way.
+        expected_rank = int(summary["n_answerable"])
+        declared = summary.get("n_retrieval_scored")
+        if declared is not None and int(declared) != expected_rank:
+            _fail(f"{benchmark}/{system}: summary declares "
+                  f"n_retrieval_scored {declared} against n_answerable "
+                  f"{expected_rank} -- self-inconsistent summary")
         if n_rank != expected_rank:
             _fail(f"{benchmark}/{system}: rank population {n_rank} != "
-                  f"summary n_retrieval_scored {expected_rank}")
+                  f"expected {expected_rank} (derived from n_answerable)")
         out.update({"hit_at_5": hit_sum / n_rank, "n_rank_population": n_rank})
     else:
         out.update({"hit_at_5": None, "n_rank_population": None})
