@@ -3,11 +3,15 @@
 The registries are patched but every object crossing replay_cell's
 boundary is the production dataclass (EvalUnit, EvalQuery,
 PreparedQuery, RetrievalScore, RetrievedChunk, Chunk) — the GoldAnswer
-standard. Covers the evidence the pre-flight audit demanded: a
+standard. Covers the evidence the pre-flight audit demanded — a
 single-row mismatch refuses the WHOLE cell and writes no sidecar; a
 missing warm substrate refuses before anything indexes; the pass path
-writes glob-safe sidecars whose names match none of the bank's
-discovery patterns.
+writes glob-safe sidecars — plus the corrected per-system key logic:
+M2/M3 carry no topology component and ignore tree_build_env entirely;
+M4 asserts host COMPATIBILITY (component versions + python
+major.minor) and injects the RECORDED env string verbatim through the
+replay-only override, so a pre-e907d68 token-less record resolves the
+old key.
 """
 
 from __future__ import annotations
@@ -21,11 +25,20 @@ from unittest import mock
 
 from src.chunking import Chunk
 from src.eval.types import EvalQuery, EvalUnit, RetrievalScore
+from src.raptor_paper import PAPER_TREE_BUILD_ENV
 from src.retrievers.base import PreparedQuery, RetrievedChunk
 from scripts.export_matrix import QWEN
-from scripts.replay_retrieval import replay_cell
+from scripts.replay_retrieval import _parse_env, replay_cell
 
 ATOM = ("docA", "<whole>")
+
+# host env, MEASURED from the real constant (the
+# fixture-parameters-from-real-data discipline): the compatible cases
+# are compatible on ANY host running these tests.
+HOST = _parse_env(PAPER_TREE_BUILD_ENV)
+TOKENLESS_ENV = ";".join(
+    f"{k}={v}" for k, v in HOST.items() if k != "python")
+HOST_PY_FULL = HOST.get("python", "3.12") + ".13"
 
 
 def _chunk_hit():
@@ -54,6 +67,7 @@ class FakeSystem:
     def __init__(self, config=None):
         self.config = config
         self.tree_cache_hit = True
+        self.topology_env_override = None
 
     def substrate_warm_path(self, items):
         return self.warm
@@ -77,12 +91,14 @@ class FakeBenchmark:
         return REPLAYED
 
 
-def _write_bank(bank: Path, banked_retr: dict):
-    stem = "multihop_rag_M2_validation"
-    summary = {"system": "M2", "benchmark": "multihop_rag",
+def _write_bank(bank: Path, banked_retr: dict, system="M2",
+                tree_build_env=None, env_python=None):
+    stem = f"multihop_rag_{system}_validation"
+    summary = {"system": system, "benchmark": "multihop_rag",
                "generator": QWEN, "partial_run": False,
                "n_answerable": 1, "n_queries_scored": 1,
-               "tree_build_env": None}
+               "environment": {"python": env_python or HOST_PY_FULL},
+               "tree_build_env": tree_build_env}
     (bank / f"{stem}.summary.json").write_text(json.dumps(summary),
                                                encoding="utf-8")
     row = {"query_id": "q0",
@@ -102,16 +118,17 @@ BANK_DISCOVERY_PATTERNS = (
     "*.summary.json",                       # bank gates + aggregate rglob
     "multihop_rag_M2_validation_*.jsonl",   # significance stamped glob
     "multihop_rag_M2_*.jsonl",              # significance loose glob
+    "multihop_rag_M4_validation_*.jsonl",
+    "multihop_rag_M4_*.jsonl",
 )
 
 
 def _patched(fn):
+    import src.eval.runner as runner
     return mock.patch.dict(
-        __import__("src.eval.runner", fromlist=["SYSTEM_REGISTRY"]
-                   ).SYSTEM_REGISTRY, {"M2": FakeSystem})(
+        runner.SYSTEM_REGISTRY, {"M2": FakeSystem, "M4": FakeSystem})(
         mock.patch.dict(
-            __import__("src.eval.runner", fromlist=["BENCHMARK_REGISTRY"]
-                       ).BENCHMARK_REGISTRY,
+            runner.BENCHMARK_REGISTRY,
             {"multihop_rag": FakeBenchmark})(fn))
 
 
@@ -172,18 +189,125 @@ class TestReplayCellEndToEnd(unittest.TestCase):
             self.assertIn("--force", str(cm.exception))
             replay_cell(bank, QWEN, "multihop_rag", "M2", force=True)
 
+
+class TestPerSystemKeyLogic(unittest.TestCase):
+    """The corrected item-4 logic, after the first-run refusal."""
+
     @_patched
-    def test_env_mismatch_refuses(self):
+    def test_m2_ignores_tree_build_env_entirely(self):
+        # the defect that refused cell 1: an M2 summary whose recorded
+        # env disagrees with the host in every component must PASS --
+        # M2's key carries no topology component
         with TemporaryDirectory() as td:
             bank = Path(td)
-            _write_bank(bank, dict(BANKED_MATCH))
-            stem = bank / "multihop_rag_M2_validation.summary.json"
-            s = json.loads(stem.read_text(encoding="utf-8"))
-            s["tree_build_env"] = "python=9.9;umap-learn=0.0.0"
-            stem.write_text(json.dumps(s), encoding="utf-8")
+            _write_bank(bank, dict(BANKED_MATCH), system="M2",
+                        tree_build_env="umap-learn=0.0.0;"
+                                       "scikit-learn=0.0.0;numpy=0.0.0",
+                        env_python="3.13.15")
+            out = replay_cell(bank, QWEN, "multihop_rag", "M2")
+            self.assertEqual(out["n_rows"], 1)
+
+    @_patched
+    def test_m4_pre_token_record_resolves_old_key(self):
+        # a pre-e907d68 cell: recorded env is TOKEN-LESS, host has the
+        # token -> compatible -> the override receives the recorded
+        # string VERBATIM (token-less), reconstructing the old key
+        captured = {}
+        orig = FakeSystem.substrate_warm_path
+
+        def spy(self, items):
+            captured["override"] = self.topology_env_override
+            return orig(self, items)
+
+        with TemporaryDirectory() as td:
+            bank = Path(td)
+            _write_bank(bank, dict(BANKED_MATCH), system="M4",
+                        tree_build_env=TOKENLESS_ENV)
+            with mock.patch.object(FakeSystem, "substrate_warm_path", spy):
+                out = replay_cell(bank, QWEN, "multihop_rag", "M4")
+            self.assertEqual(out["n_rows"], 1)
+            self.assertEqual(captured["override"], TOKENLESS_ENV)
+            self.assertNotIn("python", captured["override"])
+
+    @_patched
+    def test_m4_tokened_record_passes_and_injects_verbatim(self):
+        captured = {}
+        orig = FakeSystem.substrate_warm_path
+
+        def spy(self, items):
+            captured["override"] = self.topology_env_override
+            return orig(self, items)
+
+        with TemporaryDirectory() as td:
+            bank = Path(td)
+            _write_bank(bank, dict(BANKED_MATCH), system="M4",
+                        tree_build_env=PAPER_TREE_BUILD_ENV)
+            with mock.patch.object(FakeSystem, "substrate_warm_path", spy):
+                replay_cell(bank, QWEN, "multihop_rag", "M4")
+            self.assertEqual(captured["override"], PAPER_TREE_BUILD_ENV)
+
+    @_patched
+    def test_m4_component_mismatch_refuses(self):
+        bad_env = TOKENLESS_ENV.replace(
+            "scikit-learn=" + HOST["scikit-learn"], "scikit-learn=0.0.0")
+        with TemporaryDirectory() as td:
+            bank = Path(td)
+            _write_bank(bank, dict(BANKED_MATCH), system="M4",
+                        tree_build_env=bad_env)
             with self.assertRaises(SystemExit) as cm:
-                replay_cell(bank, QWEN, "multihop_rag", "M2")
-            self.assertIn("topology env", str(cm.exception))
+                replay_cell(bank, QWEN, "multihop_rag", "M4")
+            self.assertIn("INCOMPATIBLE", str(cm.exception))
+            self.assertIn("scikit-learn", str(cm.exception))
+
+    @_patched
+    def test_m4_python_major_minor_mismatch_refuses(self):
+        with TemporaryDirectory() as td:
+            bank = Path(td)
+            _write_bank(bank, dict(BANKED_MATCH), system="M4",
+                        tree_build_env=TOKENLESS_ENV,
+                        env_python="9.99.0")
+            with self.assertRaises(SystemExit) as cm:
+                replay_cell(bank, QWEN, "multihop_rag", "M4")
+            self.assertIn("INCOMPATIBLE", str(cm.exception))
+
+    @_patched
+    def test_m4_missing_record_refuses(self):
+        with TemporaryDirectory() as td:
+            bank = Path(td)
+            _write_bank(bank, dict(BANKED_MATCH), system="M4",
+                        tree_build_env=None)
+            with self.assertRaises(SystemExit) as cm:
+                replay_cell(bank, QWEN, "multihop_rag", "M4")
+            self.assertIn("no tree_build_env", str(cm.exception))
+
+
+class TestOverrideLever(unittest.TestCase):
+    """The replay-only injection cannot affect the runner."""
+
+    def test_runner_construction_leaves_override_none(self):
+        # the runner builds systems as system_cls(config=cfg) -- the
+        # same construction leaves the lever at None, and None is
+        # byte-identical to the pre-lever key (proven on the extra dict)
+        from src.config import DEFAULT_CONFIG
+        from src.raptor_paper import paper_substrate_extra
+        from src.retrievers.m4_raptor import RaptorSystem
+        sy = RaptorSystem(config=DEFAULT_CONFIG)
+        self.assertIsNone(sy.topology_env_override)
+        m4 = DEFAULT_CONFIG.m4
+        base = dict(params=m4.paper, summary_model=m4.summary_model,
+                    summary_prompt_version=m4.summary_prompt_version,
+                    summary_max_tokens=m4.summary_max_tokens,
+                    summary_batch_size=m4.summary_batch_size,
+                    summary_max_padded_tokens=m4.summary_max_padded_tokens,
+                    rrf_k=m4.rrf_k,
+                    include_root=m4.include_root_in_flat_index)
+        self.assertEqual(paper_substrate_extra(**base),
+                         paper_substrate_extra(**base, build_env=None))
+        self.assertEqual(
+            paper_substrate_extra(**base)["build_env"],
+            PAPER_TREE_BUILD_ENV)
+        injected = paper_substrate_extra(**base, build_env="x=1")
+        self.assertEqual(injected["build_env"], "x=1")
 
 
 if __name__ == "__main__":

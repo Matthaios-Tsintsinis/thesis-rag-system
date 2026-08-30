@@ -239,6 +239,15 @@ class RaptorSystem(BaseSystem):
         self.tree_cache_hit: bool | None = None
         self._last_trace: dict = {}
         self._resolved: ResolvedComponents | None = None
+        # REPLAY-ONLY key injection (scripts/replay_retrieval). When set,
+        # the substrate key is computed with THIS build_env string instead
+        # of the host's PAPER_TREE_BUILD_ENV -- how a replay resolves a
+        # tree banked under a pre-e907d68 (token-less) key after host
+        # compatibility is asserted. None (the default, and the only
+        # value the runner ever leaves it at) keeps the key computation
+        # BYTE-IDENTICAL: paper_substrate_extra falls back to the module
+        # constant. The safe-lever pattern from the cache-key rulings.
+        self.topology_env_override: str | None = None
 
     # --- cache identity ---------------------------------------------------
 
@@ -256,6 +265,7 @@ class RaptorSystem(BaseSystem):
             summary_max_padded_tokens=m4.summary_max_padded_tokens,
             rrf_k=m4.rrf_k,
             include_root=m4.include_root_in_flat_index,
+            build_env=self.topology_env_override,
         )
         key = compute_cache_key(
             chunking_config=self._resolved.chunker_config,

@@ -137,6 +137,15 @@ def gold_and_ranked(benchmark_name: str, q, scoring_ranking):
     return gold, _project_to_titles(list(scoring_ranking))
 
 
+def _parse_env(env: str) -> dict[str, str]:
+    out = {}
+    for part in (env or "").split(";"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
 def _floats_equal(a, b) -> bool:
     return float(a) == float(b)
 
@@ -209,22 +218,47 @@ def replay_cell(bank: Path, generator: str, benchmark_name: str,
               f"{generator!r}")
     banked = _load_banked_rows(jpath)
 
-    # KEY-COMPONENT IDENTITY: the substrate key folds the topology env;
-    # asserting the replay host's resolved env string equals the banked
-    # cell's recorded one proves the replay computes the SAME key the
-    # cell banked under (the warm probe then proves the artifact exists
-    # under it). Skipped only when the summary predates the field.
-    banked_env = summary.get("tree_build_env")
-    if banked_env:
-        try:
-            from src.raptor_paper import PAPER_TREE_BUILD_ENV
-        except Exception:
-            PAPER_TREE_BUILD_ENV = None
-        if PAPER_TREE_BUILD_ENV is not None and PAPER_TREE_BUILD_ENV != banked_env:
-            _fail(f"{stem}: replay host topology env "
-                  f"{PAPER_TREE_BUILD_ENV!r} != banked {banked_env!r} -- "
-                  "the substrate key would differ from the cell's; run "
-                  "under the pinned stack (blocks E/F)")
+    # KEY IDENTITY, scoped per system (corrected after the first-run
+    # refusal). M2/M3 keys carry NO topology component -- their
+    # substrates warm-hit across eras BY DESIGN (the six bit-identity
+    # proofs), so for them the recorded tree_build_env is informational
+    # and key identity IS the warm probe (chunker + embedder + corpus
+    # all fold into compute_cache_key). M4's key DOES fold the env, and
+    # three P10 cells predate the python token, so string equality is
+    # wrong even in principle: instead (i) assert the HOST is
+    # COMPATIBLE with the banked tree -- identical umap/sklearn/numpy
+    # versions, and the summary's python major.minor equal to the
+    # host's -- then (ii) reconstruct the banked key by injecting the
+    # RECORDED env string verbatim (token-less stays token-less) via
+    # the replay-only topology_env_override lever, which the runner
+    # never sets and which is byte-identical to the old key when None.
+    env_override = None
+    if system_id == "M4":
+        banked_env = summary.get("tree_build_env")
+        if not banked_env:
+            _fail(f"{stem}: M4 summary records no tree_build_env -- the "
+                  "banked substrate key cannot be reconstructed")
+        from src.raptor_paper import PAPER_TREE_BUILD_ENV
+        host = _parse_env(PAPER_TREE_BUILD_ENV)
+        rec = _parse_env(banked_env)
+        for pkg in ("umap-learn", "scikit-learn", "numpy"):
+            if pkg not in rec:
+                _fail(f"{stem}: banked tree_build_env lacks {pkg!r}: "
+                      f"{banked_env!r}")
+            if rec[pkg] != host.get(pkg):
+                _fail(f"{stem}: HOST INCOMPATIBLE with the banked tree: "
+                      f"{pkg} host {host.get(pkg)!r} != banked "
+                      f"{rec[pkg]!r} -- run under the pinned stack "
+                      "(blocks E/F)")
+        if "python" in rec and rec["python"] != host.get("python"):
+            _fail(f"{stem}: HOST INCOMPATIBLE: python {host.get('python')!r}"
+                  f" != banked {rec['python']!r}")
+        sum_py = ".".join(str((summary.get("environment") or {})
+                              .get("python", "")).split(".")[:2])
+        if sum_py and host.get("python") and sum_py != host["python"]:
+            _fail(f"{stem}: HOST INCOMPATIBLE: summary python {sum_py} != "
+                  f"host {host['python']}")
+        env_override = banked_env
 
     cfg = replace(
         DEFAULT_CONFIG,
@@ -233,6 +267,8 @@ def replay_cell(bank: Path, generator: str, benchmark_name: str,
         m7=replace(DEFAULT_CONFIG.m7, summary_model=generator),
     )
     system = SYSTEM_REGISTRY[system_id](config=cfg)
+    if env_override is not None:
+        system.topology_env_override = env_override
     benchmark = BENCHMARK_REGISTRY[benchmark_name]()
 
     t0 = time.time()
