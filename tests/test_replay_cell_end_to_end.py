@@ -62,21 +62,31 @@ REPLAYED = RetrievalScore(
 
 
 class FakeSystem:
-    warm = "warm-path"
-
     def __init__(self, config=None):
         self.config = config
         self.tree_cache_hit = True
         self.topology_env_override = None
-
-    def substrate_warm_path(self, items):
-        return self.warm
 
     def index_items(self, items):
         pass
 
     def prepare(self, query, k=None):
         return _prepared(query)
+
+
+def _fake_resolution(bank_holder, warm=True):
+    """Patch resolve_substrate: a real temp warm dir with a manifest
+    whose corpus_hash matches the derived one -- so replay_cell's
+    key-identity assertion runs against real files."""
+    def fake(system, system_id, items):
+        d = bank_holder["dir"] / "cachekey0000"
+        if warm:
+            d.mkdir(exist_ok=True)
+            (d / "manifest.json").write_text(
+                json.dumps({"corpus_hash": "HASH0"}), encoding="utf-8")
+            return d, "HASH0", d
+        return None, "HASH0", d
+    return fake
 
 
 class FakeBenchmark:
@@ -138,7 +148,10 @@ class TestReplayCellEndToEnd(unittest.TestCase):
         with TemporaryDirectory() as td:
             bank = Path(td)
             _write_bank(bank, dict(BANKED_MATCH))
-            out = replay_cell(bank, QWEN, "multihop_rag", "M2")
+            holder = {"dir": bank}
+            with mock.patch("scripts.replay_retrieval.resolve_substrate",
+                            _fake_resolution(holder)):
+                out = replay_cell(bank, QWEN, "multihop_rag", "M2")
             self.assertEqual(out["n_rows"], 1)
             self.assertEqual(out["recall_at_5"], 1.0)
             rows_f = bank / "rankings.multihop_rag_M2_validation.jsonl"
@@ -159,8 +172,11 @@ class TestReplayCellEndToEnd(unittest.TestCase):
             banked = dict(BANKED_MATCH)
             banked["f1"] = 0.9        # one field, one row
             _write_bank(bank, banked)
-            with self.assertRaises(SystemExit) as cm:
-                replay_cell(bank, QWEN, "multihop_rag", "M2")
+            holder = {"dir": bank}
+            with mock.patch("scripts.replay_retrieval.resolve_substrate",
+                            _fake_resolution(holder)):
+                with self.assertRaises(SystemExit) as cm:
+                    replay_cell(bank, QWEN, "multihop_rag", "M2")
             msg = str(cm.exception)
             self.assertIn("GATE FAILED", msg)
             self.assertIn("q0", msg)              # the refusal names the row
@@ -172,22 +188,49 @@ class TestReplayCellEndToEnd(unittest.TestCase):
         with TemporaryDirectory() as td:
             bank = Path(td)
             _write_bank(bank, dict(BANKED_MATCH))
-            with mock.patch.object(FakeSystem, "warm", None):
+            holder = {"dir": bank}
+            with mock.patch("scripts.replay_retrieval.resolve_substrate",
+                            _fake_resolution(holder, warm=False)):
                 with self.assertRaises(SystemExit) as cm:
                     replay_cell(bank, QWEN, "multihop_rag", "M2")
-            self.assertIn("warm substrate", str(cm.exception))
+            self.assertIn("NO COMPLETE substrate", str(cm.exception))
+            self.assertIn("cachekey0000", str(cm.exception))
             self.assertEqual(list(bank.glob("rankings.*")), [])
+
+    @_patched
+    def test_manifest_hash_disagreement_refuses(self):
+        # key identity SEEN, not inferred: a resolved dir whose manifest
+        # records a different corpus_hash refuses by name
+        with TemporaryDirectory() as td:
+            bank = Path(td)
+            _write_bank(bank, dict(BANKED_MATCH))
+            d = bank / "cachekey0000"
+            d.mkdir()
+            (d / "manifest.json").write_text(
+                json.dumps({"corpus_hash": "OTHER"}), encoding="utf-8")
+
+            def fake(system, system_id, items):
+                return d, "HASH0", d
+            with mock.patch("scripts.replay_retrieval.resolve_substrate",
+                            fake):
+                with self.assertRaises(SystemExit) as cm:
+                    replay_cell(bank, QWEN, "multihop_rag", "M2")
+            self.assertIn("corpus_hash", str(cm.exception))
+            self.assertIn("OTHER", str(cm.exception))
 
     @_patched
     def test_existing_sidecar_refuses_without_force(self):
         with TemporaryDirectory() as td:
             bank = Path(td)
             _write_bank(bank, dict(BANKED_MATCH))
-            replay_cell(bank, QWEN, "multihop_rag", "M2")
-            with self.assertRaises(SystemExit) as cm:
+            holder = {"dir": bank}
+            with mock.patch("scripts.replay_retrieval.resolve_substrate",
+                            _fake_resolution(holder)):
                 replay_cell(bank, QWEN, "multihop_rag", "M2")
-            self.assertIn("--force", str(cm.exception))
-            replay_cell(bank, QWEN, "multihop_rag", "M2", force=True)
+                with self.assertRaises(SystemExit) as cm:
+                    replay_cell(bank, QWEN, "multihop_rag", "M2")
+                self.assertIn("--force", str(cm.exception))
+                replay_cell(bank, QWEN, "multihop_rag", "M2", force=True)
 
 
 class TestPerSystemKeyLogic(unittest.TestCase):
@@ -204,7 +247,10 @@ class TestPerSystemKeyLogic(unittest.TestCase):
                         tree_build_env="umap-learn=0.0.0;"
                                        "scikit-learn=0.0.0;numpy=0.0.0",
                         env_python="3.13.15")
-            out = replay_cell(bank, QWEN, "multihop_rag", "M2")
+            holder = {"dir": bank}
+            with mock.patch("scripts.replay_retrieval.resolve_substrate",
+                            _fake_resolution(holder)):
+                out = replay_cell(bank, QWEN, "multihop_rag", "M2")
             self.assertEqual(out["n_rows"], 1)
 
     @_patched
@@ -213,17 +259,18 @@ class TestPerSystemKeyLogic(unittest.TestCase):
         # token -> compatible -> the override receives the recorded
         # string VERBATIM (token-less), reconstructing the old key
         captured = {}
-        orig = FakeSystem.substrate_warm_path
-
-        def spy(self, items):
-            captured["override"] = self.topology_env_override
-            return orig(self, items)
-
         with TemporaryDirectory() as td:
             bank = Path(td)
             _write_bank(bank, dict(BANKED_MATCH), system="M4",
                         tree_build_env=TOKENLESS_ENV)
-            with mock.patch.object(FakeSystem, "substrate_warm_path", spy):
+            holder = {"dir": bank}
+            base = _fake_resolution(holder)
+
+            def spy(system, system_id, items):
+                captured["override"] = system.topology_env_override
+                return base(system, system_id, items)
+            with mock.patch("scripts.replay_retrieval.resolve_substrate",
+                            spy):
                 out = replay_cell(bank, QWEN, "multihop_rag", "M4")
             self.assertEqual(out["n_rows"], 1)
             self.assertEqual(captured["override"], TOKENLESS_ENV)
@@ -232,17 +279,18 @@ class TestPerSystemKeyLogic(unittest.TestCase):
     @_patched
     def test_m4_tokened_record_passes_and_injects_verbatim(self):
         captured = {}
-        orig = FakeSystem.substrate_warm_path
-
-        def spy(self, items):
-            captured["override"] = self.topology_env_override
-            return orig(self, items)
-
         with TemporaryDirectory() as td:
             bank = Path(td)
             _write_bank(bank, dict(BANKED_MATCH), system="M4",
                         tree_build_env=PAPER_TREE_BUILD_ENV)
-            with mock.patch.object(FakeSystem, "substrate_warm_path", spy):
+            holder = {"dir": bank}
+            base = _fake_resolution(holder)
+
+            def spy(system, system_id, items):
+                captured["override"] = system.topology_env_override
+                return base(system, system_id, items)
+            with mock.patch("scripts.replay_retrieval.resolve_substrate",
+                            spy):
                 replay_cell(bank, QWEN, "multihop_rag", "M4")
             self.assertEqual(captured["override"], PAPER_TREE_BUILD_ENV)
 

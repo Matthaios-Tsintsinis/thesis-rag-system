@@ -186,6 +186,82 @@ def _load_banked_rows(jpath: Path) -> dict[str, dict]:
     return rows
 
 
+def assemble_cdir(system, system_id: str, corpus_hash: str):
+    """(cdir, required_files, inputs) via the SYSTEM'S OWN index-path
+    key assembly -- pinned to the banked keys by the manifest-oracle
+    tests (M2 reproduces 51a2e3f9..., M4 reproduces cc068144... from
+    the recorded corpus hashes).
+
+    WHY THIS EXISTS (the three-refusal session, 2026-08-31):
+    `BaseSystem.substrate_warm_path` defaults to an UNCONDITIONAL None
+    meaning "this system has no probe" -- its own docstring warns None
+    must not be read as checked-and-cold -- and the first replay read
+    exactly that None as a cache miss and refused the most-proven
+    substrate in the project. Only M4 overrides the probe. So the
+    replay now assembles M2/M3 keys EXACTLY as their index() does
+    (M2: no extra; M3: the sparse/fusion/rrf_k extra) and uses M4's
+    own override-aware `_cache_dir`. The key function is pure given
+    (chunking config, embedder, corpus_hash, extra), which is also
+    what makes --dry-run runnable anywhere by feeding a recorded
+    corpus hash directly."""
+    from src import paths as _paths
+    from src.cache import CacheDir, compute_cache_key
+
+    if system_id == "M4":
+        from src.retrievers.m4_raptor import (
+            REQUIRED_FILES as M4_REQ,
+            resolve_components as m4_resolve,
+        )
+        if getattr(system, "_resolved", None) is None:
+            system._resolved = m4_resolve(
+                system.config.m4, system.config, default_reranker=None)
+        cdir = system._cache_dir(corpus_hash)
+        inputs = {
+            "embedder": system._resolved.embedder_id,
+            "chunking": "raptor paper chunker (in extra)",
+            "env_override": system.topology_env_override,
+            "summary_model": system.config.m4.summary_model,
+        }
+        return cdir, M4_REQ, inputs
+
+    from dataclasses import asdict
+    from src.components import resolve_components
+    res = resolve_components(None, system.config)
+    if system_id == "M2":
+        from src.retrievers.m2_flat_dense import REQUIRED_FILES as REQ
+        extra = None
+    elif system_id == "M3":
+        from src.retrievers.m3_hybrid import REQUIRED_FILES as REQ
+        extra = {"sparse": "bm25okapi", "fusion": "rrf",
+                 "rrf_k": system.config.retrieval.rrf_k}
+    else:
+        _fail(f"assemble_cdir: unranked system {system_id!r}")
+    key = compute_cache_key(chunking_config=res.chunker_config,
+                            embedder_model=res.embedder_id,
+                            corpus_hash=corpus_hash, extra=extra)
+    cdir = CacheDir(_paths.cache_dir(), system_id, key)
+    inputs = {"embedder": res.embedder_id,
+              "chunking": asdict(res.chunker_config), "extra": extra}
+    return cdir, REQ, inputs
+
+
+def resolve_substrate(system, system_id: str, items):
+    """(warm_dir_or_None, corpus_hash, expected_dir) for one unit --
+    read-only: corpus layout into a TemporaryDirectory, hash, the
+    system's own key assembly, completeness check. Never builds."""
+    import tempfile
+    from src.cache import corpus_content_hash
+
+    with tempfile.TemporaryDirectory(prefix="replay_warm_") as td:
+        tdp = Path(td)
+        system._write_corpus_layout(list(items), tdp)
+        chash = corpus_content_hash(tdp)
+    cdir, req, _ = assemble_cdir(system, system_id, chash)
+    expected = Path(str(cdir.manifest_path)).parent
+    warm = expected if cdir.is_complete(req) else None
+    return warm, chash, expected
+
+
 def _assert_generator_never_loaded() -> None:
     from src.models import load_generator
     info = load_generator.cache_info()
@@ -278,12 +354,32 @@ def replay_cell(bank: Path, generator: str, benchmark_name: str,
     recall_sums = {k: 0.0 for k in RECALL_KS}
     hit5_sum = 0.0
 
+    n_units = 0
     for unit in benchmark.iter_eval_units(split="validation"):
-        warm = system.substrate_warm_path(list(unit.corpus))
-        if not warm:
-            _fail(f"{stem}: unit {unit.corpus_id!r} has NO warm substrate "
-                  "-- a replay must never build; refusing before the "
-                  "build path is reachable")
+        warm, chash, expected = resolve_substrate(
+            system, system_id, unit.corpus)
+        if warm is None:
+            _fail(f"{stem}: unit {unit.corpus_id!r} has NO COMPLETE "
+                  f"substrate at the expected directory {expected} -- a "
+                  "replay must never build; refusing before the build "
+                  "path is reachable")
+        # KEY IDENTITY SEEN, NOT INFERRED: the resolved directory's own
+        # manifest must record the corpus hash this replay derived.
+        mpath = warm / "manifest.json"
+        if mpath.is_file():
+            man = json.loads(mpath.read_text(encoding="utf-8"))
+            if str(man.get("corpus_hash")) != chash:
+                _fail(f"{stem}: unit {unit.corpus_id!r}: resolved "
+                      f"substrate {warm.name} records corpus_hash "
+                      f"{man.get('corpus_hash')!r} but the replay derived "
+                      f"{chash!r} -- key collision or corpus drift")
+        else:
+            _fail(f"{stem}: unit {unit.corpus_id!r}: {warm} has no "
+                  "manifest.json -- cannot verify key identity")
+        n_units += 1
+        if n_units <= 3:
+            print(f"[replay] {stem}: unit {unit.corpus_id} substrate "
+                  f"{warm.name} (manifest corpus_hash verified)")
         system.index_items(list(unit.corpus))
         if system_id == "M4" and getattr(system, "tree_cache_hit", None) is not True:
             _fail(f"{stem}: unit {unit.corpus_id!r} loaded without a warm "
@@ -375,8 +471,50 @@ def replay_cell(bank: Path, generator: str, benchmark_name: str,
                         encoding="utf-8")
     print(f"[replay] {generator.split('/')[-1]} {benchmark_name} "
           f"{system_id}: n={n_rank} recall@5={recall[5]:.6f} "
-          f"hit@5={hit5:.6f} ({side_summary['elapsed_s']}s) GATE PASS")
+          f"hit@5={hit5:.6f} substrates={n_units} (manifest corpus_hash "
+          f"verified on all) ({side_summary['elapsed_s']}s) GATE PASS")
     return side_summary
+
+
+def dry_run_cell(bank: Path, generator: str, benchmark_name: str,
+                 system_id: str, corpus_hash: str) -> str:
+    """Print every key input and the resulting directory. Touch nothing.
+    Loader-free: the key function is pure given a corpus hash, so this
+    runs on any host against a RECORDED hash (never a locally re-derived
+    one -- this host's corpus bytes are not the run host's; the
+    b274e596 incident)."""
+    from src.config import DEFAULT_CONFIG
+    from src.eval.runner import SYSTEM_REGISTRY
+
+    stem = f"{benchmark_name}_{system_id}_validation"
+    spath = bank / f"{stem}.summary.json"
+    env_override = None
+    gen_note = "(no summary present; env/generator checks skipped)"
+    if spath.is_file():
+        summary = json.loads(spath.read_text(encoding="utf-8"))
+        gen_note = f"summary generator: {summary.get('generator')}"
+        if system_id == "M4":
+            env_override = summary.get("tree_build_env")
+    cfg = replace(
+        DEFAULT_CONFIG,
+        generation=replace(DEFAULT_CONFIG.generation, model=generator),
+        m4=replace(DEFAULT_CONFIG.m4, summary_model=generator),
+        m7=replace(DEFAULT_CONFIG.m7, summary_model=generator),
+    )
+    system = SYSTEM_REGISTRY[system_id](config=cfg)
+    if env_override is not None:
+        system.topology_env_override = env_override
+    cdir, req, inputs = assemble_cdir(system, system_id, corpus_hash)
+    expected = Path(str(cdir.manifest_path)).parent
+    print(f"[dry-run] {stem} @ {generator}")
+    print(f"  {gen_note}")
+    print(f"  corpus_hash : {corpus_hash} (RECORDED, fed directly)")
+    for k, v in inputs.items():
+        print(f"  {k:12s}: {v}")
+    print(f"  namespace   : {expected.parent.name}")
+    print(f"  directory   : {expected.name}")
+    print(f"  full path   : {expected}")
+    return expected.name
 
 
 def main() -> None:
@@ -388,7 +526,18 @@ def main() -> None:
     ap.add_argument("--force", action="store_true",
                     help="overwrite an existing sidecar (deliberate "
                          "regeneration only)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print every key input + the resulting "
+                         "directory per cell; touch nothing. Requires "
+                         "--corpus-hash (a RECORDED hash from a Drive "
+                         "manifest -- never locally re-derived)")
+    ap.add_argument("--corpus-hash", default=None,
+                    help="recorded corpus hash for --dry-run")
     args = ap.parse_args()
+    if args.dry_run and not args.corpus_hash:
+        raise SystemExit("[replay] --dry-run requires --corpus-hash "
+                         "(feed a RECORDED hash; local re-derivation is "
+                         "exactly the b274e596 mistake)")
     banks = {"p10": (QWEN, Path(args.p10)), "p11": (LLAMA, Path(args.p11))}
     targets = []
     if args.only:
@@ -400,6 +549,12 @@ def main() -> None:
             for bench in RANKED_BENCHMARKS:
                 for sysid in RANKED_SYSTEMS:
                     targets.append((gen, bank, bench, sysid))
+    if args.dry_run:
+        for gen, bank, bench, sysid in targets:
+            dry_run_cell(bank, gen, bench, sysid, args.corpus_hash)
+        print(f"[replay] dry-run done: {len(targets)} cell(s), nothing "
+              "touched")
+        return
     for gen, bank, bench, sysid in targets:
         replay_cell(bank, gen, bench, sysid, force=args.force)
     print(f"[replay] done: {len(targets)} cell(s)")
