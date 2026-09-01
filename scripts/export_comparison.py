@@ -262,8 +262,16 @@ def write_outputs(rows: list[dict], out_dir: Path) -> tuple[Path, Path]:
                 "REFUSES when a sidecar is missing, never falls back to "
                 "hit@5, which now lives in the CSV only). \"bm25\" = M3, the hybrid dense+BM25 RRF "
                 "system. Retrieval figures are generator-identical by "
-                "construction for M2/M3 (bit-identity proven); M4's are "
-                "tree-dependent and legitimately differ per generator. "
+                "construction for M2/M3 (bit-identity proven). M4's SET-F1 "
+                "is tree-dependent (summary nodes consume its 2,000-token "
+                "evidence budget, so the packed leaf set differs per "
+                "generator); M4's RANK metrics are generator-invariant up "
+                "to window truncation (summary nodes carry no provenance "
+                "and rank no document; leaf order depends only on leaf and "
+                "query embeddings, shared across columns; the only tree "
+                "effect is summary-node intrusion shortening the 50-node "
+                "scoring window's document tail — compare the CSV's rank "
+                "columns across generators per benchmark). "
                 "All comparisons EXPLORATORY under Declaration 3.\n\n")
         f.write(f"`{line}`\n\n")
         for generator in (QWEN, LLAMA):
