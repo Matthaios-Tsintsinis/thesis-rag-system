@@ -1,4 +1,5 @@
-"""Verify every `path:line` citation in docs/PROVENANCE_TABLE.md.
+"""Verify every `path:line` citation in docs/PROVENANCE_TABLE.md and
+docs/METHODS_AND_FIDELITY.md.
 
 WHY THIS EXISTS, and why it is stricter than "does the line number exist".
 The living fidelity record cites our code as `path:line` at a named HEAD.
@@ -23,13 +24,20 @@ Two layers of verification:
    identifier's first token. A uniform shift now fails loudly instead of
    printing plausible-looking wrong lines.
 
+TWO DOCUMENTS, ONE CHECK (2026-09-02). `docs/PROVENANCE_TABLE.md` is the
+living fidelity record; `docs/METHODS_AND_FIDELITY.md` is the reader-facing
+document derived from it. Both cite code as `path:line`, and a citation
+that went stale in one while the other kept passing would be the staleness
+machine this project already closed once. Both are therefore checked in
+the same run, and a MISSING document is a refusal, never a silent skip.
+
 Run on the agent host after ANY commit that edits a cited file:
 
     python -m scripts.verify_provenance_citations
 
 Exit 0 = all resolve and every anchored citation matches. Exit 1 = a broken
-or drifted citation, listed. The doc lives in `docs/`, which is disk-only;
-this script therefore runs where the doc lives, not on Colab.
+or drifted citation, listed. The docs live in `docs/`, which is disk-only;
+this script therefore runs where the docs live, not on Colab.
 """
 
 from __future__ import annotations
@@ -39,7 +47,10 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DOC = ROOT / "docs" / "PROVENANCE_TABLE.md"
+DOCS = (
+    ROOT / "docs" / "PROVENANCE_TABLE.md",
+    ROOT / "docs" / "METHODS_AND_FIDELITY.md",
+)
 
 CITE = re.compile(
     r"`((?:src|tests|scripts)/[A-Za-z0-9_/]+\.py):(\d+(?:[,\-]\d+)*)`"
@@ -55,14 +66,18 @@ ANCHOR = re.compile(r"^ ?\(?`([A-Za-z_][A-Za-z0-9_]*)[^`/]*`")
 ANCHOR_WINDOW = 2  # lines either side of the cited line
 
 
-def main() -> None:
-    if not DOC.exists():
-        raise SystemExit(f"[cite] {DOC} not found - run where docs/ lives")
-    text = DOC.read_text(encoding="utf-8")
+def check_document(
+    doc: Path, files: dict[str, list[str]]
+) -> tuple[int, int, list[str]]:
+    """Check one document. Returns (n_checked, n_anchored, problems).
 
-    files: dict[str, list[str]] = {}
+    `files` is a shared line cache so a source file read for one document
+    is not re-read for the other.
+    """
+    text = doc.read_text(encoding="utf-8")
     problems: list[str] = []
     n_checked = n_anchored = 0
+    print(f"\n[cite] {doc.name}")
 
     for m in CITE.finditer(text):
         path, spec = m.group(1), m.group(2)
@@ -102,8 +117,31 @@ def main() -> None:
                     continue
             print(f"  {path}:{line_no:<5} {('[' + anchor + ']').ljust(28) if anchor else ' ' * 28} {shown[:70]}")
 
-    print(f"\n[cite] {n_checked} citations checked, "
+    print(f"[cite] {doc.name}: {n_checked} citations checked, "
           f"{n_anchored} symbol-anchored")
+    return n_checked, n_anchored, [f"{doc.name}: {p}" for p in problems]
+
+
+def main() -> None:
+    missing = [d for d in DOCS if not d.exists()]
+    if missing:
+        raise SystemExit(
+            "[cite] document(s) not found - run where docs/ lives, and "
+            "never skip a missing one silently: "
+            + ", ".join(str(d) for d in missing)
+        )
+
+    files: dict[str, list[str]] = {}
+    problems: list[str] = []
+    n_checked = n_anchored = 0
+    for doc in DOCS:
+        c, a, p = check_document(doc, files)
+        n_checked += c
+        n_anchored += a
+        problems.extend(p)
+
+    print(f"\n[cite] {n_checked} citations checked across {len(DOCS)} "
+          f"documents, {n_anchored} symbol-anchored")
     if problems:
         print("[cite] PROBLEMS:")
         for p in problems:
