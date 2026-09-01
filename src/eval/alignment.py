@@ -165,6 +165,22 @@ def score_retrieval_rank_aware(
       MAP@K  — Average Precision at K: sum of precision-at-each-
                relevant-document-rank within the top-K documents,
                normalised by min(K, n_gold). Bounded [0, 1].
+               THIS IS THE STANDARD AP NUMERATOR, AND IT IS NOT THE
+               OFFICIAL MultiHop-RAG ONE (second fidelity audit,
+               2026-09-02, executed against the fetched
+               retrieval_evaluate.py): the official script adds
+               (number of gold facts NEWLY matched at this rank) / rank
+               at each relevant rank -- for one gold per document that is
+               1/rank per newly-found gold, not the cumulative precision
+               (relevant-so-far)/rank. The two agree only while at most
+               one gold is found in the top-K; otherwise ours is HIGHER
+               (worked example, gold {D1, D2}, ranking [D3, D1, D2]:
+               ours (1/2 + 2/3)/2 = 7/12, official (1/2 + 1/3)/2 = 5/12).
+               Only the denominator rule, min(K, n_gold), matches the
+               official script. DECLARED-DEVIATION in the living record
+               (docs/PROVENANCE_TABLE.md section 3.1); frozen mid-matrix,
+               and an official-style MAP@10 is derivable post-hoc from
+               the replay sidecars' document rankings without a re-run.
       MRR    — 1 / (rank of first relevant document), 0 if none.
                1-indexed. Uncapped (over the full ranking); the
                MultiHop-RAG paper reports MRR@10. For top-15 retrieval

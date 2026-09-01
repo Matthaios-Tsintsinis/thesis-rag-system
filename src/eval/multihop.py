@@ -275,7 +275,11 @@ class MultiHopBenchmark:
             over the reader's top-15. K=4 and K=10 are the paper's own
             Hits@4 / Hits@10; K=1 and K=5 are extra diagnostic columns.
             DEVIATION FROM PAPER: MAP and MRR are reported at the same
-            grid rather than at K=10 only, and MRR is uncapped. MRR here is
+            grid rather than at K=10 only, and MRR is uncapped. MAP's
+            NUMERATOR is standard average precision, which the official
+            retrieval_evaluate.py does NOT compute (it sums 1/rank per
+            newly-found gold; see score_retrieval_rank_aware's docstring)
+            -- a declared deviation, ours >= official. MRR here is
             uncapped (first relevant doc over the full ranking), equal to
             the paper's MRR@10 unless the first relevant doc sits at
             rank >10 (rare under top-15). Matrix tables must NOT be read

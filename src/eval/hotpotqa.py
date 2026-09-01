@@ -90,8 +90,12 @@ VARIANT B — `hotpotqa_pooled` — pooled shards.
 #    Never report it as `sp_f1`.
 #
 # 3. RETRIEVAL IS MEASURED AT DEPTH 50, GENERATION AT TOP-15 / BUDGET.
-#    Rank-aware metrics run over a fixed-depth scoring ranking so K
-#    counts the same number of candidate documents for every system;
+#    Rank-aware metrics run over a fixed-depth scoring ranking so every
+#    system is measured over the same number of candidate retrieval
+#    UNITS (50 chunks or nodes); the DOCUMENT ranking is derived from
+#    them by first occurrence, so the number of distinct documents
+#    inside the window is system-dependent (M4's summary nodes rank no
+#    document at all) -- corrected wording, second fidelity audit;
 #    set-level R/P/F1 stay over the reader context, because they measure
 #    what the generator actually saw. Two depths in one table, stated
 #    here and in the results caption.
@@ -655,8 +659,9 @@ class HotpotQABenchmark:
             return base
 
         # Set-level over the reader context (above); rank-aware over the
-        # fixed-depth scoring ranking, so K counts the same number of
-        # candidate documents for every system.
+        # fixed-depth scoring ranking: 50 retrieval UNITS for every
+        # system, from which the document ranking is derived (the
+        # document count inside the window is system-dependent).
         title_gold = frozenset((t, _TITLE_SPAN) for t, _ in gold)
         ranked = scoring_ranking if scoring_ranking is not None else retrieved
         rank = score_retrieval_rank_aware(
