@@ -114,7 +114,13 @@ def _recall_from_sidecar(bank: Path, stem: str, expected_n: int) -> dict:
 def _em_and_hit5(bank: Path, benchmark: str, system: str,
                  gold_map: dict[str, tuple[str, ...]],
                  summary: dict) -> dict:
-    """EM + hit@5 for one cell, from its banked rows. Refuses loudly."""
+    """EM + hit@5 for one cell, from its banked rows. Refuses loudly.
+
+    On the HotpotQA family the recomputed EM is GATED per row against
+    the banked `answer.metadata.exact_match` (present on every banked
+    HotpotQA row); MultiHop and NarrativeQA rows carry no banked EM, so
+    recomputation is the only route there and is labelled post-hoc.
+    """
     jpath = bank / f"{benchmark}_{system}_validation.jsonl"
     em_sum = 0
     n_em = 0
@@ -132,8 +138,29 @@ def _em_and_hit5(bank: Path, benchmark: str, system: str,
                     _fail(f"{benchmark}/{system}: query {qid!r} has no gold "
                           "in the loader map -- loader/bank mismatch")
                 pred = normalize_qasper_answer(r.get("predicted_answer") or "")
-                em_sum += max(int(pred == normalize_qasper_answer(g))
-                              for g in gold_map[qid])
+                em_row = max(int(pred == normalize_qasper_answer(g))
+                             for g in gold_map[qid])
+                if benchmark.startswith("hotpotqa"):
+                    # THE BANKED EM IS A GATE. HotpotQA's scorer has
+                    # written `answer.metadata.exact_match` since 581f6d5
+                    # (2026-08-07) and every HotpotQA cell was banked
+                    # after 2026-08-23, so the field exists on every row.
+                    # The recomputation above must reproduce it exactly;
+                    # a row without it, or one that disagrees, refuses
+                    # the cell (second audit AF2-6: a value that exists
+                    # and a recomputation that never read it).
+                    banked = (r["answer"].get("metadata") or {}).get(
+                        "exact_match")
+                    if banked is None:
+                        _fail(f"{benchmark}/{system}: row {qid!r} carries "
+                              "no answer.metadata.exact_match -- the "
+                              "recomputed EM cannot be gated; refusing")
+                    if int(round(float(banked))) != em_row:
+                        _fail(f"{benchmark}/{system}: row {qid!r}: "
+                              f"recomputed EM {em_row} != banked "
+                              f"exact_match {banked!r} -- drifted "
+                              "normaliser or wrong rows; refusing")
+                em_sum += em_row
                 n_em += 1
             if system != "M1" and benchmark != "narrativeqa":
                 retr = r.get("retrieval") or {}

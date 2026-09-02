@@ -27,24 +27,40 @@ CANON = "No answer available."
 
 
 def _row(qid, value, pred, method="token_f1", abstained=False,
-         rank_hit=None):
+         rank_hit=None, exact_match=None):
     retrieval = ({"skipped": True} if rank_hit is None
                  else {"skipped": False, "hit_at_k": {"5": rank_hit}})
+    metadata = {"abstained": abstained}
+    if exact_match is not None:
+        metadata["exact_match"] = exact_match
     return {"query_id": qid, "predicted_answer": pred,
             "answer": {"value": value, "method": method,
-                       "metadata": {"abstained": abstained}},
+                       "metadata": metadata},
             "retrieval": retrieval}
+
+
+# The banked EM every HotpotQA row carries (`answer.metadata.exact_match`),
+# consistent with GOLD_QUERIES below: q0 refusal vs "no" 0; q1 refusal vs
+# "paris" 0; q2 "Paris." vs ("paris", "france") 1; q3 "an answer" vs
+# "answer" 1. MultiHop / NarrativeQA rows carry no banked EM.
+BANKED_EM = {"q0": 0.0, "q1": 0.0, "q2": 1.0, "q3": 1.0}
 
 
 def _cell_rows(benchmark, system):
     ranked = system != "M1" and benchmark != "narrativeqa"
+    hp = benchmark.startswith("hotpotqa")
     def rh(v):
         return v if ranked else None
+    def em(qid):
+        return BANKED_EM[qid] if hp else None
     rows = [
-        _row("q0", 0.5, CANON, abstained=True, rank_hit=rh(1.0)),
-        _row("q1", 0.0, CANON, abstained=True, rank_hit=rh(0.0)),
-        _row("q2", 0.8, "Paris.", rank_hit=rh(1.0)),
-        _row("q3", 0.4, "an answer", rank_hit=rh(1.0)),
+        _row("q0", 0.5, CANON, abstained=True, rank_hit=rh(1.0),
+             exact_match=em("q0")),
+        _row("q1", 0.0, CANON, abstained=True, rank_hit=rh(0.0),
+             exact_match=em("q1")),
+        _row("q2", 0.8, "Paris.", rank_hit=rh(1.0), exact_match=em("q2")),
+        _row("q3", 0.4, "an answer", rank_hit=rh(1.0),
+             exact_match=em("q3")),
     ]
     if benchmark == "multihop_rag":
         rows.append(_row("qnull", 1.0, CANON, method="unanswerable_rule",
@@ -262,6 +278,45 @@ class TestComparison(unittest.TestCase):
                   for r in rows}
             self.assertEqual(
                 by[(QWEN, "multihop_rag", "M4")]["n_rank_population"], 4)
+
+    def test_hotpotqa_em_gate_refuses_a_disagreeing_banked_row(self):
+        with TemporaryDirectory() as td:
+            p10, p11, gm, rec = _fixture(Path(td))
+            jpath = p10 / "hotpotqa_M2_validation.jsonl"
+            rows = [json.loads(l) for l in
+                    jpath.read_text(encoding="utf-8").strip().splitlines()]
+            rows[2]["answer"]["metadata"]["exact_match"] = 0.0  # q2 is 1
+            jpath.write_text(
+                "\n".join(json.dumps(r) for r in rows) + "\n",
+                encoding="utf-8")
+            with self.assertRaises(SystemExit) as cm:
+                build_comparison(p10, p11, gm, recorded=rec)
+            self.assertIn("recomputed EM", str(cm.exception))
+
+    def test_hotpotqa_em_gate_refuses_a_row_without_the_field(self):
+        with TemporaryDirectory() as td:
+            p10, p11, gm, rec = _fixture(Path(td))
+            jpath = p11 / "hotpotqa_pooled_M4_validation.jsonl"
+            rows = [json.loads(l) for l in
+                    jpath.read_text(encoding="utf-8").strip().splitlines()]
+            del rows[1]["answer"]["metadata"]["exact_match"]
+            jpath.write_text(
+                "\n".join(json.dumps(r) for r in rows) + "\n",
+                encoding="utf-8")
+            with self.assertRaises(SystemExit) as cm:
+                build_comparison(p10, p11, gm, recorded=rec)
+            self.assertIn("no answer.metadata.exact_match", str(cm.exception))
+
+    def test_non_hotpotqa_rows_carry_no_banked_em_and_pass(self):
+        # MultiHop / NarrativeQA rows have no exact_match field by
+        # construction; the fixture writes none and the happy path passes
+        with TemporaryDirectory() as td:
+            p10, p11, gm, rec = _fixture(Path(td))
+            r = json.loads((p10 / "multihop_rag_M2_validation.jsonl")
+                           .read_text(encoding="utf-8").splitlines()[0])
+            self.assertNotIn("exact_match", r["answer"]["metadata"])
+            self.assertEqual(len(build_comparison(p10, p11, gm,
+                                                  recorded=rec)), 32)
 
     def test_refuses_row_side_rank_shortfall(self):
         with TemporaryDirectory() as td:
