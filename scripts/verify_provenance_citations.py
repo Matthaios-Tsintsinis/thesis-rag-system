@@ -1,13 +1,13 @@
 """Verify every `path:line` citation in docs/PROVENANCE_TABLE.md and
-docs/METHODS_AND_FIDELITY.md.
+docs/METHODS_AND_FIDELITY.md AGAINST THE PINNED TAG'S TREE.
 
 WHY THIS EXISTS, and why it is stricter than "does the line number exist".
-The living fidelity record cites our code as `path:line` at a named HEAD.
-The first checker only tested that each line number was in range - and a
-three-line edit near the top of `raptor_paper.py` shifted every citation
-below it by +3 while that checker kept passing, because line 488 still held
-SOME text. A check that cannot fail for the right reason has not passed;
-this is the project's recurring lesson applied to its own tooling.
+The living fidelity record cites our code as `path:line`. The first checker
+only tested that each line number was in range - and a three-line edit
+near the top of `raptor_paper.py` shifted every citation below it by +3
+while that checker kept passing, because line 488 still held SOME text. A
+check that cannot fail for the right reason has not passed; this is the
+project's recurring lesson applied to its own tooling.
 
 Two layers of verification:
 
@@ -24,25 +24,32 @@ Two layers of verification:
    identifier's first token. A uniform shift now fails loudly instead of
    printing plausible-looking wrong lines.
 
-TWO DOCUMENTS, ONE CHECK (2026-09-02). `docs/PROVENANCE_TABLE.md` is the
-living fidelity record; `docs/METHODS_AND_FIDELITY.md` is the reader-facing
-document derived from it. Both cite code as `path:line`, and a citation
-that went stale in one while the other kept passing would be the staleness
-machine this project already closed once. Both are therefore checked in
-the same run, and a MISSING document is a refusal, never a silent skip.
+THE CITED TREE IS A TAG, NOT THE WORKING TREE (2026-09-03). The repo is
+being reduced to the reproduction path; everything else leaves HEAD and
+lives at tag `thesis-full-2026-09-03` (= `cd2c8dd`, the closed experiment's
+full tree). The fidelity documents cite THAT tree, so this checker reads
+every cited file with `git show <tag>:<path>` and never from the working
+tree. A citation therefore stays valid through the reduction by
+construction; `--rev` exists only for a deliberate future re-anchoring.
 
-Run on the agent host after ANY commit that edits a cited file:
+TWO DOCUMENTS, ONE CHECK. `docs/PROVENANCE_TABLE.md` is the living fidelity
+record; `docs/METHODS_AND_FIDELITY.md` is the reader-facing document
+derived from it. A MISSING document is a refusal, never a silent skip.
 
-    python -m scripts.verify_provenance_citations
+Run on the agent host (docs are disk-only, so it runs where they live):
+
+    python -m scripts.verify_provenance_citations            # against the tag
+    python -m scripts.verify_provenance_citations --rev HEAD # deliberate only
 
 Exit 0 = all resolve and every anchored citation matches. Exit 1 = a broken
-or drifted citation, listed. The docs live in `docs/`, which is disk-only;
-this script therefore runs where the docs live, not on Colab.
+or drifted citation, listed.
 """
 
 from __future__ import annotations
 
+import argparse
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -51,6 +58,8 @@ DOCS = (
     ROOT / "docs" / "PROVENANCE_TABLE.md",
     ROOT / "docs" / "METHODS_AND_FIDELITY.md",
 )
+# The tag every code citation in the fidelity documents is pinned to.
+CITATION_TAG = "thesis-full-2026-09-03"
 
 CITE = re.compile(
     r"`((?:src|tests|scripts)/[A-Za-z0-9_/]+\.py):(\d+(?:[,\-]\d+)*)`"
@@ -66,10 +75,21 @@ ANCHOR = re.compile(r"^ ?\(?`([A-Za-z_][A-Za-z0-9_]*)[^`/]*`")
 ANCHOR_WINDOW = 2  # lines either side of the cited line
 
 
+def read_at_rev(path: str, rev: str) -> list[str] | None:
+    """The file's lines at `rev` (a tag, sha or ref), or None if absent."""
+    proc = subprocess.run(
+        ["git", "show", f"{rev}:{path}"], cwd=ROOT,
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.splitlines()
+
+
 def check_document(
-    doc: Path, files: dict[str, list[str]]
+    doc: Path, files: dict[str, list[str] | None], rev: str
 ) -> tuple[int, int, list[str]]:
-    """Check one document. Returns (n_checked, n_anchored, problems).
+    """Check one document at `rev`. Returns (n_checked, n_anchored, problems).
 
     `files` is a shared line cache so a source file read for one document
     is not re-read for the other.
@@ -77,7 +97,7 @@ def check_document(
     text = doc.read_text(encoding="utf-8")
     problems: list[str] = []
     n_checked = n_anchored = 0
-    print(f"\n[cite] {doc.name}")
+    print(f"\n[cite] {doc.name} @ {rev}")
 
     for m in CITE.finditer(text):
         path, spec = m.group(1), m.group(2)
@@ -86,12 +106,9 @@ def check_document(
         anchor = am.group(1) if am else None
 
         if path not in files:
-            f = ROOT / path
-            if not f.exists():
-                problems.append(f"MISSING FILE {path}")
-                files[path] = []
-                continue
-            files[path] = f.read_text(encoding="utf-8").splitlines()
+            files[path] = read_at_rev(path, rev)
+            if files[path] is None:
+                problems.append(f"MISSING FILE {path} at {rev}")
         lines = files[path]
         if not lines:
             continue
@@ -122,7 +139,22 @@ def check_document(
     return n_checked, n_anchored, [f"{doc.name}: {p}" for p in problems]
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--rev", default=CITATION_TAG,
+                    help="git revision whose tree the citations are read "
+                         f"from (default: the pinned tag {CITATION_TAG})")
+    args = ap.parse_args(argv)
+
+    probe = subprocess.run(["git", "rev-parse", "--verify", "--quiet",
+                            f"{args.rev}^{{commit}}"], cwd=ROOT,
+                           capture_output=True, text=True)
+    if probe.returncode != 0:
+        raise SystemExit(f"[cite] revision {args.rev!r} does not resolve in "
+                         f"this clone - fetch the tag first (git fetch --tags)")
+    print(f"[cite] reading cited files from {args.rev} "
+          f"({probe.stdout.strip()[:12]}), not the working tree")
+
     missing = [d for d in DOCS if not d.exists()]
     if missing:
         raise SystemExit(
@@ -131,17 +163,17 @@ def main() -> None:
             + ", ".join(str(d) for d in missing)
         )
 
-    files: dict[str, list[str]] = {}
+    files: dict[str, list[str] | None] = {}
     problems: list[str] = []
     n_checked = n_anchored = 0
     for doc in DOCS:
-        c, a, p = check_document(doc, files)
+        c, a, p = check_document(doc, files, args.rev)
         n_checked += c
         n_anchored += a
         problems.extend(p)
 
     print(f"\n[cite] {n_checked} citations checked across {len(DOCS)} "
-          f"documents, {n_anchored} symbol-anchored")
+          f"documents at {args.rev}, {n_anchored} symbol-anchored")
     if problems:
         print("[cite] PROBLEMS:")
         for p in problems:
