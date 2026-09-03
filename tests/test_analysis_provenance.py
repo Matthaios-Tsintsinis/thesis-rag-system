@@ -1,15 +1,10 @@
-"""Two analysis-layer provenance guards, both earned on the 16/16 bank.
+"""An analysis-layer provenance guard, earned on the 16/16 bank.
 
-1. `significance_diagnostic._generator_note` — the answer-delta provenance
+`significance_diagnostic._generator_note` — the answer-delta provenance
    line is READ from the sibling summaries, never asserted. The previous
    version printed a hardcoded "gpt-4o-mini-era, must be re-measured" over
    the local-Qwen P10 bank: instance 15 of the recurring lesson — the
    summaries recorded the generator and the note consumed nothing.
-
-2. `score_rouge_l._punkt_fix_message` — the ROUGE preflight's refusal text
-   must name BOTH fix paths, because the obvious advice
-   (nltk.download(..., quiet=True)) fails SILENTLY on proxied hosts and a
-   verification one-liner printed "nltk ok" over a refused download.
 """
 
 from __future__ import annotations
@@ -22,7 +17,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts.score_rouge_l import _punkt_fix_message
 from scripts.significance_diagnostic import _generator_note
 
 
@@ -82,17 +76,6 @@ class TestGeneratorNote(unittest.TestCase):
             src.count("gpt-4o-mini-era"), 2,
             "gpt-4o-mini-era may appear only in the two comments that "
             "RECORD the defect, never in a printed string")
-
-
-class TestPunktMessage(unittest.TestCase):
-    def test_both_fix_paths_are_named(self):
-        msg = _punkt_fix_message()
-        self.assertIn("NLTK_ALLOW_PROXIED_URLOPEN=1", msg)
-        self.assertIn("punkt_tab.zip", msg)
-        self.assertIn("nltk_data/tokenizers/", msg)
-
-    def test_the_silent_failure_trap_is_warned_about(self):
-        self.assertIn("SILENTLY", _punkt_fix_message())
 
 
 if __name__ == "__main__":

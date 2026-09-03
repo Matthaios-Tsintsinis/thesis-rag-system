@@ -30,22 +30,11 @@ provably inert on ASCII input. The deviations table records this as
 "official normaliser + documented NFKC/Unicode extension", not as an
 unqualified match.
 
-IMPORTANT — what the official QASPER scorer actually does with multiple
-extractive spans: it JOINS an annotator's spans into ONE reference
-string (", ".join(spans)) and computes a SINGLE token-F1 against it,
-taking the max only ACROSS annotators/references — never a per-span
-max. The QASPER extractive path therefore joins-then-scores (see
-qasper.py _score_one_annotator) to match the official evaluator.
-
-`extractive_max_f1` below returns the MAX token-F1 over a tuple of
-reference strings. That is the right metric only when the references
-are genuine ALTERNATIVES (e.g. NarrativeQA's two independent reference
-answers, narrativeqa.py), NOT when they are co-required spans of one
-answer. Do NOT use it for QASPER extractive scoring.
-
-token_f1 is also used for QASPER abstractive answers in Pass-1 (token
-F1 vs `free_form`). Pass-2 adds an LLM-judge for abstractive semantic
-equivalence on top.
+`extractive_max_f1` returns the MAX token-F1 over a tuple of reference
+strings — the right metric when the references are genuine
+ALTERNATIVES (NarrativeQA's two independent reference answers). The
+function name `normalize_qasper_answer` is historical: it is the
+official SQuAD/HotpotQA normaliser plus the declared NFKC extension.
 """
 
 from __future__ import annotations
@@ -149,12 +138,11 @@ def token_f1(predicted: str, gold: str) -> float:
 
 
 def extractive_max_f1(predicted: str, gold_spans: tuple[str, ...]) -> float:
-    """Max token-F1 over a list of gold extractive spans.
+    """Max token-F1 over alternative gold references.
 
-    QASPER official scorer's behaviour when a question has multiple
-    extractive spans (e.g. enumerated mentions of the same concept).
-    Empty gold list returns 0 — a degenerate input the loader should
-    not produce.
+    Used where the references are independent alternatives (NarrativeQA's
+    two reference answers). Empty gold list returns 0 — a degenerate
+    input the loader should not produce.
     """
     if not gold_spans:
         return 0.0
