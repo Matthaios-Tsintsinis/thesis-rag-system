@@ -233,6 +233,17 @@ class TestRunnerMain(_CliCase):
             self.assertIn(key, s, f"summary lost the {key!r} field")
         self.assertEqual(s["n_queries_scored"], 2)
 
+    def test_summary_provenance_hashes_the_lockfile_the_gate_checked(self):
+        """--lockfile names the gate's lock; the provenance block must hash
+        THAT file, not a hardcoded ./requirements.lock (which banked
+        lockfile_hash=null whenever the two differed)."""
+        from scripts.pin_environment import lockfile_hash
+
+        out = self._run()
+        s = json.loads(out.with_suffix(".summary.json").read_text(encoding="utf-8"))
+        lock_text = (self.dir / "requirements.lock").read_text(encoding="utf-8")
+        self.assertEqual(s["environment"]["lockfile_hash"], lockfile_hash(lock_text))
+
     def test_default_leaves_the_configured_cap_alone(self):
         self._run()
         self.assertEqual(

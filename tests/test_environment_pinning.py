@@ -98,7 +98,7 @@ class TestTheRunnerRecordsIt(unittest.TestCase):
         from src.eval import runner
 
         src = inspect.getsource(runner.main)
-        self.assertIn('"environment": _environment_provenance()', src)
+        self.assertIn('"environment": _environment_provenance(args.lockfile)', src)
         self.assertIn('"model_revisions": _model_revisions(system)', src)
 
     def test_provenance_never_kills_a_run(self):

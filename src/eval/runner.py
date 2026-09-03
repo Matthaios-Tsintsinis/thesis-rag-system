@@ -58,7 +58,7 @@ BENCHMARK_REGISTRY: dict[str, type] = {
 }
 
 
-def _environment_provenance() -> dict:
+def _environment_provenance(lockfile: Path) -> dict:
     """Lockfile hash, GPU model, python and the pinned versions.
 
     The GPU string is here because the reproducibility target is
@@ -67,11 +67,12 @@ def _environment_provenance() -> dict:
     does not say which GPU produced it cannot support either claim.
     """
     try:
-        from pathlib import Path as _Path
-
         from scripts.pin_environment import environment_provenance
 
-        return environment_provenance(_Path("requirements.lock"))
+        # THE LOCKFILE THE GATE CHECKED, never a hardcoded path: the first
+        # version read ./requirements.lock regardless of --lockfile, so a
+        # cell gated against a lock elsewhere banked lockfile_hash=null.
+        return environment_provenance(Path(lockfile))
     except Exception as e:  # never fatal: provenance must not kill a run
         return {"error": f"{type(e).__name__}: {e}"}
 
@@ -795,7 +796,7 @@ def main() -> None:
         # P9: which environment produced this row. Recorded per CELL, not
         # per session — a matrix assembled over several sessions must be
         # able to say which stack produced which row.
-        "environment": _environment_provenance(),
+        "environment": _environment_provenance(args.lockfile),
         "model_revisions": _model_revisions(system),
         "tree_cache_hit": getattr(system, "tree_cache_hit", None),
         "tree_build_env": _tree_build_env(),
