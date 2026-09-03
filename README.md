@@ -238,7 +238,7 @@ md5sum /content/drive/MyDrive/thesis_rag/outputs/COMPARISON.csv
 
 Two further checks a stranger can run without the banks:
 
-- **CPU:** `python -m unittest discover -s tests -t .` is green (484
+- **CPU:** `python -m unittest discover -s tests -t .` is green (481
   tests; no GPU, no model — the suite fakes generation). The three CLIs
   print their reduced surfaces: `python -m src.eval.runner --help`
   (`--lockfile --system --benchmark --split --output --generator --resume`),
@@ -276,7 +276,7 @@ scripts/
   export_comparison.py   the one export: COMPARISON.csv / COMPARISON.md
   verify_provenance_citations.py   documentation tooling, off the output path: checks the disk-only
                          fidelity documents' citations against the tag
-tests/                   484 tests; python -m unittest discover -s tests -t .
+tests/                   481 tests; python -m unittest discover -s tests -t .
 requirements.txt         the reduced import graph (the lock on Drive is the version authority)
 ```
 
