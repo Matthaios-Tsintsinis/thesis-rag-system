@@ -38,7 +38,7 @@ from ..config import (
     DEFAULT_CONFIG,
     HarnessConfig,
 )
-from ..models import embed_texts, load_embedder
+from ..models import embed_texts
 from ..parsing import walk_corpus
 from .base import AnswerResult, BaseSystem, RetrievedChunk
 
@@ -105,10 +105,7 @@ class HybridRRFSystem(BaseSystem):
 
         print(f"[{self.system_id}] cache miss → building index at {cdir.path}")
         docs = list(walk_corpus(corpus_path, min_chars=chunker_cfg.min_chars_per_doc))
-        embedder = (
-            load_embedder(embedder_id) if chunker_cfg.strategy == "semantic" else None
-        )
-        self.chunks = chunk_corpus(docs, chunker_cfg, embedder=embedder)
+        self.chunks = chunk_corpus(docs, chunker_cfg)
         if not self.chunks:
             raise RuntimeError(f"No chunks produced from {corpus_path}")
 

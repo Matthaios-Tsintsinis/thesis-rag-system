@@ -123,13 +123,8 @@ SCORING_RANKING_DEPTH = 50
 
 # --- Chunking -------------------------------------------------------------
 # Two strategies, selected per HarnessConfig.chunking.strategy:
-#   "semantic"    — sentence-buffered embeddings + percentile breakpoints
-#                   (Greek-aware: . ! ? ; as terminators, · excluded).
-#                   Will be the production default once M4/M7 land; for
-#                   now nothing in the harness uses it and the default
-#                   stays word_window so M1/M2/M3 behaviour is unchanged.
-#   "word_window" — fixed word window + overlap. Used in smoke tests and
-#                   as the current default while baselines are stabilising.
+#   "word_window" — fixed word window + overlap (200 / 50): the harness
+#                   default, i.e. M2 and M3's chunker on every cell.
 #   "raptor_100tok" — M4 ONLY. Paper-faithful RAPTOR leaves: contiguous,
 #                   sentence-preserving, ~100 tiktoken cl100k_base tokens,
 #                   NO overlap (src/raptor_paper.py). Reads chunk_words as
@@ -141,8 +136,11 @@ SCORING_RANKING_DEPTH = 50
 # key at once (compute_cache_key folds the whole asdict) — that is why
 # raptor_100tok reuses chunk_words/overlap_words instead of declaring
 # its own size field. tests/test_raptor_chunking.py pins the schema.
+# The embedding-similarity "semantic" strategy left in the repo
+# reduction (never selected on any cell); its six fields below STAY for
+# exactly the reason above — removing a field would move every key.
 
-ChunkingStrategy = Literal["semantic", "word_window", "raptor_100tok"]
+ChunkingStrategy = Literal["word_window", "raptor_100tok"]
 
 
 # --- Generation -----------------------------------------------------------
@@ -223,7 +221,11 @@ class RetrievalConfig:
 class ChunkingConfig:
     strategy: ChunkingStrategy = "word_window"
 
-    # --- semantic parameters (notebook chunk_text_semantic defaults) ---
+    # --- KEEP-BY-CONSTRAINT: the former semantic chunker's parameters ---
+    # The strategy itself is gone, but these six fields sit inside every
+    # M2/M3/M4 substrate key (compute_cache_key folds the whole asdict),
+    # so they stay at their historical defaults; deleting or renaming one
+    # would move every banked key. TestCacheDiscipline pins the schema.
     breakpoint_percentile: float = 90.0
     absolute_threshold: float = 0.5
     min_words: int = 80

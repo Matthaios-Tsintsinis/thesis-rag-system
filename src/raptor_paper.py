@@ -54,9 +54,10 @@ the shared harness chunker at this commit, so NO cache key moves.
 #   stripping; (b) the reference has no comment, no test and no
 #   downstream consumer that wants stripped text, which reads as an
 #   artifact of the non-capturing alternation rather than a design
-#   decision; (c) this harness solves the identical problem correctly
-#   elsewhere with a lookbehind (src/chunking.py `_SENTENCE_SPLIT_RE`),
-#   which is what the reference would have needed; (d) reproducing it
+#   decision; (c) this harness once solved the identical problem
+#   correctly elsewhere with a lookbehind (the former semantic chunker's
+#   sentence splitter, at tag thesis-full-2026-09-03), which is what the
+#   reference would have needed; (d) reproducing it
 #   would feed the generator punctuation-free text, which no reading
 #   of the paper supports.
 #

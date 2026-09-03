@@ -505,8 +505,7 @@ class BaseSystem(ABC):
                     f"{self.system_id}: chunk {chunk.chunk_id!r} carries no "
                     "start_char/end_char, so per-parent provenance cannot be "
                     "derived. The word_window and raptor_100tok chunkers "
-                    "supply them; the semantic chunker does not and cannot "
-                    "be used with a multi-item parent."
+                    "both supply them."
                 )
             # Half-open overlap. A chunk crossing an item boundary
             # legitimately carries BOTH atoms — that is the whole point
