@@ -150,8 +150,8 @@ class _CliCase(unittest.TestCase):
             p.stop()
         self.td.cleanup()
 
-    def _run(self, *extra):
-        out = self.dir / "tiny_STUB.jsonl"
+    def _run(self, *extra, out=None):
+        out = out or self.dir / "tiny_STUB.jsonl"
         # The pin gate has no escape (the reduction removed it), so the
         # CLI drive carries a lockfile and stubs the version check green;
         # `test_the_lockfile_gate_is_wired_into_main` below drives main()
@@ -232,6 +232,27 @@ class TestRunnerMain(_CliCase):
                     "generator", "git_commit", "max_new_tokens"):
             self.assertIn(key, s, f"summary lost the {key!r} field")
         self.assertEqual(s["n_queries_scored"], 2)
+
+    def test_the_summary_main_writes_is_the_one_the_exporter_reads(self):
+        """One test binds the two ends: the runner's summary and JSONL go
+        through scripts.export_comparison.read_cell, which hard-indexes
+        the keys the tables are built from. A key dropped from the
+        summary fails HERE, not on the first real bank."""
+        from scripts.export_comparison import read_cell
+
+        out = self._run(out=self.dir / "tiny_STUB_validation.jsonl")
+        generator = DEFAULT_CONFIG.generation.model
+        # the stub answers "Paris" twice: no abstention, so the recorded
+        # credited-refusal battery for this cell is (0, 0.0)
+        row = read_cell(self.dir, generator, "tiny", "STUB",
+                        {(generator, "tiny", "STUB"): (0, 0.0)})
+        self.assertEqual(row["n_queries"], 2)
+        self.assertEqual(row["n_credited"], 0)
+        self.assertEqual(row["generator"], generator)
+        self.assertEqual(float(row["mean_answer_score_answerable"]),
+                         float(json.loads((self.dir / "tiny_STUB_validation.summary.json")
+                                          .read_text(encoding="utf-8"))
+                               ["mean_answer_score_answerable"]))
 
     def test_summary_provenance_hashes_the_lockfile_the_gate_checked(self):
         """--lockfile names the gate's lock; the provenance block must hash
