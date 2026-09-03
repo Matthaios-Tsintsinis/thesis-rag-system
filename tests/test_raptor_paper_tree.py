@@ -16,8 +16,7 @@ from pathlib import Path
 
 import numpy as np
 
-from src.raptor import raptor_substrate_extra
-from src.config import M4Config, RaptorBuildParams
+from src.config import M4Config
 from src.raptor_paper import (
     PAPER_TREE_SCHEMA_VERSION,
     PaperNode,
@@ -386,7 +385,7 @@ class TestSerialisation(unittest.TestCase):
 
 
 class TestCacheIdentity(unittest.TestCase):
-    """Lever B, strict reading: own extras function, raptor.py never opened."""
+    """Lever B, strict reading: M4 has its own extras function."""
 
     def _extra(self, **kw):
         base = dict(
@@ -396,20 +395,6 @@ class TestCacheIdentity(unittest.TestCase):
         )
         base.update(kw)
         return paper_substrate_extra(**base)
-
-    def test_emits_the_same_seven_base_fields_as_the_shared_extras(self):
-        shared = raptor_substrate_extra(
-            build=RaptorBuildParams(),
-            summary_model="gpt-4o-mini",
-            summary_prompt_version="v1",
-            include_root=False,
-            rrf_k=60,
-        )
-        mine = self._extra()
-        self.assertTrue(
-            set(shared) <= set(mine),
-            f"missing base fields: {set(shared) - set(mine)}",
-        )
 
     def test_carries_the_m4_only_keys_that_close_the_landmine(self):
         mine = self._extra()
@@ -467,10 +452,9 @@ class TestCacheIdentity(unittest.TestCase):
         )
         self.assertEqual(mine["summary_max_tokens"], m4.summary_max_tokens)
 
-    def test_tree_field_is_the_paper_params_not_raptor_build_params(self):
+    def test_tree_field_is_the_paper_params(self):
         mine = self._extra()
         self.assertEqual(mine["tree"], asdict(PaperTreeParams()))
-        self.assertNotEqual(mine["tree"], asdict(RaptorBuildParams()))
 
     def test_params_change_moves_the_extras(self):
         a = self._extra()

@@ -1,8 +1,8 @@
 """CLI runner: one system x one benchmark x one split, JSONL output.
 
 Usage:
-    python -m src.eval.runner --system M2 --benchmark qasper --split validation \
-        --output local_runs/eval/qasper_M2_validation.jsonl --max-units 20
+    python -m src.eval.runner --system M2 --benchmark multihop_rag --split validation \
+        --output local_runs/eval/multihop_rag_M2_validation.jsonl --max-units 20
 
 Sharding across systems / benchmarks is done by running this script
 once per combination from a wrapper (shell script or Colab notebook
@@ -30,15 +30,10 @@ from ..retrievers.m1_closedbook import ClosedBookSystem
 from ..retrievers.m2_flat_dense import FlatDenseSystem
 from ..retrievers.m3_hybrid import HybridRRFSystem
 from ..retrievers.m4_raptor import RaptorSystem
-from ..retrievers.m6_hipporag import HippoRAGSystem
-from ..retrievers.m7_three_axis import ThreeAxisSystem
-from ..retrievers.m9_corrective import CorrectiveRAGSystem
 from .base import BenchmarkRunner
 from .hotpotqa import HotpotQABenchmark, HotpotQAPooledBenchmark
 from .multihop import MultiHopBenchmark
 from .narrativeqa import NarrativeQABenchmark
-from .qasper import QasperBenchmark
-from .quality import QualityBenchmark
 
 
 SYSTEM_REGISTRY: dict[str, type[BaseSystem]] = {
@@ -46,15 +41,10 @@ SYSTEM_REGISTRY: dict[str, type[BaseSystem]] = {
     "M2": FlatDenseSystem,
     "M3": HybridRRFSystem,
     "M4": RaptorSystem,
-    "M6": HippoRAGSystem,
-    "M7": ThreeAxisSystem,
-    "M9": CorrectiveRAGSystem,
 }
 
 BENCHMARK_REGISTRY: dict[str, type] = {
-    "qasper": QasperBenchmark,
     "multihop_rag": MultiHopBenchmark,
-    "quality": QualityBenchmark,
     "narrativeqa": NarrativeQABenchmark,
     # HotpotQA ships as TWO benchmarks, not one flag: variant A is the
     # comparable headline, variant B is where a hierarchy exists. They
@@ -597,7 +587,7 @@ def main() -> None:
         "--system",
         required=True,
         choices=sorted(SYSTEM_REGISTRY),
-        help="Retrieval system id (M1/M2/M3/M4/M6/M7/M9).",
+        help="Retrieval system id (M1/M2/M3/M4).",
     )
     parser.add_argument(
         "--benchmark",
@@ -619,7 +609,7 @@ def main() -> None:
     parser.add_argument(
         "--split",
         required=True,
-        help="Benchmark-specific split. QASPER: train/validation/test. "
+        help="Benchmark-specific split; every matrix cell runs 'validation'. "
         "MultiHop-RAG: validation/test/all (single underlying split).",
     )
     parser.add_argument(
@@ -730,16 +720,16 @@ def main() -> None:
         help=(
             "Run this cell under a DIFFERENT model. Sets the READER "
             "(HarnessConfig.generation.model) AND the INDEX-TIME "
-            "SUMMARISER (M4/M7 summary_model) together, because the "
+            "SUMMARISER (M4 summary_model) together, because the "
             "matrix design is FULL INDEPENDENT REPLICATION: each column "
             "builds its own trees with its own summariser and reads them "
             "with the same model. "
             "Rebinding src.config.GENERATOR_MODEL or JUDGE_MODEL "
             "in-process does NOT work -- both are dataclass field "
             "defaults evaluated once at class-definition time. "
-            "VERIFIED: changing this moves M4's and M7's substrate cache "
-            "keys, so a Llama cell cannot silently hit a Qwen tree. "
-            "M2/M3/M9 keys do NOT move, which is CORRECT -- their "
+            "VERIFIED: changing this moves M4's substrate cache "
+            "key, so a Llama cell cannot silently hit a Qwen tree. "
+            "M2/M3 keys do NOT move, which is CORRECT -- their "
             "substrate contains no LLM output, so it is a "
             "model-independent artifact and rebuilding it would produce "
             "byte-identical files."
@@ -875,20 +865,19 @@ def main() -> None:
         # its own summariser and reads them with the same model. Setting
         # only the reader would produce a column whose trees came from
         # the other model, which is the confound this design exists to
-        # avoid on M1/M2/M3/M9 and cannot avoid on M4.
+        # avoid on M1/M2/M3 and cannot avoid on M4.
         harness_cfg = replace(
             harness_cfg,
             generation=replace(harness_cfg.generation, model=args.generator),
             m4=replace(harness_cfg.m4, summary_model=args.generator),
-            m7=replace(harness_cfg.m7, summary_model=args.generator),
         )
         print(
             f"[eval] GENERATOR OVERRIDE: {args.generator}\n"
             f"    reader           = {harness_cfg.generation.model}\n"
             f"    index summariser = {harness_cfg.m4.summary_model}\n"
-            "    M4/M7 substrate cache keys MOVE with this, so this cell "
+            "    M4's substrate cache key MOVES with this, so this cell "
             "builds its own trees and cannot hit the other column's.\n"
-            "    M2/M3/M9 keys do NOT move — their substrate has no LLM "
+            "    M2/M3 keys do NOT move — their substrate has no LLM "
             "in it, so a cache hit there reuses a model-INDEPENDENT "
             "artifact, not the other column's work."
         )
@@ -969,7 +958,7 @@ def main() -> None:
         resume=args.resume,
         max_padded_tokens=args.max_padded_tokens,
         verify_max_new_tokens=args.max_new_tokens,
-        # Tree systems only: M1/M2/M3/M9 build no tree, so the rule has
+        # Tree systems only: M1/M2/M3 build no tree, so the rule has
         # nothing to say about them and a blanket gate would fire on a
         # legitimate embedding-substrate cache hit.
         require_cold_tree=(args.system == "M4" and not args.allow_warm_trees),

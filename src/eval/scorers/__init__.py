@@ -1,17 +1,15 @@
 """Answer-side scorers for the benchmark eval layer.
 
-extractive: QASPER's SQuAD-style token-F1 with the QASPER normaliser.
-yes_no: exact-match on Yes/No after light normalisation.
+extractive: SQuAD/HotpotQA-style token-F1 under the official normaliser
+            (+ NFKC), max over references — the ONE answer-scoring
+            contract every live loader applies.
 unanswerable: canonical-string match plus a fuzzy-phrase abstention
-              detector for non-canonical phrasings the reader may emit
-              despite the prompt's exact-string instruction.
-multiple_choice: QuALITY option extraction (letter markers with the
-              leading-A article guard, abstention, text match,
-              token-F1 fallback) + 1-indexed accuracy scoring.
+              detector (metadata only; never a score) and the
+              pure-refusal null rule.
+free_form: substring match, recorded in MultiHop answer metadata.
 
 All scorers operate on a SINGLE predicted answer string and a SINGLE
-gold annotation; the benchmark-level wrapper (qasper.score_answer)
-applies max-over-annotators per QASPER convention.
+gold annotation; the benchmark-level wrapper applies max-over-references.
 """
 
 from .extractive import (
@@ -23,21 +21,11 @@ from .extractive import (
 from .free_form import (
     substring_match,
 )
-from .multiple_choice import (
-    RULE3_MIN_F1,
-    RULE3_MIN_MARGIN,
-    extract_choice,
-    score_multiple_choice,
-)
 from .unanswerable import (
     ABSTENTION_PHRASES,
     is_abstention,
     score_abstention,
     score_unanswerable,
-)
-from .yes_no import (
-    normalize_yes_no,
-    score_yes_no,
 )
 
 
@@ -46,15 +34,9 @@ __all__ = [
     "token_f1",
     "extractive_max_f1",
     "substring_match",
-    "RULE3_MIN_F1",
-    "RULE3_MIN_MARGIN",
-    "extract_choice",
-    "score_multiple_choice",
     "ABSTENTION_PHRASES",
     "is_abstention",
     "assert_gold_not_empty",
     "score_abstention",
     "score_unanswerable",
-    "normalize_yes_no",
-    "score_yes_no",
 ]

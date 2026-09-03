@@ -41,7 +41,6 @@ from .config import (
     GENERATOR_MAX_MEMORY,
     GENERATOR_MODEL,
     GenerationConfig,
-    RERANKER_MODEL,
 )
 
 
@@ -78,45 +77,15 @@ def embed_texts(texts: list[str], model_name: str = EMBEDDER_MODEL) -> np.ndarra
     return vecs.astype(np.float32, copy=False)
 
 
-# --- Reranker -------------------------------------------------------------
-
-
-@functools.lru_cache(maxsize=2)
-def load_reranker(model_name: str = RERANKER_MODEL) -> Any:
-    from sentence_transformers import CrossEncoder
-
-    return CrossEncoder(model_name)
-
-
-def rerank_scores(
-    query: str,
-    passages: list[str],
-    model_name: str = RERANKER_MODEL,
-) -> np.ndarray:
-    """Raw cross-encoder logits. Apply sigmoid externally for probabilities."""
-    if not passages:
-        return np.zeros((0,), dtype=np.float32)
-    reranker = load_reranker(model_name)
-    scores = reranker.predict([(query, p) for p in passages], show_progress_bar=False)
-    return np.asarray(scores, dtype=np.float32)
-
-
 # --- Generator ------------------------------------------------------------
 #
-# Two backends share one `generate()` entrypoint, routed by model name:
-#
-#   * OpenAI Chat Completions API (gpt-*, o*, chatgpt-*) -- the
-#     methodology-locked default. The shared final-answer generator
-#     across ALL systems is gpt-4o-mini (professor-confirmed); the
-#     index-time summariser / OpenIE LLM is also gpt-4o-mini and goes
-#     through `summarization.chat_messages` -- the same client + retry
-#     policy this path reuses, so prompt-cache behaviour and rate-limit
-#     handling stay consistent across answer-time and index-time calls.
-#
-#   * Local HuggingFace causal LM (anything else) -- preserved
-#     behind an explicit `cfg.model="Qwen/..."` opt-in so a future
-#     "local-vs-API answer generator" ablation has a working code path
-#     at zero cost. Not used by the default eval grid.
+# One backend: a local HuggingFace causal LM (Qwen2.5-7B-Instruct fp16 by
+# default; Llama-3.1-8B-Instruct for the second column), shared as the
+# final-answer reader AND M4's tree summariser. OpenAI-style model ids
+# are recognised only to be REFUSED: the API answer path was removed in
+# the repo reduction (it lives at tag thesis-full-2026-09-03), and M4's
+# index-LLM guard still reads `_is_openai_model` to refuse an API
+# summariser before any build starts.
 
 
 _OPENAI_MODEL_PREFIXES: tuple[str, ...] = (
@@ -129,42 +98,23 @@ _OPENAI_MODEL_PREFIXES: tuple[str, ...] = (
 
 
 def _is_openai_model(model_name: str) -> bool:
-    """True if `model_name` should route to the OpenAI API path.
+    """True if `model_name` names an OpenAI API model.
 
-    Heuristic on prefix -- avoids hard-coding the exact model id list and
-    lets new OpenAI families (o3-*, o4-*, chatgpt-*) work without code
-    change. Any name not matching a known OpenAI prefix is treated as a
-    local HuggingFace causal-LM id (the opt-in Qwen path).
+    Prefix heuristic so new OpenAI families (o3-*, o4-*, chatgpt-*) are
+    recognised without a code change. Such ids are REFUSED by the
+    generators below and by M4's index-LLM guard; any other name is a
+    local HuggingFace causal-LM id.
     """
     name = model_name.strip().lower()
     return any(name.startswith(p) for p in _OPENAI_MODEL_PREFIXES)
 
 
-def _generate_openai(
-    system_prompt: str,
-    user_prompt: str,
-    cfg: GenerationConfig,
-) -> str:
-    """OpenAI Chat Completions answer. Reuses summarization.chat_messages
-    so the answer-time client / retry / transient-error policy is
-    identical to the index-time path.
-    """
-    # Late import: keeps this module importable in environments where
-    # `openai` is not installed (CPU-only smoke that exercises only the
-    # local path).
-    from .summarization import chat_messages
-
-    return chat_messages(
-        [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        model=cfg.model,
-        max_tokens=cfg.max_new_tokens,
-        temperature=cfg.temperature,
-        top_p=cfg.top_p,
-        _label="generate",
-    )
+_API_PATH_REMOVED = (
+    "generator {model!r} names an OpenAI API model, and the API answer "
+    "path was removed in the repo reduction: every matrix cell runs a "
+    "LOCAL HuggingFace model (tag thesis-full-2026-09-03 keeps the old "
+    "path)."
+)
 
 
 def assert_loaded_generator_matches(
@@ -287,8 +237,8 @@ def _load_generator_impl(model_name: str, load_in_4bit: bool) -> Any:
     # The one choke point every local path goes through, and the last
     # moment before CUDA allocates anything. Setting it in runner.main()
     # only covers subprocess runs; a notebook calling
-    # describe_generator_runtime directly bypassed it, which is why a
-    # probe reported cuda_alloc_conf=None.
+    # a probe helper that loaded the model directly bypassed it, which is
+    # why a probe once reported cuda_alloc_conf=None.
     configure_cuda_allocator()
 
     import torch
@@ -411,7 +361,7 @@ def load_generator(
     return _load_generator_cached(str(model_name), bool(load_in_4bit))
 
 
-# `release_generator` and the probes call these on the public name; the
+# `load_generator.cache_clear()` / `.cache_info()` are used on the public name; the
 # cache lives on the inner function, so the attributes are forwarded
 # rather than left to fail at the call site.
 load_generator.cache_clear = _load_generator_cached.cache_clear  # type: ignore[attr-defined]
@@ -423,10 +373,7 @@ def _generate_local(
     user_prompt: str,
     cfg: GenerationConfig,
 ) -> str:
-    """Local HuggingFace causal-LM answer (Qwen path). Opt-in only via
-    `cfg.model` set to a non-OpenAI model id; kept for a future
-    local-vs-API generator ablation.
-    """
+    """Local HuggingFace causal-LM answer — the only answer path."""
     import torch
 
     tokenizer, model = load_generator(cfg.model, cfg.load_in_4bit)
@@ -582,121 +529,6 @@ def configure_cuda_allocator() -> str | None:
     if not os.environ.get(key):
         os.environ[key] = "expandable_segments:True"
     return os.environ[key]
-
-
-def release_generator() -> None:
-    """Drop the cached generator and return its VRAM.
-
-    `load_generator` is lru_cached, so the model outlives any single
-    inspection and keeps ~15 GB resident. That is correct for a run and
-    wrong for a probe: it OOM'd a subsequent `python -m src.eval.runner`
-    subprocess launched from the same notebook.
-    """
-    import gc
-
-    load_generator.cache_clear()
-    gc.collect()
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except ImportError:
-        pass
-
-
-def describe_generator_config(model_name: str = GENERATOR_MODEL) -> dict:
-    """Architecture facts WITHOUT loading weights. Safe to call anywhere.
-
-    Enough to compute KV-cache arithmetic (layers x kv_heads x head_dim)
-    when planning a batch budget. What it cannot tell you is the
-    attention implementation, which is resolved at model construction —
-    for that you need `describe_generator_runtime`.
-    """
-    from transformers import AutoConfig
-
-    c = AutoConfig.from_pretrained(model_name)
-    n_layers = getattr(c, "num_hidden_layers", None)
-    n_kv = getattr(c, "num_key_value_heads", None)
-    head_dim = getattr(c, "head_dim", None) or (
-        (getattr(c, "hidden_size", 0) // getattr(c, "num_attention_heads", 1))
-        or None
-    )
-    kv_bytes_per_token = (
-        2 * n_layers * n_kv * head_dim * 2
-        if None not in (n_layers, n_kv, head_dim)
-        else None
-    )
-    return {
-        "model": model_name,
-        "n_layers": n_layers,
-        "n_attention_heads": getattr(c, "num_attention_heads", None),
-        "n_kv_heads": n_kv,
-        "head_dim": head_dim,
-        "max_position_embeddings": getattr(c, "max_position_embeddings", None),
-        "vocab_size": getattr(c, "vocab_size", None),
-        # fp16 KV per token per sequence; multiply by padded tokens to
-        # size a batch budget.
-        "kv_bytes_per_token_fp16": kv_bytes_per_token,
-    }
-
-
-def describe_generator_runtime(
-    model_name: str = GENERATOR_MODEL,
-    *,
-    load_in_4bit: bool = False,
-    release: bool = True,
-) -> dict:
-    """Load the generator, report what actually got built, then RELEASE it.
-
-    Exists for the measurement round: attention implementation is the
-    single biggest free lever on batch size at 4k context, and it is not
-    knowable from config — recent transformers picks SDPA when torch
-    supports it, older ones fall back to eager, and eager materialises a
-    batch x heads x seq x seq attention matrix that dominates VRAM.
-
-    `release=True` by DEFAULT, and that default is a bug fix: because
-    `load_generator` is lru_cached, an earlier version left ~15 GB
-    resident in the calling process and OOM'd the next
-    `python -m src.eval.runner` subprocess launched from the same
-    notebook. A probe must not cost the run that follows it. Pass
-    release=False only when the caller intends to generate immediately
-    afterwards in the same process.
-    """
-    import torch
-
-    tokenizer, model = load_generator(model_name, load_in_4bit)
-    out = {
-        **generator_identity(model_name, load_in_4bit=load_in_4bit),
-        "attn_implementation": getattr(
-            model.config, "_attn_implementation", "unknown"
-        ),
-        "dtype": str(model.dtype),
-        "n_layers": getattr(model.config, "num_hidden_layers", None),
-        "n_kv_heads": getattr(model.config, "num_key_value_heads", None),
-        "max_position_embeddings": getattr(
-            model.config, "max_position_embeddings", None
-        ),
-        # The checkpoint's idle default. generate_batch does NOT use
-        # this: it forces left padding for the duration of the call and
-        # restores afterwards, so a probe outside a generation call
-        # legitimately reports "right". Reported alongside the value
-        # actually used, because a bare "right" here reads like the bug
-        # that produces plausible text attached to the wrong question.
-        "tokenizer_padding_side_idle": tokenizer.padding_side,
-        "padding_side_used_for_generation": "left",
-        "vram_allocated_gb": (
-            round(torch.cuda.memory_allocated() / 1e9, 2)
-            if torch.cuda.is_available() else None
-        ),
-        "cuda_alloc_conf": __import__("os").environ.get(
-            "PYTORCH_CUDA_ALLOC_CONF"
-        ),
-    }
-    del tokenizer, model
-    if release:
-        release_generator()
-    return out
 
 
 # Populated by generate_batch: how many model.generate() invocations were
@@ -944,8 +776,7 @@ def generate_batch(
     part of the artifact's identity and belongs in the cache key of
     anything cached (see raptor_paper.paper_substrate_extra).
 
-    OpenAI-model ids fall back to the sequential API path — batching is a
-    local-model concern, and the API already parallelises server-side.
+    OpenAI-model ids are refused: the API answer path no longer exists.
     """
     cfg = cfg or GenerationConfig()
     if len(system_prompts) != len(user_prompts):
@@ -959,10 +790,7 @@ def generate_batch(
         raise ValueError("batch_size must be >= 1")
 
     if _is_openai_model(cfg.model):
-        return [
-            _generate_openai(s, u, cfg)
-            for s, u in zip(system_prompts, user_prompts)
-        ]
+        raise ValueError(_API_PATH_REMOVED.format(model=cfg.model))
 
     configure_cuda_allocator()
     import torch
@@ -1123,15 +951,12 @@ def generate(
     user_prompt: str,
     cfg: GenerationConfig | None = None,
 ) -> str:
-    """Final-answer generator. Routes by `cfg.model` to OpenAI or local.
+    """Final-answer generator: the local HuggingFace path.
 
-    Methodology: the shared final-answer generator is gpt-4o-mini (held
-    constant across ALL systems per professor's directive). `cfg.model`
-    defaults to `GENERATOR_MODEL = "gpt-4o-mini"`, so unless a caller
-    explicitly overrides with a non-OpenAI id, every system's answer
-    goes through the API path.
+    The shared final-answer generator is a LOCAL model held constant
+    across ALL systems (`GENERATOR_MODEL`); an OpenAI id is refused.
     """
     cfg = cfg or GenerationConfig()
     if _is_openai_model(cfg.model):
-        return _generate_openai(system_prompt, user_prompt, cfg)
+        raise ValueError(_API_PATH_REMOVED.format(model=cfg.model))
     return _generate_local(system_prompt, user_prompt, cfg)

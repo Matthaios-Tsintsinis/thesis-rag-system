@@ -53,26 +53,13 @@ class TestDeterministicBatchOrder(unittest.TestCase):
 
 
 class TestRoutingAndContract(unittest.TestCase):
-    def test_openai_ids_use_the_sequential_api_path(self):
-        """Batching is a local-model concern; the API parallelises
-        server-side. Also keeps this path torch-free."""
+    def test_openai_ids_are_refused_before_any_load(self):
+        """The API answer path was removed in the reduction; an OpenAI id
+        must fail loudly, torch-free, before anything loads."""
         cfg = GenerationConfig(model="gpt-4o-mini")
-        with mock.patch(
-            "src.models._generate_openai", side_effect=lambda s, u, c: f"A:{u}"
-        ) as m:
-            out = generate_batch(["sys"] * 3, ["q1", "q2", "q3"], cfg)
-        self.assertEqual(out, ["A:q1", "A:q2", "A:q3"])
-        self.assertEqual(m.call_count, 3)
-
-    def test_results_align_to_input_order_not_sorted_order(self):
-        cfg = GenerationConfig(model="gpt-4o-mini")
-        with mock.patch(
-            "src.models._generate_openai", side_effect=lambda s, u, c: u.upper()
-        ):
-            out = generate_batch(
-                ["s"] * 3, ["short", "a much longer prompt here", "mid one"], cfg
-            )
-        self.assertEqual(out, ["SHORT", "A MUCH LONGER PROMPT HERE", "MID ONE"])
+        with self.assertRaises(ValueError) as ctx:
+            generate_batch(["sys"] * 3, ["q1", "q2", "q3"], cfg)
+        self.assertIn("gpt-4o-mini", str(ctx.exception))
 
     def test_empty_input_returns_empty(self):
         self.assertEqual(generate_batch([], [], GenerationConfig()), [])

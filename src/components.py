@@ -14,7 +14,7 @@ the retrieval comparison. ResolvedComponents therefore carries no
 generator slot — the invariant is enforced structurally.
 
 Index-time LLM names differ per paper (RAPTOR calls it the summariser
-and stores it as M4Config.summary_model / M7Config.summary_model;
+and stores it as M4Config.summary_model;
 HippoRAG calls it OpenIE and a future M6 config will carry openie_llm).
 The resolver checks both names and normalises to a single index_llm_id
 for the per-system audit log.
@@ -92,8 +92,7 @@ def resolve_components(
     per-system fallbacks. They differ from harness-level defaults
     because not every system reranks or runs an index-time LLM — M4
     passes default_reranker=None to keep "M4 does not rerank" visible
-    in the resolved bundle, while M7 passes default_reranker=
-    RERANKER_MODEL.
+    in the resolved bundle.
     """
     embedder = _resolve_field(system_cfg, "embedder", EMBEDDER_MODEL)
     chunker = _resolve_field(system_cfg, "chunker", harness_cfg.chunking)

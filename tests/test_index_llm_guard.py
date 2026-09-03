@@ -45,8 +45,6 @@ class TestLocalGeneratorIsWired(unittest.TestCase):
         for label, model in (
             ("generation", DEFAULT_CONFIG.generation.model),
             ("m4.summary_model", DEFAULT_CONFIG.m4.summary_model),
-            ("m7.summary_model", DEFAULT_CONFIG.m7.summary_model),
-            ("m6.openie_llm", DEFAULT_CONFIG.m6.openie_llm),
         ):
             with self.subTest(field=label):
                 self.assertFalse(

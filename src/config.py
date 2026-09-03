@@ -30,7 +30,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 EMBEDDER_MODEL = "BAAI/bge-m3"
 EMBEDDING_DIM = 1024
-RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
 # Final-answer generator, shared across ALL systems. Held constant so
 # per-system answer-quality deltas attribute to retrieval, not to reader
 # capacity.
@@ -296,38 +295,12 @@ class GenerationConfig:
 
 
 @dataclass(frozen=True)
-class RaptorBuildParams:
-    """RAPTOR cluster-tree topology (PIPELINE_DESIGN.md section 3.4).
-
-    Defaults match the document. Smoke overrides them to produce a
-    tree on the small fixture corpus.
-    """
-    branching_factor: int = 4
-    min_cluster_size: int = 24
-    max_depth: int = 4
-
-
-@dataclass(frozen=True)
-class ExpansionParams:
-    """Per-node-type expansion (PIPELINE_DESIGN.md section 4.4)."""
-    max_children_to_follow_from_broad_summary: int = 2
-    summary_expansion_top_k_chunks: int = 3
-    max_descendant_chunks_for_direct_expansion: int = 50
-    max_expansion_recursion_depth: int = 2
-    # Depth boundaries: 0-1 high (root excluded from flat index), 2 mid, 3+ low.
-    high_level_max_depth: int = 1
-    mid_level_depth: int = 2
-    low_level_min_depth: int = 3
-
-
-@dataclass(frozen=True)
 class M4Config:
     """M4-specific knobs.
 
     M4 is the official-RAPTOR collapsed-retrieval baseline. No
-    cross-encoder rerank (matches the published paper; rerank is M7's
-    contribution, not M4's). Trace is opt-in: smoke flips it on for
-    routing-path sanity checks; production benchmarks leave it off.
+    cross-encoder rerank (matches the published paper). Trace is
+    opt-in; production benchmarks leave it off.
 
     The optional `embedder`, `chunker`, `reranker` fields are component
     overrides resolved by `src.components.resolve_components`. None = use
@@ -338,16 +311,6 @@ class M4Config:
     the answer generator is harness-level (HarnessConfig.generation),
     held constant across systems.
     """
-    # --- LEGACY: the top-down MiniBatchKMeans substrate (src/raptor.py) ---
-    # Unused by the paper-faithful path, which builds bottom-up via
-    # src/raptor_paper.py and reads `paper` below. Retained so that
-    # reverting to the pre-fidelity M4 is a code revert against a
-    # preserved cache (RAPTOR/bfc50c2...), not a config redesign, and so
-    # existing callers that construct M4Config(build=..., expansion=...)
-    # keep working.
-    build: RaptorBuildParams = field(default_factory=RaptorBuildParams)
-    expansion: ExpansionParams = field(default_factory=ExpansionParams)
-
     # --- paper-faithful tree (src/raptor_paper.py) ---
     paper: PaperTreeParams = field(default_factory=PaperTreeParams)
     # Reference TreeBuilderConfig.summarization_length. Ruling 4: this is
@@ -553,285 +516,12 @@ class M4Config:
     trace: bool = False
 
 
-# M5Config (GraphRAG) and M8Config (hierarchical cluster-tree port) were
-# dropped from the active roster when the per-paper-component rule was
-# adopted. Their dataclasses are preserved verbatim in
-# `src/retrievers/deprecated/_archived_config.py` for resurrection.
-
-
-@dataclass(frozen=True)
-class M6Config:
-    """M6 — HippoRAG 1 (legacy, NeurIPS'24), single-step retrieval.
-
-    Faithful port of the OSU-NLP-Group/HippoRAG legacy branch. Components
-    per the paper's main-experiment shell scripts (not the constructor
-    defaults, which are stubs — see notes below).
-
-    Damping convention: igraph's `personalized_pagerank(damping=...)` is
-    the continue-walk probability (1 - restart probability). The legacy
-    main_exps + ablations + case_study + ircot_main_exps shell scripts
-    all use `--damping 0.5`, overriding the constructor default of 0.1.
-    M6Config.damping = 0.5 is byte-for-byte faithful at the call site.
-
-    Empty-NER policy: when query NER returns zero entities, the legacy
-    code falls back to uniform doc_prob (random top-k). M6 preserves
-    that fallback for paper faithfulness and logs every empty-NER event
-    so the impact can be quantified in analysis (do NOT silently fix).
-
-    Multilingual: Contriever is English-centric; processing_phrases
-    drops non-ASCII characters. Greek queries degrade — documented as a
-    paper-faithfulness limitation alongside M4's mpnet.
-    """
-
-    # --- index-time LLM (paper used gpt-3.5-turbo-1106; modernised) ---
-    openie_llm: str = JUDGE_MODEL  # gpt-4o-mini
-    openie_prompt_version: str = "v1"  # bumped when any prompt string changes
-
-    # --- graph build (paper defaults) ---
-    sim_threshold: float = 0.8       # synonymy edge cutoff
-    synonym_top_k_cap: int = 100     # per-source-phrase neighbour cap (legacy line 280)
-    node_specificity: bool = True
-
-    # --- PPR (paper main-experiment values, NOT constructor defaults) ---
-    damping: float = 0.5             # continue-walk probability; see class docstring
-    doc_ensemble: bool = False       # paper headline = single-step + no DPR ensemble
-    dpr_only: bool = False
-
-    # --- query ---
-    max_query_ner: int = 8           # bound personalisation-vector size (soft cap, not in paper)
-    top_k_final: int = FINAL_CONTEXT_CHUNKS
-
-    # --- component overrides (per-paper assignment) ---
-    # Contriever (768-dim) per the HippoRAG paper / legacy
-    # main_exps.sh:5. Same dim as M4's mpnet but different model;
-    # M4 and M6 cache namespaces are entirely separate (no shared
-    # substrate — M6 has its own graph-based artifacts in cache/M6/).
-    # Chunker falls through to the harness default (paper takes
-    # pre-chunked passages; chunking is OUR choice, faithful to no
-    # specific paper choice). Reranker stays None (HippoRAG has no
-    # cross-encoder rerank).
-    embedder: str | None = "facebook/contriever"
-    chunker: ChunkingConfig | None = None
-    reranker: str | None = None
-
-    trace: bool = False
-
-
-# --- M7 sub-configs (PIPELINE_DESIGN.md §5 CONFIG, verbatim) --------------
-
-
-@dataclass(frozen=True)
-class AspectParams:
-    """§4.1 query decomposition."""
-    max_aspects: int = 3
-    min_aspect_importance: float = 0.25
-    drop_low_importance_aspects: bool = True
-
-
-@dataclass(frozen=True)
-class AspectScoringParams:
-    """§4.2 aspect scoring = w_i·importance + w_c·retrieval_confidence.
-
-    retrieval_confidence = sigmoid(top-1 cross-encoder logit) over the
-    preliminary-rerank top-K first-stage hits of the aspect's paraphrase
-    view. Source is fixed (cross_encoder_top1) by design — not a knob.
-    """
-    importance_weight: float = 0.5
-    retrieval_confidence_weight: float = 0.5
-    preliminary_rerank_top_k: int = 10
-
-
-@dataclass(frozen=True)
-class BudgetParams:
-    """§4.3 final-context budget allocation.
-
-    CK-4 update: defaults bumped from {final_context_chunks=15,
-    max_chunks_per_aspect=8} to {50, 25} so M7's quota machinery
-    distributes over the shared RETRIEVAL_RANKING_DEPTH=50 budget the
-    rest of the systems also retrieve. The shared packer
-    (src.prompt_packing.pack_context) then enforces the token-level
-    EVIDENCE_TOKEN_BUDGET=3000 at prompt-build time uniformly across
-    all systems. The quota algorithm itself is unchanged — same
-    proportional split, same per-aspect clamps, just sized to the
-    deeper budget so M7 doesn't self-handicap to 8-12 chunks while
-    baselines feed 15.
-    """
-    final_context_chunks: int = RETRIEVAL_RANKING_DEPTH  # 50 post-CK-4
-    global_view_quota: int = 2
-    min_chunks_per_aspect: int = 2
-    max_chunks_per_aspect: int = 25
-
-
-@dataclass(frozen=True)
-class MultiBranchParams:
-    """§4.4 Axis-1 Part B multi-branch tree traversal."""
-    top_k_depth_1: int = 3
-    top_k_per_level: int = 2
-    max_depth: int = 4
-    leaves_per_path: int = 5
-
-
-@dataclass(frozen=True)
-class StructuralAxisParams:
-    """§4.4 Axis-2 Docling structural rerank/diversification."""
-    section_diversity_cap: int = 3
-    neighbor_radius: int = 1
-    aspect_section_bias_factor: float = 1.15
-    include_section_title_header: bool = True
-
-
-@dataclass(frozen=True)
-class DiversityParams:
-    """§4.5 anti-redundancy caps (cluster ancestry tagged at index time)."""
-    max_chunks_per_raptor_cluster: int = 4
-
-
-@dataclass(frozen=True)
-class ContextPackingParams:
-    """§4.8 parent-summary orientation context packing."""
-    max_ancestor_summaries_per_chunk_group: int = 2
-    max_parent_summaries_per_chunk_group: int = 2
-    max_parent_summary_tokens: int = 80
-    summary_context_token_ratio: float = 0.15
-    chunk_context_token_ratio: float = 0.85
-    include_root_summary: bool = False
-
-
-@dataclass(frozen=True)
-class AbstentionParams:
-    """§4.9 retrieval-side abstention signal."""
-    retrieval_confidence_threshold: float = 0.40
-
-
-@dataclass(frozen=True)
-class M7Config:
-    """M7 — three-axis hybrid over RAPTOR (the thesis contribution).
-
-    Reuses the shared RAPTOR substrate: `build` / `expansion` /
-    `summary_model` / `rrf_k` / `include_root_in_flat_index` MUST keep
-    M4's defaults so M7 and M4 land on the same RAPTOR/<substrate_hash>/
-    cache directory (see raptor.raptor_substrate_extra). Changing them
-    forks the substrate and forces a rebuild.
-
-    The eight ablation switches are top-level fields so the eval grid
-    (evaluation_plan.pdf §4, A1-A8) flips exactly one off per row via
-    config, never a code change. Six are pure toggles; A3 (view_types)
-    and A6 (quota_preserving_rerank) gate explicit code branches in the
-    orchestrator.
-    """
-    # --- shared RAPTOR substrate (keep == M4 defaults) ---
-    build: RaptorBuildParams = field(default_factory=RaptorBuildParams)
-    expansion: ExpansionParams = field(default_factory=ExpansionParams)
-    summary_model: str = JUDGE_MODEL  # gpt-4o-mini
-    first_stage_top_k: int = FIRST_STAGE_TOP_K
-    rrf_k: int = RRF_K
-    include_root_in_flat_index: bool = False
-
-    # --- component overrides (None = shared default) ---
-    # Resolved by src.components.resolve_components. The reranker default
-    # for M7 is RERANKER_MODEL (bge-reranker-v2-m3), passed by the M7
-    # resolve_components(..., default_reranker=RERANKER_MODEL) call site;
-    # `reranker=None` here means "use that per-system default", not "no
-    # reranker". Embedder/chunker fall back to HarnessConfig defaults.
-    # No `final_generator` field — final generator is harness-level
-    # (HarnessConfig.generation), held constant across systems.
-    embedder: str | None = None
-    chunker: ChunkingConfig | None = None
-    reranker: str | None = None
-
-    # --- M7 query-time sub-configs ---
-    aspects: AspectParams = field(default_factory=AspectParams)
-    scoring: AspectScoringParams = field(default_factory=AspectScoringParams)
-    budget: BudgetParams = field(default_factory=BudgetParams)
-    multi_branch: MultiBranchParams = field(default_factory=MultiBranchParams)
-    structural: StructuralAxisParams = field(default_factory=StructuralAxisParams)
-    diversity: DiversityParams = field(default_factory=DiversityParams)
-    packing: ContextPackingParams = field(default_factory=ContextPackingParams)
-    abstention: AbstentionParams = field(default_factory=AbstentionParams)
-
-    # --- ablation switches (evaluation_plan.pdf §4) ---
-    use_docling_structural_axis: bool = True          # A1
-    use_intent_decomposition: bool = True             # A2
-    view_types: tuple[str, ...] = ("paraphrase", "hyde")  # A3 -> (..,"paraphrase2")
-    use_bm25: bool = True                             # A4
-    include_parent_summaries: bool = True             # A5
-    quota_preserving_rerank: bool = True              # A6
-    pass_retrieval_confidence_to_llm: bool = True     # A7
-    always_include_global_query_view: bool = True     # A8
-
-    # --- diagnostics (smoke flips on for sanity checks; eval leaves off) ---
-    trace: bool = False
-
-
-@dataclass(frozen=True)
-class CorrectiveConfig:
-    """M9 — CorrectiveRAG (Yan et al., 2024), corpus-internal variant.
-
-    M9 composes over the M3 hybrid substrate (no index-time artifacts
-    of its own, no substrate cache namespace) and adds a query-time
-    corrective loop: bge-reranker evaluator -> two-threshold action
-    decision -> optional gpt-4o-mini query rewrite + re-retrieval ->
-    strip refinement. All fields here are query-time parameters; none
-    enter any cache key. Deviations from the paper are documented in
-    the module comment block (src/retrievers/m9_corrective.py).
-
-    THRESHOLD PROVENANCE (baked 2026-06-12). Derived empirically by
-    scripts/derive_corrective_thresholds.py on the QASPER VALIDATION
-    20-paper small sample (55 queries; 72 gold / 708 non-gold chunks,
-    base rate 0.0923), artifact
-    derivation_validation_20260612-014811.json. Criterion v2
-    (non-gold percentile / FPR control):
-      tau_high = 0.6395 — 90th percentile of the NON-GOLD confidence
-        distribution (a chunk above it scores higher than ~all
-        known-irrelevant chunks; FPR 0.100 by construction; precision
-        0.193, lift 2.09x over base rate at the cut).
-      tau_low  = 0.5001 — 5th percentile of the GOLD confidence
-        distribution (discarding below it loses ~5% of gold).
-    Derivation-time action mix: 49.1% correct / 50.9% ambiguous /
-    0.0% incorrect; strip survival at tau_strip(=tau_low): 57.2%.
-    The realized mix of every M9 run must roughly match (analyse.py
-    prints it); large drift = miscalibration. Derived ONCE — no
-    per-benchmark tuning; MultiHop transfer is checked via the
-    action-mix logging, not re-derivation. The paper's published
-    thresholds (0.59 / -0.99) live on its fine-tuned-T5 score scale
-    and do not transfer; an absolute-precision criterion (v1) was
-    retired after measuring a 0.50 precision ceiling at every cut —
-    see the CALIBRATION FINDINGS block in m9_corrective.py.
-    """
-
-    tau_high: float = 0.6395  # max conf >= tau_high -> CORRECT (non-gold p90)
-    tau_low: float = 0.5001   # max conf <  tau_low  -> INCORRECT (gold p5)
-    # Strip-refinement threshold; None -> use tau_low (one fewer free
-    # parameter — revisit only if refinement degenerates).
-    tau_strip: float | None = None
-    refine: bool = True             # strip refinement; flag kept for ablation
-    strip_sentences: int = 2        # sentences per refinement strip
-    rewrite_prompt_version: str = "v1"  # names REWRITE_PROMPT_V{n} in the module
-
-    # --- component overrides (per-paper assignment) ---
-    # Embedder/chunker stay None = shared defaults (the substrate IS
-    # M3's: bge-m3 + harness chunker; overriding either here would
-    # fork the inner M3 cache key and rebuild). The reranker default
-    # for M9 is RERANKER_MODEL, passed by the M9
-    # resolve_components(..., default_reranker=RERANKER_MODEL) call
-    # site — reranker=None here means "use that per-system default".
-    # No final_generator field — harness-level, held constant.
-    embedder: str | None = None
-    chunker: ChunkingConfig | None = None
-    reranker: str | None = None
-
-    trace: bool = False
-
-
 @dataclass(frozen=True)
 class HarnessConfig:
     retrieval: RetrievalConfig = field(default_factory=RetrievalConfig)
     chunking: ChunkingConfig = field(default_factory=ChunkingConfig)
     generation: GenerationConfig = field(default_factory=GenerationConfig)
     m4: M4Config = field(default_factory=M4Config)
-    m6: M6Config = field(default_factory=M6Config)
-    m7: M7Config = field(default_factory=M7Config)
-    corrective: CorrectiveConfig = field(default_factory=CorrectiveConfig)
 
 
 DEFAULT_CONFIG = HarnessConfig()

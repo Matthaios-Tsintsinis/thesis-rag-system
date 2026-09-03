@@ -188,35 +188,6 @@ class TestSystemsExposeAScoringRanking(unittest.TestCase):
             SCORING_RANKING_DEPTH,
         )
 
-    def test_m9_reuses_its_pool_instead_of_re_running_the_pipeline(self):
-        """M9's corrective decision is k-independent, so ONE pass cut
-        twice is exact. Re-running would pay a second reranker pass and a
-        second rewrite LLM call — that is F4 in the verification doc.
-
-        COUNTED BY CALLING, not by grepping `prepare`'s source for
-        `_corrective_retrieve(`. A source count proves the token appears
-        once; it says nothing about how many times a query triggers the
-        corrective pass, which is the property F4 asserts.
-        """
-        from unittest import mock
-
-        from src.retrievers.m9_corrective import CorrectiveRAGSystem
-
-        from src.config import DEFAULT_CONFIG
-
-        # Constructs without loading any model — verified, so this stays
-        # a CPU test that runs on every commit rather than one that only
-        # runs where a GPU is.
-        system = CorrectiveRAGSystem(config=DEFAULT_CONFIG)
-        # `prepare` guards on the index; the corrective pass is what is
-        # under test, not the guard, so satisfy it and stub the pass.
-        system._indexed = True
-        with mock.patch.object(
-            CorrectiveRAGSystem, "_corrective_retrieve",
-            return_value=([], {"m9_action": "CORRECT"}),
-        ) as call:
-            system.prepare("a question")
-        self.assertEqual(call.call_count, 1)
 
 
 if __name__ == "__main__":

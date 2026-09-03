@@ -74,8 +74,7 @@ class TestM4Oracle(unittest.TestCase):
         cfg = replace(
             DEFAULT_CONFIG,
             generation=replace(DEFAULT_CONFIG.generation, model=QWEN),
-            m4=replace(DEFAULT_CONFIG.m4, summary_model=QWEN),
-            m7=replace(DEFAULT_CONFIG.m7, summary_model=QWEN))
+            m4=replace(DEFAULT_CONFIG.m4, summary_model=QWEN))
         sy = RaptorSystem(config=cfg)
         sy.topology_env_override = TOKENLESS_ENV
         sy._resolved = m4_resolve(cfg.m4, cfg, default_reranker=None)
@@ -93,8 +92,7 @@ class TestM4Oracle(unittest.TestCase):
         cfg = replace(
             DEFAULT_CONFIG,
             generation=replace(DEFAULT_CONFIG.generation, model=QWEN),
-            m4=replace(DEFAULT_CONFIG.m4, summary_model=QWEN),
-            m7=replace(DEFAULT_CONFIG.m7, summary_model=QWEN))
+            m4=replace(DEFAULT_CONFIG.m4, summary_model=QWEN))
         sy = RaptorSystem(config=cfg)
         sy._resolved = m4_resolve(cfg.m4, cfg, default_reranker=None)
         cdir = sy._cache_dir(RECORDED_CORPUS_HASH)

@@ -340,7 +340,6 @@ def replay_cell(bank: Path, generator: str, benchmark_name: str,
         DEFAULT_CONFIG,
         generation=replace(DEFAULT_CONFIG.generation, model=generator),
         m4=replace(DEFAULT_CONFIG.m4, summary_model=generator),
-        m7=replace(DEFAULT_CONFIG.m7, summary_model=generator),
     )
     system = SYSTEM_REGISTRY[system_id](config=cfg)
     if env_override is not None:
@@ -499,7 +498,6 @@ def dry_run_cell(bank: Path, generator: str, benchmark_name: str,
         DEFAULT_CONFIG,
         generation=replace(DEFAULT_CONFIG.generation, model=generator),
         m4=replace(DEFAULT_CONFIG.m4, summary_model=generator),
-        m7=replace(DEFAULT_CONFIG.m7, summary_model=generator),
     )
     system = SYSTEM_REGISTRY[system_id](config=cfg)
     if env_override is not None:
