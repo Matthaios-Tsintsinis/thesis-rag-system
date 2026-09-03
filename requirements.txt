@@ -52,8 +52,8 @@ numba>=0.66                     # FLOOR IS LOAD-BEARING, DO NOT LOWER.
 #   numpy 2.4.6 / numba 0.66.0 / llvmlite 0.48.0 / umap-learn 0.5.12 /
 #   pynndescent 0.6.0   (Colab, Python 3.12, 2026-07-29)
 #
-# INSTALL ORDER IS NOT OPTIONAL — see src/colab_setup.py
-# verify_umap_stack(). Installing these upgrades numpy inside a live
+# INSTALL ORDER IS NOT OPTIONAL — see the README's Colab block sequence
+# (install, RESTART, stack check). Installing these upgrades numpy inside a live
 # kernel that already imported the stock version, which leaves a spliced
 # module tree; the observed failure is
 #   ImportError: cannot import name '_center' from 'numpy._core.umath'

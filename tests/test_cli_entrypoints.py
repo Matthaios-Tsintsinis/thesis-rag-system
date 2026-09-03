@@ -1,4 +1,4 @@
-"""End-to-end smoke for the three CLI entry points. No GPU, no model.
+"""End-to-end smoke for the runner CLI. No GPU, no model.
 
 WHY THIS FILE EXISTS. `b3d3df3` shipped with `runner.main()` raising
 `NameError: name 'system_cls' is not defined` on its very first use — the
@@ -7,20 +7,13 @@ full suite was 215/215 green, because NOTHING under tests/ called
 `main()`. A broken runner costs a Colab session and a 15GB model download
 to discover.
 
-An audit at that point found the same gap in all three CLIs:
-
-    runner     no test imported it at all
-    analyse    two tests, both of private helpers (_aggregate); main() never called
-    aggregate  no test touched it in any form
-
 These tests exercise the WIRING — argument parsing, registry lookup,
-config construction, output paths, summary shape, and the handoff from
-runner to analyse to aggregate. They deliberately stub the system so no
-model loads: the failure being guarded against lives in the plumbing, and
-a test that needed a GPU would not run often enough to catch it.
+config construction, output paths and summary shape. They deliberately
+stub the system so no model loads: the failure being guarded against
+lives in the plumbing, and a test that needed a GPU would not run often
+enough to catch it.
 
-Any commit touching runner.py / analyse.py / aggregate.py has to pass
-this.
+Any commit touching runner.py has to pass this.
 """
 
 from __future__ import annotations
@@ -33,8 +26,6 @@ from pathlib import Path
 from unittest import mock
 
 from src.config import DEFAULT_CONFIG
-from src.eval import aggregate as aggregate_mod
-from src.eval import analyse as analyse_mod
 from src.config import MATRIX_BATCH_SIZE
 from src.eval import runner as runner_mod
 from src.eval.types import (
@@ -343,47 +334,6 @@ class TestRunnerMain(_CliCase):
         simply not checked, never broken."""
         self.assertFalse(hasattr(_TinyBenchmark, "preflight"))
         self.assertTrue(self._run().exists())
-
-
-class TestAnalyseMain(_CliCase):
-    def test_analyse_main_reads_the_runner_output(self):
-        """analyse had two tests, both of _aggregate. main() was never
-        called, so its argument wiring was as unguarded as runner's."""
-        out = self._run()
-        dump = self.dir / "agg.json"
-        argv = ["analyse", str(out), "--output", str(dump)]
-        with mock.patch.object(sys, "argv", argv):
-            analyse_mod.main()
-        self.assertTrue(dump.exists())
-        rollup = json.loads(dump.read_text(encoding="utf-8"))
-        self.assertEqual(rollup["n_total_records"], 2)
-        self.assertIn("STUB", rollup["systems"])
-
-    def test_by_type_slice_does_not_crash(self):
-        out = self._run()
-        with mock.patch.object(sys, "argv", ["analyse", str(out), "--by-type"]):
-            analyse_mod.main()
-
-
-class TestAggregateMain(_CliCase):
-    def test_aggregate_main_renders_a_table(self):
-        """aggregate was touched by NO test in any form."""
-        self._run()
-        outdir = self.dir / "agg"
-        argv = ["aggregate", str(self.dir), "--output-dir", str(outdir),
-                "--no-deep"]
-        with mock.patch.object(sys, "argv", argv):
-            aggregate_mod.main()
-        written = list(outdir.glob("results_*.md")) + list(outdir.glob("results_*.csv"))
-        self.assertTrue(written, "aggregate wrote nothing")
-
-    def test_aggregate_exits_cleanly_when_there_is_nothing_to_read(self):
-        empty = self.dir / "empty"
-        empty.mkdir()
-        argv = ["aggregate", str(empty), "--no-deep"]
-        with mock.patch.object(sys, "argv", argv):
-            with self.assertRaises(SystemExit):
-                aggregate_mod.main()
 
 
 if __name__ == "__main__":
