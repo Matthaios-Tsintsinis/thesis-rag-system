@@ -35,10 +35,12 @@ documents (`docs/` is gitignored) and cite that tag.
   hardware, so a reproduction runs on an L4 or into its own bank.
 - **CPython 3.12.13, exactly.** The environment gate compares the full
   interpreter string recorded in the lock.
-- **`requirements.lock`** — the banked environment (13 pinned packages
-  plus the `# python=3.12.13` line, `lockfile_hash 17878bc8740173be`). It
-  is not in this repository; it sits at the root of the Drive folder
-  beside the banks. The runner checks it before any model loads.
+- **`requirements.lock`** — the banked environment: the pinned versions
+  of the topology stack, torch and transformers, faiss, rank-bm25,
+  tiktoken, datasets and huggingface-hub, plus the `# python=3.12.13`
+  line (`lockfile_hash 17878bc8740173be`). It is not in this repository;
+  it sits at the root of the Drive folder beside the banks. The runner
+  checks it before any model loads.
 - **The Drive folder** `/content/drive/MyDrive/thesis_rag/`:
 
   ```
@@ -99,7 +101,9 @@ os.environ.update({
 **Block E — the interpreter and the locked environment.** Creates the
 3.12.13 environment the lock names and installs into IT, never into the
 notebook kernel. `requirements.txt` is the reduced import graph;
-`requirements.lock` then pins every version. (This block is the
+`requirements.lock` then pins every version. The lock names the CUDA
+12.8 build of torch (`torch==2.11.0+cu128`), which PyPI does not serve,
+so the lock install carries the PyTorch index. (This block is the
 reconstruction of the operator's `py312` cell from the recorded
 interpreter path and version; if your own notebook cell differs, your
 cell is the record — what must hold is `python --version` printing
@@ -112,7 +116,7 @@ cd /content && curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | 
 cp /content/drive/MyDrive/thesis_rag/requirements.lock /content/thesis-rag-system/requirements.lock
 cd /content/thesis-rag-system
 /content/py312/bin/python -m pip install -r requirements.txt
-/content/py312/bin/python -m pip install -r requirements.lock
+/content/py312/bin/python -m pip install -r requirements.lock --extra-index-url https://download.pytorch.org/whl/cu128
 ```
 
 ```bash
@@ -122,8 +126,10 @@ cd /content/thesis-rag-system && /content/py312/bin/python -c "import numpy, num
 numba >= 0.66 is load-bearing (older numba pins numpy < 2.1); fix by
 upgrading numba, never by lowering numpy.
 
-**Block F — the pin gate.** Must print `[pin] lockfile_hash=17878bc8740173be`
-and `[pin] OK`, and `pip check` must be clean. The gate itself screens
+**Block F — the pin gate.** Must print `[pin] lockfile_hash=17878bc8740173be`,
+`[pin] python=3.12.13 (locked 3.12.13)`, `[pin] checked N pinned
+package(s)` and `[pin] OK — environment matches the lockfile.`, and
+`pip check` must be clean. The gate itself screens
 `pip check` and FAILS on any conflict that names a locked package. The
 uninstall line exists for one recorded incident (a `torchvision` wheel
 pulled in over the lock's torch broke `PreTrainedModel` after the pin
@@ -162,22 +168,33 @@ cd /content/thesis-rag-system && /content/py312/bin/python -c "from huggingface_
 
 ## The two commands
 
-**Run one cell** (here M4 x HotpotQA distractor, Qwen bank). `--output`
-is always passed for a bank cell (the runner's default name carries a
-timestamp, not the bank stem). `--resume` appends to an interrupted cell
-and skips banked queries — and, for M4, never rebuilds a tree whose
-queries are all already banked. Gates before any model loads: the pin,
-the bank's reader, the bank's GPU, hub file access, the benchmark
-preflight, and the cold-tree preflight over every unit (an M4 cell
-refuses to serve a warm substrate; there is no flag that allows it).
+**Run one cell** (here M4 x HotpotQA distractor, the Qwen reader).
+This is the command shape that produced every banked cell; the banks
+are complete, so a reproduction runs into a THROWAWAY cache and output
+directory (pointing `--output` at a banked cell answers nothing and is
+refused by the population gate before any summary is written — the
+banked summary is never rewritten). `--output` is always passed (the
+runner's default name carries a timestamp, not the bank stem). Gates
+before any model loads: the pin, the bank's reader, the bank's GPU,
+hub file access, the benchmark preflight, and the cold-tree preflight
+over every unit (an M4 cell refuses to serve a warm substrate; there is
+no flag that allows it).
 
 ```bash
-cd /content/thesis-rag-system && /content/py312/bin/python -m src.eval.runner --system M4 --benchmark hotpotqa --split validation --output /content/drive/MyDrive/thesis_rag/outputs/p10/hotpotqa_M4_validation.jsonl --resume
+cd /content/thesis-rag-system && THESIS_CACHE_DIR=/content/repro_cache /content/py312/bin/python -m src.eval.runner --system M4 --benchmark hotpotqa --split validation --output /content/drive/MyDrive/thesis_rag/outputs/repro/hotpotqa_M4_validation.jsonl
 ```
 
-For the Llama bank add `--generator meta-llama/Llama-3.1-8B-Instruct`
-and write into `outputs/p11/`. Every cell is the full declared
-population; there is no small-sample mode.
+For the Llama reader add `--generator meta-llama/Llama-3.1-8B-Instruct`
+and use a separate output directory (the bank-reader gate refuses two
+readers in one directory). Every cell is the full declared population;
+there is no small-sample mode. `--resume` appends to an interrupted
+cell and skips its banked queries; the summary written at the end
+covers the rows the finishing process scored and the units it indexed,
+so a cell is completed within one process where possible. On M4, a
+unit interrupted after its tree was flushed is warm on resume and the
+cold-tree preflight lists its directory: delete it and re-run (the
+rebuild is deterministic under the pinned stack, up to the measured
+floor of one 16-leaf unit in a thousand).
 
 **Export the three tables** against both banks. Refuses on any missing
 or partial cell, on any population mismatch, on a recomputed

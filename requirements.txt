@@ -1,8 +1,9 @@
 # The reduced import graph: exactly what runs a cell, the replay and the
-# export. Install order on Colab is README Block 1 (this file), RESTART,
-# stack check; the AUTHORITY for versions is requirements.lock (Drive
-# root, lockfile_hash 17878bc8740173be), checked by
-# `python -m scripts.pin_environment check` before any model loads.
+# export. Installed in README Block E into the py312 interpreter (a
+# subprocess, never the notebook kernel), with requirements.lock on top;
+# the AUTHORITY for versions is that lock (Drive root, lockfile_hash
+# 17878bc8740173be), checked by `python -m scripts.pin_environment check`
+# before any model loads.
 
 # --- Shared retrieval infra (M2/M3; M4 shares the embedder loader) ---
 numpy>=2.1,<3                    # Floored at 2.1 to stay on the numpy 2.x ABI
@@ -42,10 +43,10 @@ numba>=0.66                     # FLOOR IS LOAD-BEARING, DO NOT LOWER.
 # is the one requirements.lock pins (CPython 3.12.13, NVIDIA L4); the
 # thesis methods section quotes it from there.
 #
-# INSTALL ORDER IS NOT OPTIONAL — see the README's Colab block sequence
-# (install, RESTART, stack check). Installing these upgrades numpy inside
-# a live kernel that already imported the stock version, which leaves a
-# spliced module tree; the observed failure is
+# INSTALL ORDER IS NOT OPTIONAL — see README Block E: install into the
+# py312 interpreter as a subprocess, never into a live kernel. Installing
+# these upgrades numpy inside a kernel that already imported the stock
+# version, which leaves a spliced module tree; the observed failure is
 #   ImportError: cannot import name '_center' from 'numpy._core.umath'
 # and it takes down faiss / torch / sentence-transformers, not just UMAP.
 # Install, RESTART THE RUNTIME, then verify. Never run an eval cell in

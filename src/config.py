@@ -1,9 +1,11 @@
 """Shared configuration for the thesis RAG harness.
 
-Values here are defaults for every system in the benchmark (M1-M8).
-System-specific knobs live next to their implementation.
-The PIPELINE_DESIGN.md M7 spec is the source of truth — if a constant
-here disagrees with that doc, the doc wins.
+Values here are the defaults every system in the matrix reads (M1
+closed-book, M2 flat dense, M3 hybrid, M4 paper-faithful RAPTOR).
+System-specific knobs live in M4Config; the four withdrawn or archived
+systems' configs left with them (tag thesis-full-2026-09-03).
+ChunkingConfig is inside every substrate key — see the CACHE DISCIPLINE
+note above it before touching a field.
 """
 
 from __future__ import annotations

@@ -13,10 +13,8 @@ hierarchical systems (M4/M7) are built for. The summary variant
 a retrieval test — top-15 returns essentially the whole corpus — and
 would waste the slot. Cost consequence: RAPTOR substrates run ~120
 gpt-4o-mini summaries per story (~$0.04/story/substrate); the
-small-sample gate should run CHEAP SYSTEMS FIRST (M1/M2/M3, M9) and
-only then M4/M7, so loader/scorer bugs surface before the substrate
-spend. Full-validation subsampling levers (--max-queries, --max-units)
-are decided at matrix time.
+small-sample gate should run CHEAP SYSTEMS FIRST (M1/M2/M3) and only
+then M4, so loader/scorer bugs surface before the substrate spend.
 
 QUESTIONS-FROM-SUMMARIES CAVEAT (thesis methods note): NarrativeQA
 questions were written by annotators who read the Wikipedia plot
@@ -115,8 +113,10 @@ def select_units(order: list, max_units: int | None) -> list:
     changed WHICH stories ran, not merely how many — and why a story
     picked as "largest" from the wrong draw might never be built at all.
 
-    Explicit values are still honoured, including the full split: pass
-    `115` and nothing is dropped. Explicit is possible; silent is not.
+    Explicit values are still honoured by the loader, including the full
+    split (`115` drops nothing) — reachable from tests only: the runner
+    passes no cap since the repo reduction. Explicit is possible; silent
+    is not.
     """
     effective = CELL_UNITS if max_units is None else max_units
     if effective is not None and effective < len(order):

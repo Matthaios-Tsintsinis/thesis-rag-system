@@ -199,9 +199,10 @@ SHARD_QUESTIONS = 100
 # avoid. Defaulting here makes the registered sample the thing you get
 # unless you deliberately ask for otherwise.
 #
-# `--max-units` remains a separate GATE knob: it caps units WITHIN the
-# subsample, so `--max-units 2` is a two-question smoke of the registered
-# sample rather than a different sample.
+# The loader's `max_units` parameter caps units WITHIN the subsample (a
+# two-unit smoke is two questions of the registered sample, never a
+# different sample); the runner passes no cap since the repo reduction,
+# so it is reached only from tests.
 #
 # Pass max_questions=None explicitly for the full 7,405-question split.
 PREREGISTERED_Q = 1000
@@ -719,8 +720,8 @@ class HotpotQABenchmark:
 class HotpotQAPooledBenchmark(HotpotQABenchmark):
     """Variant B — paragraphs pooled across a shard of questions.
 
-    One EvalUnit per shard, so `--max-units 1` is a single-shard gate and
-    `--max-units 10` is the Q=1000 run. Titles are deduplicated within a
+    One EvalUnit per shard (ten shards for the Q=1000 run). Titles are
+    deduplicated within a
     shard: the same Wikipedia paragraph is a distractor for many
     questions, and indexing it twice would both waste the build and put
     exact-duplicate vectors into the clustering.
