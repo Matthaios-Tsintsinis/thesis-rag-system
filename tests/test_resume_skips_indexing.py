@@ -12,9 +12,9 @@ sessions, which makes resume the normal path rather than the exception,
 so the waste is paid on every one of them.
 
 The invariant: indexing is work done ON BEHALF OF queries. No queries to
-answer for a unit, no indexing of that unit. This holds for both reasons
-a unit can end up with nothing to do — every query already banked
-(`--resume`), and the `max_queries` cap already reached.
+answer for a unit, no indexing of that unit. Since the repo reduction the
+one way a unit ends up with nothing to do is that every query is already
+banked (`--resume`).
 
 WHY THE ASSERTION COUNTS CALLS RATHER THAN CHECKING A FLAG. This is the
 defect class the correction batch kept meeting: a thing that exists,
@@ -126,10 +126,6 @@ def _fake_generate(system_prompt, user_prompt, cfg=None):
     return f"ANSWER<{user_prompt[-24:]}>"
 
 
-def _fake_generate_batch(system_prompts, user_prompts, cfg=None, **kw):
-    return [_fake_generate(s, u) for s, u in zip(system_prompts, user_prompts)]
-
-
 def _bank(path: Path, query_ids) -> None:
     """Write rows for `query_ids` as an interrupted pass would leave them."""
     with path.open("w", encoding="utf-8") as f:
@@ -137,7 +133,7 @@ def _bank(path: Path, query_ids) -> None:
             f.write(json.dumps({"query_id": qid}) + "\n")
 
 
-def _run(*, banked=(), resume=False, max_queries=None, batch_size=2):
+def _run(*, banked=(), resume=False):
     """Drive run() to completion; return (indexed_units, scored_ids)."""
     with tempfile.TemporaryDirectory() as td:
         out = Path(td) / "o.jsonl"
@@ -145,12 +141,10 @@ def _run(*, banked=(), resume=False, max_queries=None, batch_size=2):
             _bank(out, banked)
         system = CountingSystem(config=DEFAULT_CONFIG)
         runner = BenchmarkRunner(output_path=out, verbose=False,
-                                 batch_size=batch_size, resume=resume)
-        with mock.patch("src.models.generate", _fake_generate), \
-             mock.patch("src.models.generate_batch", _fake_generate_batch):
+                                 resume=resume)
+        with mock.patch("src.models.generate", _fake_generate):
             rows = list(runner.run(system, MultiUnitBenchmark(),
-                                   split="validation",
-                                   max_queries=max_queries))
+                                   split="validation"))
         return system.indexed_units, [r.query_id for r in rows]
 
 
@@ -197,22 +191,6 @@ class TestResumeSkipsIndexing(unittest.TestCase):
         indexed, scored = _run(banked=_all_ids(), resume=False)
         self.assertEqual(indexed, ["unit0", "unit1", "unit2"])
         self.assertEqual(sorted(scored), sorted(_all_ids()))
-
-    def test_max_queries_stop_does_not_index_the_unit_it_stops_before(self):
-        """The other route to an empty unit. The cap is reached exactly at
-        the unit boundary, so unit1 is pulled from the loader and then
-        has nothing to answer — it must not be indexed on the way out."""
-        indexed, scored = _run(max_queries=QUERIES_PER_UNIT)
-        self.assertEqual(indexed, ["unit0"])
-        self.assertEqual(len(scored), QUERIES_PER_UNIT)
-
-    def test_resume_and_max_queries_compose(self):
-        """Both filters at once: unit0 is banked and the cap allows only
-        unit1's pair, so unit2 is never indexed either."""
-        indexed, scored = _run(banked=["u0q0", "u0q1"], resume=True,
-                               max_queries=QUERIES_PER_UNIT)
-        self.assertEqual(indexed, ["unit1"])
-        self.assertEqual(sorted(scored), ["u1q0", "u1q1"])
 
 
 if __name__ == "__main__":

@@ -39,8 +39,8 @@ from src.models import (
 )
 
 
-def _stub_impl(model_name, load_in_4bit):  # noqa: ANN001
-    return (f"tok:{model_name}", f"model:{model_name}:{load_in_4bit}")
+def _stub_impl(model_name):  # noqa: ANN001
+    return (f"tok:{model_name}", f"model:{model_name}")
 
 
 class TestOneKeyPerGenerator(unittest.TestCase):
@@ -52,36 +52,27 @@ class TestOneKeyPerGenerator(unittest.TestCase):
         load_generator.cache_clear()
         GENERATOR_LOADS.clear()
 
-    def test_omitted_and_explicit_default_are_the_same_load(self):
-        """THE BUG. Two call styles, one model, one load."""
+    def test_positional_and_keyword_forms_are_the_same_load(self):
+        """THE BUG, in its surviving form: one model, one load, however
+        the call spells it. The second (4-bit) argument that made two
+        keys left with the reduction."""
         with mock.patch("src.models._load_generator_impl",
                         side_effect=_stub_impl) as impl:
             a = load_generator("some/model")
-            b = load_generator("some/model", False)
+            b = load_generator(model_name="some/model")
         self.assertEqual(impl.call_count, 1)
         self.assertIs(a, b)
         self.assertEqual(len(GENERATOR_LOADS), 1)
 
-    def test_keyword_form_is_also_the_same_load(self):
-        with mock.patch("src.models._load_generator_impl",
-                        side_effect=_stub_impl) as impl:
-            load_generator("some/model")
-            load_generator("some/model", load_in_4bit=False)
-            load_generator(model_name="some/model")
-        self.assertEqual(impl.call_count, 1)
-        self.assertEqual(len(GENERATOR_LOADS), 1)
-
     def test_the_real_call_sites_agree(self):
-        """Drives the two forms the pipeline actually uses, rather than
-        asserting a normaliser in the abstract: the probe prewarm passes
-        one positional arg, generate_batch passes two."""
+        """Drives the form the pipeline actually uses (`generate` and
+        `generate_batch` both pass cfg.model) twice: one load."""
         from src.config import DEFAULT_CONFIG
 
         with mock.patch("src.models._load_generator_impl",
                         side_effect=_stub_impl) as impl:
-            load_generator(DEFAULT_CONFIG.generation.model)              # prewarm
-            load_generator(DEFAULT_CONFIG.generation.model,              # generate_batch
-                           DEFAULT_CONFIG.generation.load_in_4bit)
+            load_generator(DEFAULT_CONFIG.generation.model)
+            load_generator(DEFAULT_CONFIG.generation.model)
         self.assertEqual(impl.call_count, 1, "the two call sites disagree")
         self.assertEqual(len(GENERATOR_LOADS), 1)
 
@@ -91,13 +82,6 @@ class TestOneKeyPerGenerator(unittest.TestCase):
                         side_effect=_stub_impl) as impl:
             load_generator("model/a")
             load_generator("model/b")
-        self.assertEqual(impl.call_count, 2)
-
-    def test_four_bit_is_a_different_load_because_it_is(self):
-        with mock.patch("src.models._load_generator_impl",
-                        side_effect=_stub_impl) as impl:
-            load_generator("some/model", False)
-            load_generator("some/model", True)
         self.assertEqual(impl.call_count, 2)
 
     def test_cache_clear_is_still_exposed(self):

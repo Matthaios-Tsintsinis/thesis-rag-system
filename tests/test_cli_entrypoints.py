@@ -19,6 +19,7 @@ Any commit touching runner.py has to pass this.
 from __future__ import annotations
 
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -26,7 +27,6 @@ from pathlib import Path
 from unittest import mock
 
 from src.config import DEFAULT_CONFIG
-from src.config import MATRIX_BATCH_SIZE
 from src.eval import runner as runner_mod
 from src.eval.types import (
     ANSWER_TYPE_FREE_FORM,
@@ -99,7 +99,6 @@ class _StubSystem(BaseSystem):
     """Answers without generating. The plumbing is the subject here."""
 
     system_id = "STUB"
-    supports_batched_answer = False
     seen_max_new_tokens: list[int] = []
 
     def index(self, corpus_path):  # pragma: no cover - unused
@@ -120,8 +119,8 @@ class _StubSystem(BaseSystem):
                 for n, c in enumerate(self.chunks)]
 
     def answer(self, query, k=None):
-        # Record what the CLI actually handed us — this is the assertion
-        # that --max-new-tokens reaches the object generation consumes.
+        # Record what the CLI actually handed us — the assertion that
+        # the configured cap reaches the object generation consumes.
         type(self).seen_max_new_tokens.append(
             self.config.generation.max_new_tokens
         )
@@ -153,25 +152,26 @@ class _CliCase(unittest.TestCase):
 
     def _run(self, *extra):
         out = self.dir / "tiny_STUB.jsonl"
-        # --allow-unpinned because these are CLI-surface tests on a host
-        # with no requirements.lock. The lockfile gate is deliberately a
-        # HARD abort (it guards a matrix split that is undetectable after
-        # the fact), so every non-P10 caller has to say so explicitly.
-        # That the flag is needed HERE is the gate proving it is wired:
-        # dropping it makes these tests fail, which is the check the
-        # gate's own test cannot make about main().
+        # The pin gate has no escape (the reduction removed it), so the
+        # CLI drive carries a lockfile and stubs the version check green;
+        # `test_the_lockfile_gate_is_wired_into_main` below drives main()
+        # WITHOUT one and proves the gate fires first.
+        lock = self.dir / "requirements.lock"
+        lock.write_text("# lock\nnumpy==0.0.0\n", encoding="utf-8")
         argv = ["runner", "--system", "STUB", "--benchmark", "tiny",
                 "--split", "validation", "--output", str(out),
-                "--allow-unpinned", *extra]
-        with mock.patch.object(sys, "argv", argv):
+                "--lockfile", str(lock), *extra]
+        with mock.patch("scripts.pin_environment.check_lockfile",
+                        return_value=0), \
+                mock.patch.object(sys, "argv", argv):
             runner_mod.main()
         return out
 
     def test_the_lockfile_gate_is_wired_into_main(self):
         """END TO END, not a unit test of the gate function.
 
-        Without --allow-unpinned and with no lockfile present, main() must
-        abort BEFORE it writes any output. This is the difference between
+        With no lockfile present, main() must abort BEFORE it writes any
+        output. This is the difference between
         "the gate exists" and "the runner calls the gate" — the exact
         distinction that made MATRIX_BATCH_SIZE inert through a whole
         release.
@@ -186,67 +186,30 @@ class _CliCase(unittest.TestCase):
         self.assertFalse(out.exists(), "the gate fired too late")
 
 
-class TestBatchSizeDefault(_CliCase):
-    """The runner READS config.MATRIX_BATCH_SIZE — the property the P9
-    commit claimed and left inert.
+class TestHelpRenders(unittest.TestCase):
+    """`--help` is the reduced CLI surface a stranger reads first.
 
-    The test P9 shipped asserted MATRIX_BATCH_SIZE == 16, which is a
-    tautology about a constant and proves nothing about the pipeline: the
-    flag still defaulted to None, so a cell launched without an explicit
-    --batch-size resolved to something the constant did not name, and
-    nothing in the run would have said so. Batch composition can move
-    generated text at temperature 0, so cells that batch differently are
-    not strictly comparable.
-
-    These assertions read what the CLI RESOLVED, from the artifact a real
-    run leaves behind — which is why they survived the constant CHANGING
-    (16 -> 0, sequential, on the answer-path measurement) while the
-    tautology in test_environment_pinning did not.
+    It CRASHED at the tag: the --benchmark help text carried bare percent
+    signs ("91.7%"), which argparse expands as format specifiers, and
+    nothing ever called --help. Driven end to end here, and the kept
+    flags are asserted so a re-added flag or a lost one is visible.
     """
 
-    def _summary(self, *extra):
-        out = self._run(*extra)
-        return json.loads(
-            out.with_suffix(".summary.json").read_text(encoding="utf-8"))
+    def test_help_exits_zero_and_names_exactly_the_kept_flags(self):
+        import contextlib
+        import io
 
-    def test_no_flag_resolves_to_the_configured_matrix_batch_size(self):
-        """Tracks the CONSTANT through the runner's own resolution.
-
-        `batch_size = args.batch_size if args.batch_size else None`, so a
-        falsy constant selects the sequential path and the summary
-        records None. Asserting the resolved form rather than the raw
-        integer keeps this a statement about the pipeline: set the
-        constant to 8 and have the runner ignore it, and this fails.
-        """
-        self.assertEqual(self._summary()["batch_size"],
-                         MATRIX_BATCH_SIZE or None)
-
-    def test_the_flag_still_overrides_downward_for_a_cost_probe(self):
-        self.assertEqual(self._summary("--batch-size", "4")["batch_size"], 4)
-
-    def test_the_summary_names_the_retrieval_denominator(self):
-        """A mean without its n invites the wrong denominator.
-
-        `mean_retrieval_f1` averages over rows that HAD retrieval ground
-        truth, not over every row. On the first banked cell that is 2,255
-        of 2,556 — MultiHop's 301 null queries are skipped — and a reader
-        given only the mean assumes 2,556. On NarrativeQA every row is
-        skipped, so the denominator is 0 and the column is n/a rather
-        than a score of zero.
-
-        Read from a summary main() actually wrote, so it fails if the
-        field stops being emitted rather than if a string moves.
-        """
-        summary = self._summary()
-        self.assertEqual(
-            summary["n_retrieval_scored"],
-            summary["n_queries_scored"] - summary["n_retrieval_skipped"],
-        )
-
-    def test_zero_is_the_explicit_sequential_opt_out(self):
-        """An escape hatch reachable only by editing config is not an
-        escape hatch."""
-        self.assertIsNone(self._summary("--batch-size", "0")["batch_size"])
+        buf = io.StringIO()
+        with mock.patch.object(sys, "argv", ["runner", "--help"]), \
+                contextlib.redirect_stdout(buf):
+            with self.assertRaises(SystemExit) as cm:
+                runner_mod.main()
+        self.assertEqual(cm.exception.code, 0)
+        text = buf.getvalue()
+        flags = set(re.findall(r"^\s+(--[a-z-]+)", text, re.M))
+        self.assertEqual(flags, {"--lockfile", "--system", "--benchmark",
+                                 "--split", "--output", "--generator",
+                                 "--resume"})
 
 
 class TestRunnerMain(_CliCase):
@@ -270,55 +233,12 @@ class TestRunnerMain(_CliCase):
             self.assertIn(key, s, f"summary lost the {key!r} field")
         self.assertEqual(s["n_queries_scored"], 2)
 
-    def test_max_new_tokens_reaches_the_system_config(self):
-        """The whole point of the flag: rebinding the module constant does
-        NOT work, so the CLI must construct the config explicitly."""
-        self._run("--max-new-tokens", "7")
-        self.assertTrue(_StubSystem.seen_max_new_tokens)
-        self.assertEqual(set(_StubSystem.seen_max_new_tokens), {7})
-
     def test_default_leaves_the_configured_cap_alone(self):
         self._run()
         self.assertEqual(
             set(_StubSystem.seen_max_new_tokens),
             {DEFAULT_CONFIG.generation.max_new_tokens},
         )
-
-    def test_max_queries_caps_the_run(self):
-        out = self._run("--max-queries", "1")
-        rows = [x for x in out.read_text(encoding="utf-8").splitlines() if x.strip()]
-        self.assertEqual(len(rows), 1)
-
-    def test_a_bad_cap_is_rejected_not_silently_ignored(self):
-        with self.assertRaises(SystemExit):
-            self._run("--max-new-tokens", "0")
-
-    def test_preflight_runs_before_the_generator_is_loaded(self):
-        """Cheap preconditions before expensive ones.
-
-        A HotpotQA run died on an unresolvable dataset id at the first
-        iter_eval_units call -- AFTER --prewarm had pulled 15 GB of Qwen
-        into VRAM. A two-second metadata check would have failed in two
-        seconds. This pins the ORDER, because a later refactor that moves
-        benchmark construction back below prewarm would silently restore
-        the two-minute failure.
-        """
-        order: list[str] = []
-
-        class _Preflighting(_TinyBenchmark):
-            def preflight(self):
-                order.append("preflight")
-
-        def _fake_load(*a, **kw):
-            order.append("load_generator")
-            return (None, None)
-
-        with mock.patch.dict(runner_mod.BENCHMARK_REGISTRY,
-                             {"tiny": _Preflighting}), \
-                mock.patch("src.models.load_generator", _fake_load):
-            self._run("--prewarm")
-
-        self.assertEqual(order, ["preflight", "load_generator"])
 
     def test_a_failing_preflight_aborts_before_anything_expensive(self):
         class _Doomed(_TinyBenchmark):

@@ -20,25 +20,6 @@ from .base import BaseSystem, PreparedQuery, RetrievedChunk
 
 class ClosedBookSystem(BaseSystem):
     system_id = "M1"
-    # BATCHABLE as of the 1-token probe (2026-08-05). The previous value
-    # was False, justified by "M1's prompts are ~100 tokens so batching
-    # buys almost nothing" — which is PREFILL reasoning, and prefill is
-    # not what M1 pays.
-    #
-    # MEASURED, generating exactly one token so the fixed cost is
-    # isolated: M1 0.106 s/query against M2's 1.496 s at 4k. So M1's
-    # ~4.1 s/query is ~97% DECODE, making it the purest decode-bound
-    # system in the matrix — the same regime as the index summaries that
-    # batch 13x, and the regime where a batched decode step serves the
-    # whole batch for the price of one.
-    #
-    # CAVEAT, and it is why the forecast for this is labelled a
-    # projection: batching measurably LOST at 4k (25 s for a batch of 5)
-    # and that failure is still unexplained. The prefill split does not
-    # account for it. M1 is a different regime and should not inherit
-    # that result, but it has not yet been measured either — treat the
-    # win as unverified until a batched M1 pass is timed.
-    supports_batched_answer = True
 
     def __init__(self, config: HarnessConfig = DEFAULT_CONFIG) -> None:
         super().__init__(config)

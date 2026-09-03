@@ -17,7 +17,7 @@ Both carry corpus_hash
 `72aa87d69093d4b17aab2a3d51409151aab82bc28c8023d9c5ae8b8ca2306ef1` —
 which this host CANNOT re-derive (its corpus bytes are not the run
 host's; the b274e596 prediction failure), so the hash is FED, exactly
-as `--dry-run --corpus-hash` feeds it.
+as the replay's key assembly is fed a recorded hash.
 """
 
 from __future__ import annotations

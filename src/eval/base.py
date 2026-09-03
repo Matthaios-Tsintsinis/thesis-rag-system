@@ -2,15 +2,16 @@
 
 A `Benchmark` exposes:
   * `name` — string id used in output filenames.
-  * `iter_eval_units(split, max_units)` — generator of `EvalUnit`s
-    (one per per-paper corpus for QASPER, one shared-corpus
-    EvalUnit for MultiHop-RAG).
+  * `iter_eval_units(split)` — generator of `EvalUnit`s (one shared
+    corpus for MultiHop-RAG, one per story for NarrativeQA, one per
+    question for HotpotQA-distractor, one per shard for the pooled
+    variant).
   * `score_answer(predicted, query)` — benchmark-specific scoring of
     the predicted answer text against the query's gold annotations.
 
 `BenchmarkRunner` drives one (system, benchmark, split) pass:
 
-  for unit in benchmark.iter_eval_units(split, max_units):
+  for unit in benchmark.iter_eval_units(split):
       todo = [q for q in unit.queries if q.query_id not in already_done]
       if not todo:
           continue            # NOT indexed - see run()
@@ -24,7 +25,8 @@ A `Benchmark` exposes:
 Each ScoredQuery is written as one JSONL line. The driver is
 deliberately simple: one process, one system, one benchmark, one
 split. Parallelism across systems/benchmarks happens at the CLI runner
-level by sharding (run M2 + qasper, M3 + qasper, ... separately).
+level by sharding (run M2 + multihop_rag, M3 + multihop_rag, ...
+separately).
 """
 
 from __future__ import annotations
@@ -85,10 +87,7 @@ class BenchmarkRunner:
         *,
         output_path: Path,
         verbose: bool = True,
-        batch_size: int | None = None,
         resume: bool = False,
-        max_padded_tokens: int | None = None,
-        verify_max_new_tokens: int | None = None,
         require_cold_tree: bool = False,
     ) -> None:
         self.output_path = output_path
@@ -102,25 +101,6 @@ class BenchmarkRunner:
         # interrupted pass as normal rather than exceptional is the
         # correct default posture even though the flag is opt-in.
         self.resume = resume
-        # Upper bound on n * longest-prompt within a batch. When set,
-        # it governs batch shape and `batch_size` becomes an upper
-        # bound on COUNT rather than the batch size itself. This is
-        # the knob that survives ragged real prompts; a fixed count
-        # measured on uniform synthetic prompts does not.
-        self.max_padded_tokens = max_padded_tokens
-        # None -> sequential answering (the historic path, and the right
-        # one against an API). An int enables TWO-PHASE answering for
-        # systems that support it: retrieve every query first, then
-        # generate the whole unit in batches. Necessary because the
-        # harness now generates with a LOCAL model, where sequential
-        # answering wastes ~90% of throughput and generation is ~90% of
-        # the cost.
-        self.batch_size = batch_size
-        # When a generation cap is being asserted, CHECK IT. A probe that
-        # silently did not apply its cap produced a wrong number rather
-        # than an error once already; the caller should not have to be the
-        # one who notices. None disables the check entirely.
-        self.verify_max_new_tokens = verify_max_new_tokens
         # P10's cold-tree rule, enforced rather than remembered. A warm
         # M4 substrate may have been built under a different topology
         # stack, and nothing in the output says which — so a matrix can
@@ -130,8 +110,15 @@ class BenchmarkRunner:
         # aborts on exactly this and the runner did not.
         self.require_cold_tree = require_cold_tree
 
-    def _check_output_length(self, answer: str, query_id: str, model: str) -> None:
-        """Abort if a generated answer overran the cap that was requested.
+    def _check_output_length(self, answer: str, query_id: str, cap: int) -> None:
+        """Abort if a generated answer overran the configured cap.
+
+        The cap is `GenerationConfig.max_new_tokens` (512 on every matrix
+        cell), read from the system's config at the call site so it is
+        the value generation actually consumed. Before the repo reduction
+        this ran only when a `--max-new-tokens` override was passed —
+        which no banked cell did — so it now runs on every answer as the
+        fixed-cap check.
 
         Counted with the harness-wide tiktoken counter, NOT the
         generator's own tokenizer. An earlier version called
@@ -147,18 +134,15 @@ class BenchmarkRunner:
         hundred tokens; it is deliberately NOT a precise assertion about
         generation length.
         """
-        if self.verify_max_new_tokens is None:
-            return
         from ..prompt_packing import count_tokens
 
         n = count_tokens(answer)
-        if n > self.verify_max_new_tokens * 1.25 + 2:
+        if n > cap * 1.25 + 2:
             raise RuntimeError(
                 f"generation cap NOT APPLIED: query {query_id!r} returned "
-                f"~{n} tokens against max_new_tokens="
-                f"{self.verify_max_new_tokens}. The run is measuring "
-                f"something other than what it claims. Answer began: "
-                f"{answer[:80]!r}"
+                f"~{n} tokens against max_new_tokens={cap}. The run is "
+                "measuring something other than what it claims. Answer "
+                f"began: {answer[:80]!r}"
             )
 
     def _existing_query_ids(self) -> set[str]:
@@ -190,114 +174,18 @@ class BenchmarkRunner:
     ) -> Iterator[tuple[EvalQuery, "AnswerResult", float]]:
         """Yield (query, AnswerResult, latency_s) for one unit's queries.
 
-        Sequential unless batching is enabled AND the system supports it
-        (M1 and M7 still override answer() wholesale — see
-        BaseSystem.supports_batched_answer). Falling back rather than
-        guessing keeps an unconverted system correct instead of subtly
-        wrong.
-
-        Output order is ALWAYS the input query order, regardless of the
-        length-sorted order generation actually ran in.
+        SEQUENTIAL, by construction. Answer generation was measured
+        faster sequentially than batched on the 512-token answer path
+        (M2 x MultiHop, 64 queries, L4: 4.2558 s/query against 5.1654 at
+        the best batched cap), because a batch runs until its LONGEST
+        member stops; every banked cell answered sequentially. M4's tree
+        summaries batch separately through `models.generate_batch`, where
+        the 100-token cap makes batching the right call.
         """
-        if not queries:
-            return
-        if self.batch_size is None or not getattr(
-            system, "supports_batched_answer", False
-        ):
-            for q in queries:
-                t_q = time.perf_counter()
-                ar = system.answer(q.question_text)
-                yield q, ar, time.perf_counter() - t_q
-            return
-
-        from ..models import (
-            deterministic_batch_order,
-            generate_batch,
-            token_budget_batches,
-        )
-
-        # PHASE A — retrieval + any query-time LLM work, sequential.
-        t_a = time.perf_counter()
-        prepared = [system.prepare(q.question_text) for q in queries]
-        phase_a_s = time.perf_counter() - t_a
-        if self.verbose:
-            print(f"  phase_a(retrieve)={phase_a_s:.1f}s  n={len(queries)}")
-
-        # PHASE B — batched generation, YIELDED PER BATCH so the caller
-        # can write and flush incrementally.
-        #
-        # DURABILITY over ordering, deliberately. Generating the whole
-        # unit before yielding anything would mean MultiHop (ONE unit,
-        # 2,556 queries) writes nothing for well over an hour and loses
-        # everything to a reclaimed runtime or a Drive disconnect — both
-        # of which have happened on this project. Yielding per batch caps
-        # the loss at one batch.
-        #
-        # Length sorting happens HERE, across the whole unit, rather than
-        # inside generate_batch: sorting per-batch would only homogenise
-        # within an already-arbitrary group and lose most of the padding
-        # saving. The consequence is that rows are emitted in
-        # LENGTH-SORTED order, not query order. That is safe — every row
-        # carries query_id and every downstream consumer (analyse,
-        # aggregate, the significance diagnostic) parses per line into
-        # dicts and never depends on file order. Sorting is by
-        # n_input_tokens, already computed by prepare(), so it costs no
-        # extra tokenisation.
-        lengths = [p.n_input_tokens for p in prepared]
-        order, _ = deterministic_batch_order(lengths)
-
-        # BATCH SHAPE. A fixed count must be sized for the worst-case
-        # batch, because padding makes the cost n * longest rather than
-        # sum(len) — and length sorting, while it cuts total padding
-        # waste, CONCENTRATES the longest prompts into one batch, which
-        # is precisely the batch that OOMs. Bounding padded tokens
-        # instead adapts to raggedness and bounds peak memory by
-        # construction, with one knob covering both M4's ~2k prompts and
-        # M2/M3/M9's ~4k.
-        if self.max_padded_tokens is not None:
-            groups = token_budget_batches(
-                order, lengths,
-                max_padded_tokens=self.max_padded_tokens,
-                max_batch_size=self.batch_size,
-                # KV grows with every DECODED token too, and the budget
-                # bounds KV. Without this a short-prompt system (M1:
-                # ~45-token prompts) gets a batch of hundreds and OOMs
-                # while the budget still looks conservative.
-                reserve_tokens_per_seq=system.config.generation.max_new_tokens,
-            )
-        else:
-            groups = [
-                order[s : s + self.batch_size]
-                for s in range(0, len(order), self.batch_size)
-            ]
-
-        t_b = time.perf_counter()
-        n_done = 0
-        for idxs in groups:
-            t_batch = time.perf_counter()
-            answers = generate_batch(
-                [prepared[i].system_prompt for i in idxs],
-                [prepared[i].user_prompt for i in idxs],
-                cfg=system.config.generation,
-                batch_size=self.batch_size,
-                # Already globally sorted; re-sorting inside the call
-                # would be a no-op on a homogeneous group.
-                sort_by_length=False,
-            )
-            batch_s = time.perf_counter() - t_batch
-            # Per-query generation time is not observable once batched;
-            # amortise it rather than invent a measured-looking number.
-            per_query_gen_s = batch_s / max(1, len(idxs))
-            for i, ans in zip(idxs, answers):
-                ar = system.finish(prepared[i], ans, generate_s=per_query_gen_s)
-                yield queries[i], ar, ar.latency_s
-            n_done += len(idxs)
-            if self.verbose:
-                elapsed = time.perf_counter() - t_b
-                print(
-                    f"  phase_b {n_done}/{len(order)}  "
-                    f"{n_done / max(elapsed, 1e-9):.2f} gen-req/s"
-                )
+        for q in queries:
+            t_q = time.perf_counter()
+            ar = system.answer(q.question_text)
+            yield q, ar, time.perf_counter() - t_q
 
     def _cold_tree_preflight(
         self, system, units: list, already_done: set
@@ -358,8 +246,9 @@ class BenchmarkRunner:
             "A warm substrate may have been built under a different "
             "topology stack, and nothing in the output records which — so "
             "the matrix could hold two tree populations with no error "
-            "anywhere. Delete the directories above and re-run, or pass "
-            "--allow-warm-trees if a warm run is intended.\n"
+            "anywhere. Delete the directories above and re-run; a "
+            "deliberate re-derivation uses a throwaway THESIS_CACHE_DIR, "
+            "never the banked cache.\n"
             "Nothing was indexed; no GPU work was done."
         )
 
@@ -369,18 +258,13 @@ class BenchmarkRunner:
         benchmark: Benchmark,
         *,
         split: str,
-        max_units: int | None = None,
-        max_queries: int | None = None,
-        only_unit: str | None = None,
     ) -> Iterator[ScoredQuery]:
         """Drive one (system, benchmark, split) pass to JSONL.
 
-        `max_units` caps the EvalUnits processed (one per paper for
-        QASPER; MultiHop has one shared-corpus EvalUnit so max_units<=1
-        is meaningful there). `max_queries` caps TOTAL queries across
-        units — useful for MultiHop where the natural EvalUnit holds
-        2556 queries; pass `--max-queries 50` for a small-sample
-        shared-corpus validation before the full run.
+        Always the full cell: the loader draws its declared population
+        (NarrativeQA's seeded 40 stories, HotpotQA's registered 1,000
+        questions, MultiHop's single unit) and every unit with a query
+        not already banked is indexed and answered.
         """
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         # Exposed on the instance so main() can check the resolved
@@ -405,20 +289,11 @@ class BenchmarkRunner:
             )
         mode = "a" if (self.resume and already_done) else "w"
 
-        units = list(benchmark.iter_eval_units(split=split, max_units=max_units))
-        if only_unit:
-            units = [u for u in units
-                     if str(u.corpus_id).startswith(only_unit)]
+        units = list(benchmark.iter_eval_units(split=split))
         self._cold_tree_preflight(system, units, already_done)
 
         with self.output_path.open(mode, encoding="utf-8") as fout:
-            stopped = False
             for unit_idx, unit in enumerate(units):
-                # TARGETED SINGLE UNIT. Needed because `--max-units N`
-                # cannot address a specific unit on NarrativeQA: its draw
-                # is seeded on N, so `--max-units 1` selects a DIFFERENT
-                # story than the first of the 40-story cell. Filtering by
-                # id leaves the draw intact and picks from within it.
                 if self.verbose:
                     print(
                         f"[eval] unit {unit_idx + 1}: corpus_id={unit.corpus_id!r}  "
@@ -430,16 +305,9 @@ class BenchmarkRunner:
                 # indexing. Indexing is work done on behalf of queries;
                 # a unit with nothing left to answer must not be indexed
                 # at all.
-                unit_queries: list[EvalQuery] = []
-                for q in unit.queries:
-                    if max_queries is not None and (
-                        n_queries + len(unit_queries)
-                    ) >= max_queries:
-                        stopped = True
-                        break
-                    if q.query_id in already_done:
-                        continue
-                    unit_queries.append(q)
+                unit_queries: list[EvalQuery] = [
+                    q for q in unit.queries if q.query_id not in already_done
+                ]
 
                 # INDEX ORDERING IS LOAD-BEARING, not tidiness. With the
                 # index call above this filter, a resumed pass rebuilt
@@ -459,8 +327,6 @@ class BenchmarkRunner:
                             f"{unit.corpus_id!r} — NOT indexed"
                         )
                     n_units_skipped += 1
-                    if stopped:
-                        break
                     continue
 
                 t_index = time.perf_counter()
@@ -483,8 +349,9 @@ class BenchmarkRunner:
                         "different topology stack, and nothing in the "
                         "output records which — so the matrix could hold "
                         "two tree populations with no error anywhere. "
-                        "Delete that substrate directory and re-run, or "
-                        "pass --allow-warm-trees if a warm run is intended."
+                        "Delete that substrate directory and re-run; a "
+                        "deliberate re-derivation uses a throwaway "
+                        "THESIS_CACHE_DIR, never the banked cache."
                     )
 
                 if self.verbose:
@@ -499,7 +366,8 @@ class BenchmarkRunner:
                     # Independent of CK-4 packing — reads ar.retrieved
                     # (full ranking).
                     self._check_output_length(
-                        ar.answer, q.query_id, system.config.generation.model
+                        ar.answer, q.query_id,
+                        system.config.generation.max_new_tokens,
                     )
                     retr = benchmark.score_retrieval(
                         ar.retrieved, q,
@@ -538,9 +406,10 @@ class BenchmarkRunner:
                         packed_unit_types=packed_unit_types,
                         # Loader-provided query metadata merged with any
                         # per-query system diagnostics the AnswerResult
-                        # carried (e.g. M9's corrective-action logging).
-                        # System keys are namespaced by convention
-                        # ("m9_*") so loader metadata can't collide.
+                        # carried (M4's non-leaf share, budget use,
+                        # degenerate-tree flag). System keys are
+                        # namespaced by convention ("m4_*") so loader
+                        # metadata can't collide.
                         #
                         # packed_ids: the IDENTITY of the packed set, in
                         # prompt order. Added 2026-08-24 after a per-row
@@ -567,17 +436,6 @@ class BenchmarkRunner:
 
                 n_units += 1
                 self.n_units_processed = n_units
-                # Stop check at the BOTTOM of the body: breaking here
-                # (not at the top) means the max-queries stop never
-                # pulls another unit from the loader's generator. A
-                # top-of-loop check advances the generator first, so
-                # the loader builds one extra unit that is immediately
-                # discarded — inflating loader-side benchmark_stats
-                # (n_stories / n_queries) past what was actually
-                # processed. The runner summary's n_queries_scored is
-                # authoritative either way.
-                if stopped:
-                    break
 
         if self.verbose:
             elapsed = time.perf_counter() - t_start

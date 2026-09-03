@@ -65,7 +65,6 @@ numba>=0.66                     # FLOOR IS LOAD-BEARING, DO NOT LOWER.
 transformers>=4.44
 torch>=2.2
 accelerate>=0.33
-bitsandbytes>=0.43 ; platform_system == "Linux"   # 4-bit quant; Linux/CUDA only
 
 # --- M6 (HippoRAG 1, NeurIPS'24 — port, not wrap) ---
 python-igraph>=0.11             # Personalized PageRank via prpack on the phrase

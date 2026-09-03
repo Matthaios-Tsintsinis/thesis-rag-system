@@ -91,22 +91,11 @@ FINAL_CONTEXT_CHUNKS = 15
 FIRST_STAGE_TOP_K = 50
 RRF_K = 60                       # Cormack et al. (2009)
 
-# CK-4 (shared context-budget machinery, OPT-IN). The packer
-# (src.prompt_packing.pack_context) supports a token budget over the
-# evidence block, but the DEFAULT IS OFF per professor's directive:
-# baselines must run at their natural strength, unconstrained. The
-# budget exists as an ABLATION tool for post-hoc context-volume
-# studies, NOT as an imposed control on the main eval.
-#
-# EVIDENCE_TOKEN_BUDGET = None — no budget enforcement by default; each
-# system's natural full retrieval (post-RETRIEVAL_RANKING_DEPTH deep
-# pull and M7's quota un-cap) flows into the generator unchanged.
-#
-# To opt-in for an ablation run, set this constant at runtime via the
-# CLI flag `python -m src.eval.runner --evidence-budget 3000`, which
-# monkey-patches `src.config.EVIDENCE_TOKEN_BUDGET` for the duration
-# of the process. The packer then enforces; the analyser's
-# --check-budget-equality assertion becomes meaningful.
+# CK-4 evidence budget: NONE at the harness level (locked decision 4:
+# baselines run at their natural strength). The packer implements no
+# budget since the repo reduction; the constant records the decision.
+# M4's 2,000-token paper budget is M4Config.retrieval_budget_tokens and
+# is applied by M4 itself, before packing.
 EVIDENCE_TOKEN_BUDGET: int | None = None
 EVIDENCE_TOKEN_BUDGET_TOKENIZER = "gpt-4o-mini"
 
@@ -160,56 +149,21 @@ ChunkingStrategy = Literal["semantic", "word_window", "raptor_100tok"]
 
 GEN_MAX_NEW_TOKENS = 512
 
-# THE ONE BATCH SIZE, used by every cell in the matrix.
-#
-# Batch COMPOSITION can change generated text at temperature 0 — padding
-# plus batched-matmul reduction order can flip an argmax on a near-tie,
-# measured once at 8e-5 on a MultiHop answer mean. That is small, but it
-# is only harmless while it is CONSTANT: cells generated at different
-# batch sizes are not strictly comparable to each other. Fixing it here
-# rather than passing it per invocation is what makes "the same batch
-# size in every cell" a property of the code instead of a habit.
-#
-# 0 MEANS SEQUENTIAL, AND SEQUENTIAL IS MEASURED FASTER ON THE ANSWER
-# PATH. Measured 2026-08-18, M2 x MultiHop, 64 queries, L4, cap 16000
-# substrate, allocator fix live:
-#
-#   batch 0  (sequential)      272.4 s   4.2558 s/query   <- fastest
-#   batch 16, padded 16000     330.6 s   5.1654 s/query
-#   batch 16, padded 12000     337.8 s   5.2784 s/query
-#   batch 16, padded 20000     399.9 s   6.2492 s/query
-#
-# Batching costs 21% at its best cap and degrades as the cap grows.
-#
-# WHY, and the codebase predicted it: a batch runs until its LONGEST
-# member stops, so one non-terminating generation makes every member pay
-# the cap (raptor_paper.py, `summarize_paper_style_batch`). At answer
-# time that cap is GEN_MAX_NEW_TOKENS = 512 while a typical MultiHop
-# answer is far shorter, so batching trades a real per-step saving for a
-# much larger tail penalty. Sequential lets every query stop at its own
-# EOS.
-#
-# THE BATCHING WIN IS REAL ONLY WHERE THE CAP IS TIGHT. M4's tree
-# summaries decode at most 100 tokens, so the uncapped-tail failure
-# cannot occur there — and that path has its own knob,
-# `M4Config.summary_batch_size`, which is unaffected by this value and
-# stays at 32.
-#
-# Set here rather than passed per invocation so "the same batch shape in
-# every cell" is a property of the code, not a flag someone remembers.
-# `--batch-size N` still overrides for probes.
-MATRIX_BATCH_SIZE = 0
+# ANSWER GENERATION IS SEQUENTIAL, by construction: the answer path has
+# no batch knob since the repo reduction. Measured 2026-08-18, M2 x
+# MultiHop, 64 queries, L4: sequential 4.2558 s/query against 5.1654 at
+# the best batched cap — a batch runs until its LONGEST member stops,
+# and at answer time that cap is GEN_MAX_NEW_TOKENS = 512 while a
+# typical answer is far shorter. Every banked cell answered
+# sequentially. M4's 100-token tree summaries are the one place batching
+# wins; that path has its own knobs, `M4Config.summary_batch_size` and
+# `M4Config.summary_max_padded_tokens`, both inside M4's substrate key.
 GEN_TEMPERATURE = 0.0
 GEN_TOP_P = 1.0
-# fp16, NOT 4-bit. This default was True and it is the b6e35c6 failure
-# mode waiting to recur: a silently quantized model is NOT the model the
-# thesis names, and nothing in the output would have said so. Under the
-# local-generator design the reported models (Qwen2.5-7B / Llama-3.1-8B,
-# ~15-16GB fp16) fit an L4's 24GB without quantization, so there is no
-# reason to quantize and every reason not to. `models.load_generator`
-# now REFUSES to return a model whose realised quantization or dtype
-# disagrees with what was requested.
-LOAD_GENERATOR_IN_4BIT = False
+# fp16, NEVER quantized. The 4-bit load option left in the repo
+# reduction (it was False on every path); `models.load_generator`
+# REFUSES a quantized model or an unexpected dtype, so a silently
+# quantized model cannot become the model the thesis names.
 
 # Placement budget handed to accelerate. "cpu": "0GiB" leaves NOWHERE to
 # spill, which converts a silent offload into a load-time exception.
@@ -291,7 +245,6 @@ class GenerationConfig:
     max_new_tokens: int = GEN_MAX_NEW_TOKENS
     temperature: float = GEN_TEMPERATURE
     top_p: float = GEN_TOP_P
-    load_in_4bit: bool = LOAD_GENERATOR_IN_4BIT
 
 
 @dataclass(frozen=True)
@@ -385,30 +338,6 @@ class M4Config:
     # never moves the substrate cache key.
     # None restores plain top_k_final selection.
     retrieval_budget_tokens: int | None = 2000
-
-    # --- DIAGNOSTIC TWIN: leaf-expanded retrieval (default OFF) ---
-    # Retrieved SUMMARY nodes carry an empty gold_provenance, so CK-2
-    # cannot credit them — a summary is abstractive text with no gold
-    # span. That is honest, and it has a consequence that must be
-    # reported rather than hidden: 18.5-57% of M4's retrieved units
-    # (paper App. I) are unscoreable BY CONSTRUCTION, so M4's retrieval
-    # F1 is not directly comparable to a system returning only leaves.
-    #
-    # Turning this on replaces each retrieved summary with its top-N
-    # descendant LEAVES (ranked against the query), which are scoreable,
-    # producing a diagnostic twin that quantifies exactly that gap.
-    #
-    # NEVER A REPORTED M4 NUMBER. Expansion is applied POST-SELECTION, so
-    # the retrieval decision is identical to real M4 — but the evidence
-    # text changes, so answers change too. A run with this on is a
-    # different system and its JSONL says so (every row carries
-    # metadata m4_summary_expansion=true).
-    #
-    # Query-time only: deliberately NOT in raptor_paper.
-    # paper_substrate_extra, so toggling it never moves the substrate key
-    # and the diagnostic twin reuses the same tree.
-    expand_summary_nodes: bool = False
-    summary_expansion_leaves: int = 3
 
     # --- component overrides (per-paper assignment) ---
     # Per-paper rule (professor-approved): each system uses the

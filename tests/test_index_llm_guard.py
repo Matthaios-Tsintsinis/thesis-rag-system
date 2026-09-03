@@ -52,10 +52,6 @@ class TestLocalGeneratorIsWired(unittest.TestCase):
                     f"{label} still routes to the OpenAI API: {model!r}",
                 )
 
-    def test_local_generation_is_fp16_not_quantized(self):
-        """A silently quantized model is not the model the thesis names."""
-        self.assertFalse(GenerationConfig().load_in_4bit)
-
 
 class TestDoomedBuildGuard(unittest.TestCase):
     def _system(self, model, allow=False):

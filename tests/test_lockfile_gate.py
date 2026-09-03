@@ -27,6 +27,9 @@ from src.eval.runner import assert_environment_pinned
 
 
 class TestGate(unittest.TestCase):
+    """No escape since the repo reduction: a missing lockfile and a
+    violated one both abort; there is no flag that downgrades either."""
+
     def _lock(self, td: str, body: str = "numpy==2.2.6\n") -> Path:
         p = Path(td) / "requirements.lock"
         p.write_text("# lock\n" + body, encoding="utf-8")
@@ -35,9 +38,7 @@ class TestGate(unittest.TestCase):
     def test_missing_lockfile_aborts(self):
         with tempfile.TemporaryDirectory() as td:
             with self.assertRaises(SystemExit) as ctx:
-                assert_environment_pinned(
-                    Path(td) / "absent.lock", allow_unpinned=False
-                )
+                assert_environment_pinned(Path(td) / "absent.lock")
             self.assertNotEqual(ctx.exception.code, 0)
 
     def test_mismatched_environment_aborts(self):
@@ -46,41 +47,19 @@ class TestGate(unittest.TestCase):
             with mock.patch("scripts.pin_environment.check_lockfile",
                             return_value=1):
                 with self.assertRaises(SystemExit):
-                    assert_environment_pinned(lock, allow_unpinned=False)
+                    assert_environment_pinned(lock)
 
     def test_matching_environment_passes(self):
         with tempfile.TemporaryDirectory() as td:
             lock = self._lock(td)
             with mock.patch("scripts.pin_environment.check_lockfile",
                             return_value=0):
-                assert_environment_pinned(lock, allow_unpinned=False)
-
-    def test_allow_unpinned_downgrades_a_missing_lockfile_to_a_warning(self):
-        """Probes and dev runs need to run without a lock. The escape is
-        EXPLICIT so that using it is a decision recorded in the command."""
-        with tempfile.TemporaryDirectory() as td:
-            assert_environment_pinned(
-                Path(td) / "absent.lock", allow_unpinned=True
-            )
-
-    def test_allow_unpinned_does_not_silence_a_MISMATCH(self):
-        """A drifted environment with a lockfile present is a different
-        situation from no lockfile at all: the operator asserted a pin and
-        the pin is violated. --allow-unpinned means 'I have no lock', not
-        'ignore the one I have'."""
-        with tempfile.TemporaryDirectory() as td:
-            lock = self._lock(td)
-            with mock.patch("scripts.pin_environment.check_lockfile",
-                            return_value=1):
-                with self.assertRaises(SystemExit):
-                    assert_environment_pinned(lock, allow_unpinned=True)
+                assert_environment_pinned(lock)
 
     def test_the_abort_message_names_the_failure_mode(self):
         with tempfile.TemporaryDirectory() as td:
             with self.assertRaises(SystemExit) as ctx:
-                assert_environment_pinned(
-                    Path(td) / "absent.lock", allow_unpinned=False
-                )
+                assert_environment_pinned(Path(td) / "absent.lock")
             msg = str(ctx.exception.code) + " " + (ctx.exception.args[0]
                                                    if ctx.exception.args
                                                    else "")

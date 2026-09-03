@@ -219,7 +219,7 @@ class TestReplayCellEndToEnd(unittest.TestCase):
             self.assertIn("OTHER", str(cm.exception))
 
     @_patched
-    def test_existing_sidecar_refuses_without_force(self):
+    def test_existing_sidecar_refuses_until_deleted_by_hand(self):
         with TemporaryDirectory() as td:
             bank = Path(td)
             _write_bank(bank, dict(BANKED_MATCH))
@@ -229,8 +229,9 @@ class TestReplayCellEndToEnd(unittest.TestCase):
                 replay_cell(bank, QWEN, "multihop_rag", "M2")
                 with self.assertRaises(SystemExit) as cm:
                     replay_cell(bank, QWEN, "multihop_rag", "M2")
-                self.assertIn("--force", str(cm.exception))
-                replay_cell(bank, QWEN, "multihop_rag", "M2", force=True)
+                self.assertIn("already exists", str(cm.exception))
+                (bank / "rankings.multihop_rag_M2_validation.jsonl").unlink()
+                replay_cell(bank, QWEN, "multihop_rag", "M2")
 
 
 class TestPerSystemKeyLogic(unittest.TestCase):

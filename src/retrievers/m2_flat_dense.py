@@ -117,11 +117,9 @@ class FlatDenseSystem(BaseSystem):
         self._require_indexed()
         assert self._resolved is not None
         # Natural top-K (FINAL_CONTEXT_CHUNKS=15 default). M2 baseline
-        # feeds the generator what its paper would. The CK-4 packer
-        # at answer() time is a no-op pass-through when the opt-in
-        # --evidence-budget flag is OFF (the default). Callers who
-        # want a deeper menu (for opt-in budget ablations) pass an
-        # explicit k.
+        # feeds the generator what its paper would; the packer at
+        # answer() time is a pass-through. Callers who want a deeper
+        # menu pass an explicit k.
         k = k or self.config.retrieval.top_k
         q_vec = embed_texts([query], model_name=self._resolved.embedder_id)
         scores, idxs = self._index.search(q_vec, k)

@@ -75,19 +75,12 @@ class TestExpectedNQueriesResolution(unittest.TestCase):
         from src.eval.runner import assert_expected_n_queries_usable
 
         with self.assertRaises(SystemExit):
-            assert_expected_n_queries_usable(
-                None, max_units=None, max_queries=None
-            )
+            assert_expected_n_queries_usable(None)
 
-    def test_a_capped_run_may_legitimately_have_none(self):
+    def test_a_populated_count_passes(self):
         from src.eval.runner import assert_expected_n_queries_usable
 
-        assert_expected_n_queries_usable(None, max_units=1, max_queries=5)
-
-    def test_a_populated_count_passes_either_way(self):
-        from src.eval.runner import assert_expected_n_queries_usable
-
-        assert_expected_n_queries_usable(1000, max_units=None, max_queries=None)
+        assert_expected_n_queries_usable(1000)
 
 
 class TestChunkerIsTheResolvedOne(unittest.TestCase):

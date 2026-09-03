@@ -91,36 +91,6 @@ class TestProvenanceBlock(unittest.TestCase):
             self.assertIn(pkg, TOPOLOGY_CRITICAL)
 
 
-class TestOneBatchSizeForEveryCell(unittest.TestCase):
-    """`assertEqual(MATRIX_BATCH_SIZE, 16)` used to live here.
-
-    That is a statement about a constant and proves nothing about the
-    pipeline — the exact tautology I2 was created to replace, surviving
-    in a second file while the replacement was written in a first. It
-    also blocked a measured change to the value while asserting nothing
-    about whether anything reads it.
-
-    What matters is that the runner RESOLVES the constant into the batch
-    shape it actually uses. `test_cli_entrypoints` asserts the summary's
-    batch_size tracks the constant end to end; this asserts the meaning
-    of the value the matrix now runs at.
-    """
-
-    def test_the_matrix_value_resolves_to_sequential_answering(self):
-        from src.config import MATRIX_BATCH_SIZE
-
-        # `batch_size = args.batch_size if args.batch_size else None`,
-        # and None is the sequential path. Measured faster on the answer
-        # path than any batched cap: 4.2558 s/query against 5.1654 at the
-        # best one, because a batch runs until its longest member stops
-        # and the 512-token answer cap makes that tail dominate.
-        self.assertFalse(
-            MATRIX_BATCH_SIZE,
-            "MATRIX_BATCH_SIZE must be falsy to select the sequential "
-            "path the answer-side measurement chose",
-        )
-
-
 class TestTheRunnerRecordsIt(unittest.TestCase):
     def test_summary_carries_environment_and_model_revisions(self):
         import inspect

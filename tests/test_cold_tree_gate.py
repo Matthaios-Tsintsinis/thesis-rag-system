@@ -16,9 +16,9 @@ FAILS ON THE FIRST WARM UNIT, not after the pass. A 40-story NarrativeQA
 cell that ran to completion before reporting a warm tree would have spent
 the session it was meant to protect.
 
-`--allow-warm-trees` is the deliberate escape, same shape as
-`--allow-unpinned`: it means "I intend a warm run", and it is recorded in
-the summary so a cell can never claim a cold build it did not do.
+There is no escape flag since the repo reduction: an M4 cell either
+builds cold or refuses. A deliberate re-derivation runs against a
+throwaway THESIS_CACHE_DIR instead.
 """
 
 from __future__ import annotations
@@ -45,7 +45,6 @@ from src.retrievers.base import AnswerResult, BaseSystem, RetrievedChunk
 
 class _TreeSystem(BaseSystem):
     system_id = "M4"
-    supports_batched_answer = False
 
     def __init__(self, *, warm: bool, **kw):
         super().__init__(**kw)
@@ -111,7 +110,7 @@ def _run(*, warm: bool, require_cold: bool):
         system = _TreeSystem(warm=warm, config=DEFAULT_CONFIG)
         runner = BenchmarkRunner(
             output_path=Path(td) / "o.jsonl", verbose=False,
-            batch_size=None, require_cold_tree=require_cold,
+            require_cold_tree=require_cold,
         )
         rows = list(runner.run(system, _TwoUnitBenchmark(),
                                split="validation"))
@@ -147,7 +146,7 @@ class TestColdTreeGate(unittest.TestCase):
         self.assertEqual(system.n_indexed, 2)
 
     def test_warm_is_allowed_when_not_required(self):
-        """The escape hatch, and the default for non-tree systems."""
+        """The default for systems that build no tree (M1/M2/M3)."""
         system, rows = _run(warm=True, require_cold=False)
         self.assertEqual(len(rows), 2)
 
@@ -156,7 +155,8 @@ class TestColdTreeGate(unittest.TestCase):
             _run(warm=True, require_cold=True)
         msg = str(ctx.exception).lower()
         self.assertIn("tree_cache_hit", msg)
-        self.assertIn("allow-warm-trees", msg)
+        self.assertIn("delete", msg)
+        self.assertIn("thesis_cache_dir", msg)
 
 
 class TestWiring(unittest.TestCase):
@@ -186,12 +186,19 @@ class TestWiring(unittest.TestCase):
                 super().__init__(warm=warm, **kw)
 
         out = Path(self.td.name) / "two_M4.jsonl"
+        # The pin gate has no escape, so the CLI drive carries a lockfile
+        # and stubs the version check green: what is under test here is
+        # the cold-tree gate, not the pin.
+        lock = Path(self.td.name) / "requirements.lock"
+        lock.write_text("# lock\nnumpy==0.0.0\n", encoding="utf-8")
         argv = ["runner", "--system", "M4", "--benchmark", "two",
                 "--split", "validation", "--output", str(out),
-                "--allow-unpinned", *extra]
+                "--lockfile", str(lock), *extra]
         with mock.patch.dict(runner_mod.SYSTEM_REGISTRY, {"M4": _M4Stub}), \
              mock.patch.dict(runner_mod.BENCHMARK_REGISTRY,
                              {"two": _TwoUnitBenchmark}), \
+             mock.patch("scripts.pin_environment.check_lockfile",
+                        return_value=0), \
              mock.patch.object(sys, "argv", argv):
             runner_mod.main()
         return json.loads(
@@ -203,14 +210,10 @@ class TestWiring(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self._drive(warm=True)
 
-    def test_allow_warm_trees_permits_it_and_is_recorded(self):
-        summary = self._drive("--allow-warm-trees", warm=True)
-        self.assertTrue(summary["allow_warm_trees"])
-        self.assertEqual(summary["n_queries_scored"], 2)
-
-    def test_a_cold_M4_cell_records_the_flag_as_false(self):
+    def test_a_cold_M4_cell_runs_and_records_no_cache_hit(self):
         summary = self._drive(warm=False)
-        self.assertFalse(summary["allow_warm_trees"])
+        self.assertFalse(summary["tree_cache_hit"])
+        self.assertEqual(summary["n_queries_scored"], 2)
 
 
 if __name__ == "__main__":

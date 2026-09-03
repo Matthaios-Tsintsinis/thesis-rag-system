@@ -102,7 +102,7 @@ class TestBankGpuGate(unittest.TestCase):
             msg = str(cm.exception)
             self.assertIn("Tesla T4", msg)
             self.assertIn("NVIDIA L4", msg)
-            self.assertIn("--allow-gpu-mismatch", msg)
+            self.assertIn("DIFFERENT bank", msg)
 
     def test_matching_hardware_passes(self):
         with tempfile.TemporaryDirectory() as td:
@@ -113,14 +113,6 @@ class TestBankGpuGate(unittest.TestCase):
     def test_the_first_cell_into_an_empty_bank_sets_the_hardware(self):
         with tempfile.TemporaryDirectory() as td:
             assert_bank_gpu_consistent(Path(td), current_gpu="Tesla T4")
-
-    def test_the_flag_downgrades_to_a_loud_pass(self):
-        with tempfile.TemporaryDirectory() as td:
-            d = Path(td)
-            self._gpu_summary(d, "a.summary.json", "NVIDIA L4")
-            assert_bank_gpu_consistent(
-                d, current_gpu="Tesla T4", allow_mismatch=True
-            )  # no raise; loudness is the print, recording is the summary field
 
     def test_an_unknown_current_gpu_warns_but_cannot_fail(self):
         """Absence of measurement is not a measured change — and the

@@ -1052,10 +1052,10 @@ def summarize_paper_style_batch(
     long ones — the same raggedness argument that produced
     `models.token_budget_batches`.
 
-    The GenerationConfig leaves `load_in_4bit` at the config default,
-    which MUST match the answer path: `load_generator` is keyed on
-    (model_name, load_in_4bit), so a mismatch would load a second ~15 GB
-    copy of the same weights instead of reusing the resident one.
+    The GenerationConfig names the SAME model as the answer path:
+    `load_generator` is keyed on the model name, so a different spelling
+    would load a second ~15 GB copy of the same weights instead of
+    reusing the resident one.
     """
     from .config import GenerationConfig
     from .models import generate_batch

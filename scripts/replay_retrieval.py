@@ -62,9 +62,11 @@ dominating):
       --p10 /content/drive/MyDrive/thesis_rag/outputs/p10 \\
       --p11 /content/drive/MyDrive/thesis_rag/outputs/p11
 
-`--only GEN:BENCH:SYS` (e.g. `p11:hotpotqa:M4`) replays one cell;
-`--force` overwrites an existing sidecar (otherwise present = done =
-refuse, so an interrupted session resumes by re-running the command).
+An existing sidecar means DONE and refuses, so an interrupted session
+resumes by re-running the same command; to regenerate a cell
+deliberately, delete its two sidecar files by hand first. All 18 ranked
+cells are replayed in one invocation (the per-cell selector, the
+overwrite flag and the key dry-run left in the repo reduction).
 """
 
 from __future__ import annotations
@@ -201,9 +203,9 @@ def assemble_cdir(system, system_id: str, corpus_hash: str):
     replay now assembles M2/M3 keys EXACTLY as their index() does
     (M2: no extra; M3: the sparse/fusion/rrf_k extra) and uses M4's
     own override-aware `_cache_dir`. The key function is pure given
-    (chunking config, embedder, corpus_hash, extra), which is also
-    what makes --dry-run runnable anywhere by feeding a recorded
-    corpus hash directly."""
+    (chunking config, embedder, corpus_hash, extra), which is what lets
+    the key oracles in tests/test_key_oracles.py feed a recorded corpus
+    hash directly."""
     from src import paths as _paths
     from src.cache import CacheDir, compute_cache_key
 
@@ -272,7 +274,7 @@ def _assert_generator_never_loaded() -> None:
 
 
 def replay_cell(bank: Path, generator: str, benchmark_name: str,
-                system_id: str, force: bool = False) -> dict:
+                system_id: str) -> dict:
     from src.config import DEFAULT_CONFIG
     from src.eval.runner import BENCHMARK_REGISTRY, SYSTEM_REGISTRY
 
@@ -283,9 +285,10 @@ def replay_cell(bank: Path, generator: str, benchmark_name: str,
     side_sum = bank / f"rankings.{stem}.json"
     if not spath.is_file() or not jpath.is_file():
         _fail(f"missing banked cell {stem} in {bank}")
-    if side_rows.exists() and not force:
+    if side_rows.exists():
         _fail(f"{side_rows} already exists -- the replay never needs "
-              "repeating; pass --force only to deliberately regenerate")
+              "repeating; delete the sidecar by hand to deliberately "
+              "regenerate this cell")
     summary = json.loads(spath.read_text(encoding="utf-8"))
     if summary.get("partial_run"):
         _fail(f"{stem}: partial_run")
@@ -475,86 +478,20 @@ def replay_cell(bank: Path, generator: str, benchmark_name: str,
     return side_summary
 
 
-def dry_run_cell(bank: Path, generator: str, benchmark_name: str,
-                 system_id: str, corpus_hash: str) -> str:
-    """Print every key input and the resulting directory. Touch nothing.
-    Loader-free: the key function is pure given a corpus hash, so this
-    runs on any host against a RECORDED hash (never a locally re-derived
-    one -- this host's corpus bytes are not the run host's; the
-    b274e596 incident)."""
-    from src.config import DEFAULT_CONFIG
-    from src.eval.runner import SYSTEM_REGISTRY
-
-    stem = f"{benchmark_name}_{system_id}_validation"
-    spath = bank / f"{stem}.summary.json"
-    env_override = None
-    gen_note = "(no summary present; env/generator checks skipped)"
-    if spath.is_file():
-        summary = json.loads(spath.read_text(encoding="utf-8"))
-        gen_note = f"summary generator: {summary.get('generator')}"
-        if system_id == "M4":
-            env_override = summary.get("tree_build_env")
-    cfg = replace(
-        DEFAULT_CONFIG,
-        generation=replace(DEFAULT_CONFIG.generation, model=generator),
-        m4=replace(DEFAULT_CONFIG.m4, summary_model=generator),
-    )
-    system = SYSTEM_REGISTRY[system_id](config=cfg)
-    if env_override is not None:
-        system.topology_env_override = env_override
-    cdir, req, inputs = assemble_cdir(system, system_id, corpus_hash)
-    expected = Path(str(cdir.manifest_path)).parent
-    print(f"[dry-run] {stem} @ {generator}")
-    print(f"  {gen_note}")
-    print(f"  corpus_hash : {corpus_hash} (RECORDED, fed directly)")
-    for k, v in inputs.items():
-        print(f"  {k:12s}: {v}")
-    print(f"  namespace   : {expected.parent.name}")
-    print(f"  directory   : {expected.name}")
-    print(f"  full path   : {expected}")
-    return expected.name
-
-
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--p10", required=True)
     ap.add_argument("--p11", required=True)
-    ap.add_argument("--only", default=None,
-                    help="replay one cell: {p10|p11}:BENCH:SYS")
-    ap.add_argument("--force", action="store_true",
-                    help="overwrite an existing sidecar (deliberate "
-                         "regeneration only)")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="print every key input + the resulting "
-                         "directory per cell; touch nothing. Requires "
-                         "--corpus-hash (a RECORDED hash from a Drive "
-                         "manifest -- never locally re-derived)")
-    ap.add_argument("--corpus-hash", default=None,
-                    help="recorded corpus hash for --dry-run")
     args = ap.parse_args()
-    if args.dry_run and not args.corpus_hash:
-        raise SystemExit("[replay] --dry-run requires --corpus-hash "
-                         "(feed a RECORDED hash; local re-derivation is "
-                         "exactly the b274e596 mistake)")
     banks = {"p10": (QWEN, Path(args.p10)), "p11": (LLAMA, Path(args.p11))}
     targets = []
-    if args.only:
-        tag, bench, sysid = args.only.split(":")
-        targets.append((banks[tag][0], banks[tag][1], bench, sysid))
-    else:
-        for tag in ("p10", "p11"):
-            gen, bank = banks[tag]
-            for bench in RANKED_BENCHMARKS:
-                for sysid in RANKED_SYSTEMS:
-                    targets.append((gen, bank, bench, sysid))
-    if args.dry_run:
-        for gen, bank, bench, sysid in targets:
-            dry_run_cell(bank, gen, bench, sysid, args.corpus_hash)
-        print(f"[replay] dry-run done: {len(targets)} cell(s), nothing "
-              "touched")
-        return
+    for tag in ("p10", "p11"):
+        gen, bank = banks[tag]
+        for bench in RANKED_BENCHMARKS:
+            for sysid in RANKED_SYSTEMS:
+                targets.append((gen, bank, bench, sysid))
     for gen, bank, bench, sysid in targets:
-        replay_cell(bank, gen, bench, sysid, force=args.force)
+        replay_cell(bank, gen, bench, sysid)
     print(f"[replay] done: {len(targets)} cell(s)")
 
 

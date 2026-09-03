@@ -73,10 +73,10 @@ class AnswerResult:
     # FULL ranking returned by system.retrieve(). CK-2 retrieval-recall
     # scores against this — the CK-4 packer does not narrow it.
     retrieved: list[RetrievedChunk] = field(default_factory=list)
-    # CK-4: the subset of `retrieved` that actually fed the generator
-    # after `src.prompt_packing.pack_context` enforced the shared
-    # EVIDENCE_TOKEN_BUDGET. Equal to `retrieved` for M1 (no retrieval)
-    # and for any system whose retrieved set already fits in budget.
+    # The subset of `retrieved` that actually fed the generator. The
+    # packer imposes no budget, so this equals `retrieved` for every
+    # system; M4 applies its own paper budget BEFORE packing, inside
+    # retrieve().
     packed: list[RetrievedChunk] = field(default_factory=list)
     # P6: fixed-depth ranking for rank-aware scoring. Empty for systems
     # that do not retrieve (M1). NOT generator input.
@@ -89,12 +89,9 @@ class AnswerResult:
     # on the actual prompt text. ANALYSIS visibility — see how much
     # each system's prompt actually weighs.
     n_input_tokens: int = 0
-    # CK-4: chunks-only token count of the evidence block AFTER the
-    # shared packer enforced EVIDENCE_TOKEN_BUDGET. THIS is the
-    # quantity --check-budget-equality measures — the experimental
-    # control. For M7 (or any future system) with heavier structural
-    # overhead, n_input_tokens will exceed evidence_tokens; the
-    # difference IS the per-system structural overhead.
+    # Chunks-only token count of the evidence block as packed. For any
+    # system with structural overhead beyond the chunks, n_input_tokens
+    # exceeds evidence_tokens; the difference IS that overhead.
     evidence_tokens: int = 0
     n_output_tokens: int = 0
     extra: dict = field(default_factory=dict)
@@ -212,13 +209,6 @@ class BaseSystem(ABC):
 
     system_id: str = "base"
 
-    # False for systems that still override answer() wholesale and have
-    # not been split into prepare/finish (M1 closed-book, M7). The runner
-    # falls back to sequential answering for those rather than guessing.
-    # M1 is cheap enough not to matter (~100-token prompts); M7 is not in
-    # the baseline matrix.
-    supports_batched_answer: bool = True
-
     def __init__(self, config: HarnessConfig = DEFAULT_CONFIG) -> None:
         self.config = config
         self._indexed: bool = False
@@ -255,11 +245,9 @@ class BaseSystem(ABC):
              natural strength under the no-budget default per
              professor's directive — baselines feed exactly what
              their papers fed.
-          2. pack_context(retrieved) — no enforcement when
-             src.config.EVIDENCE_TOKEN_BUDGET is None (the default);
-             with --evidence-budget opt-in it truncates by token
-             count. Either way returns (packed, evidence_tokens,
-             evidence_block).
+          2. pack_context(retrieved) — formats the evidence block with
+             no budget and returns (packed, evidence_tokens,
+             evidence_block), packed == retrieved.
           3. Assemble `Evidence:\\n{evidence}\\n\\nQuestion: {query}`,
              call generate() with BASE_ANSWER_SYSTEM_PROMPT.
           4. Return AnswerResult(retrieved=full, packed=packed,
@@ -313,12 +301,9 @@ class BaseSystem(ABC):
         # M2/M3/M4/M6 feed their original top-15 unchanged.
         retrieved = self.retrieve(query, k=k)
         scoring_ranking = self.retrieve_for_scoring(query)
-        # token_budget=None (default) -> packer reads
-        # src.config.EVIDENCE_TOKEN_BUDGET at call time. None by
-        # default = no enforcement (baselines unconstrained, per
-        # professor's directive). Opt-in for ablation via
-        # `python -m src.eval.runner --evidence-budget 3000` which
-        # monkey-patches the config constant before answer() runs.
+        # No budget: the packer returns the full retrieval (baselines
+        # unconstrained, per professor's directive; M4 applied its own
+        # paper budget inside retrieve()).
         packed, evidence_tokens, evidence_block = pack_context(
             retrieved,
             tokenizer_name=EVIDENCE_TOKEN_BUDGET_TOKENIZER,

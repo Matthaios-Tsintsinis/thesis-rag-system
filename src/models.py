@@ -121,7 +121,6 @@ def assert_loaded_generator_matches(
     *,
     requested_name: str,
     loaded_name: str | None,
-    want_4bit: bool,
     is_quantized: bool,
     dtype_str: str,
 ) -> None:
@@ -136,9 +135,9 @@ def assert_loaded_generator_matches(
 
     Three ways the artifact can differ from the name:
       * a different checkpoint than requested;
-      * quantization applied (or skipped) against the config, which
-        makes it a materially different model from the one the thesis
-        names;
+      * quantization applied — the harness loads fp16 only, so a
+        quantized model is a materially different model from the one
+        the thesis names;
       * an unintended dtype — `torch_dtype="auto"` can yield fp32 or
         bf16 depending on the checkpoint, which changes both numerics
         and VRAM.
@@ -151,14 +150,13 @@ def assert_loaded_generator_matches(
             f"{loaded_name!r}. Refusing to run — this is the b6e35c6 "
             "failure mode (reporting one model while running another)."
         )
-    if bool(is_quantized) != bool(want_4bit):
+    if is_quantized:
         raise RuntimeError(
-            f"quantization mismatch for {requested_name!r}: config asked for "
-            f"load_in_4bit={want_4bit} but the loaded model "
-            f"{'IS' if is_quantized else 'is NOT'} quantized. A silently "
+            f"quantization mismatch for {requested_name!r}: the harness "
+            "loads fp16 only but the loaded model IS quantized. A silently "
             "quantized model is not the model the thesis names."
         )
-    if not want_4bit and dtype_str not in ("torch.float16", "torch.bfloat16"):
+    if dtype_str not in ("torch.float16", "torch.bfloat16"):
         raise RuntimeError(
             f"unexpected dtype {dtype_str} for {requested_name!r}. "
             "Unquantized local generators must load in fp16/bf16; fp32 "
@@ -166,7 +164,7 @@ def assert_loaded_generator_matches(
         )
 
 
-def generator_identity(model_name: str, *, load_in_4bit: bool) -> dict:
+def generator_identity(model_name: str) -> dict:
     """Runtime identity of the generator, for the manifest / run summary.
 
     Recorded so a cell can be traced to the exact artifact that produced
@@ -184,7 +182,6 @@ def generator_identity(model_name: str, *, load_in_4bit: bool) -> dict:
     )
     return {
         "generator_model": model_name,
-        "load_in_4bit": bool(load_in_4bit),
         "torch_version": torch.__version__,
         "gpu": gpu,
     }
@@ -232,7 +229,7 @@ def assert_generator_fully_resident(
     )
 
 
-def _load_generator_impl(model_name: str, load_in_4bit: bool) -> Any:
+def _load_generator_impl(model_name: str) -> Any:
     """The actual load. Separated from the cache so it can be stubbed."""
     # The one choke point every local path goes through, and the last
     # moment before CUDA allocates anything. Setting it in runner.main()
@@ -245,18 +242,7 @@ def _load_generator_impl(model_name: str, load_in_4bit: bool) -> Any:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     kwargs: dict = {}
-    if load_in_4bit and torch.cuda.is_available():
-        from transformers import BitsAndBytesConfig
-
-        kwargs["quantization_config"] = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.float16,
-            bnb_4bit_use_double_quant=True,
-        )
-        kwargs["device_map"] = "auto"
-        kwargs["max_memory"] = dict(GENERATOR_MAX_MEMORY)
-    elif torch.cuda.is_available():
+    if torch.cuda.is_available():
         # EXPLICIT fp16, never torch_dtype="auto" — "auto" resolves from
         # the checkpoint and can hand back fp32 or bf16 without saying so.
         kwargs["torch_dtype"] = torch.float16
@@ -277,7 +263,6 @@ def _load_generator_impl(model_name: str, load_in_4bit: bool) -> Any:
     assert_loaded_generator_matches(
         requested_name=model_name,
         loaded_name=getattr(model.config, "_name_or_path", None),
-        want_4bit=bool(load_in_4bit and torch.cuda.is_available()),
         is_quantized=getattr(model.config, "quantization_config", None) is not None,
         dtype_str=str(model.dtype),
     )
@@ -285,7 +270,7 @@ def _load_generator_impl(model_name: str, load_in_4bit: bool) -> Any:
 
 
 @functools.lru_cache(maxsize=2)
-def _load_generator_cached(model_name: str, load_in_4bit: bool) -> Any:
+def _load_generator_cached(model_name: str) -> Any:
     """Cached on a CANONICAL key — see `load_generator` for why.
 
     Records the load and then CHECKS it. This body runs only on a cache
@@ -293,24 +278,20 @@ def _load_generator_cached(model_name: str, load_in_4bit: bool) -> Any:
     means a genuine second load, into whatever VRAM was free at that
     later moment.
     """
-    tokenizer, model = _load_generator_impl(model_name, load_in_4bit)
+    tokenizer, model = _load_generator_impl(model_name)
 
     placement = model_placement_snapshot(model)
     GENERATOR_LOADS.append({
         "model": model_name,
-        "load_in_4bit": bool(load_in_4bit),
         "memory_after_load": cuda_memory_snapshot(),
         "placement_at_load": placement,
     })
     # The identity block reads torch/CUDA, so it is best-effort: a
     # LOG LINE must never be the thing that takes a load down.
     try:
-        identity: Any = generator_identity(
-            model_name, load_in_4bit=load_in_4bit
-        )
+        identity: Any = generator_identity(model_name)
     except Exception:  # noqa: BLE001
-        identity = {"generator_model": model_name,
-                    "load_in_4bit": bool(load_in_4bit)}
+        identity = {"generator_model": model_name}
     print(
         f"[models] loaded local generator: {identity} "
         f"(load #{len(GENERATOR_LOADS)} this process)"
@@ -326,18 +307,14 @@ def _load_generator_cached(model_name: str, load_in_4bit: bool) -> Any:
     # The snapshot above is no longer merely recorded. It is READ.
     assert_generator_fully_resident(
         placement, model_name=model_name, cuda_available=cuda,
-        allow_offload=bool(load_in_4bit),
     )
     return tokenizer, model
 
 
-def load_generator(
-    model_name: str = GENERATOR_MODEL,
-    load_in_4bit: bool = False,
-) -> Any:
-    """Return (tokenizer, model). fp16 by default; 4-bit only on request.
+def load_generator(model_name: str = GENERATOR_MODEL) -> Any:
+    """Return (tokenizer, model), fp16, cached once per model name.
 
-    NORMALISES ITS ARGUMENTS BEFORE THE CACHE, and that is the whole
+    NORMALISES ITS ARGUMENT BEFORE THE CACHE, and that is the whole
     point of this wrapper. `functools.lru_cache` keys on the argument
     TUPLE, so `load_generator(m)` and `load_generator(m, False)` were two
     DIFFERENT keys despite naming the same model at the same precision.
@@ -353,12 +330,15 @@ def load_generator(
     build that still produced correct output.
 
     Collapsing the arguments to one canonical key here means every call
-    site — however it spells the defaults — reaches the same entry.
+    site — however it spells the defaults — reaches the same entry. The
+    4-bit parameter itself left in the repo reduction (it was False on
+    every path), so there is now exactly one argument, still
+    canonicalised to str.
 
     The load is gated by `assert_loaded_generator_matches` and, since the
     above, by `assert_generator_fully_resident`.
     """
-    return _load_generator_cached(str(model_name), bool(load_in_4bit))
+    return _load_generator_cached(str(model_name))
 
 
 # `load_generator.cache_clear()` / `.cache_info()` are used on the public name; the
@@ -376,7 +356,7 @@ def _generate_local(
     """Local HuggingFace causal-LM answer — the only answer path."""
     import torch
 
-    tokenizer, model = load_generator(cfg.model, cfg.load_in_4bit)
+    tokenizer, model = load_generator(cfg.model)
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -795,7 +775,7 @@ def generate_batch(
     configure_cuda_allocator()
     import torch
 
-    tokenizer, model = load_generator(cfg.model, cfg.load_in_4bit)
+    tokenizer, model = load_generator(cfg.model)
 
     texts = [
         tokenizer.apply_chat_template(

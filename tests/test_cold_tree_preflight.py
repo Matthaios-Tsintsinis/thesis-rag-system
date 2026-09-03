@@ -114,7 +114,9 @@ class TestPreflightScope(unittest.TestCase):
         _runner()._cold_tree_preflight(sys_, [_unit("u1", ["a"])], set())
         self.assertEqual(sys_.checked, [])
 
-    def test_the_gate_is_inert_when_warm_trees_are_allowed(self):
+    def test_the_gate_is_inert_when_no_cold_tree_is_required(self):
+        """M1/M2/M3 build no tree; the runner constructs them with
+        require_cold_tree=False. There is no such setting for M4."""
         sys_ = _StubSystem({"u1"})
         r = BenchmarkRunner(
             output_path=Path(tempfile.mkdtemp()) / "c.jsonl",
