@@ -16,18 +16,14 @@ available" — one shared token buys token-F1 0.5 and EM exactly 0
 (verified against the normaliser in tests). So MultiHop EM is
 artifact-free by construction, unlike the primary token-F1.
 
-RANK@5 — WHAT THE BANK SUPPORTS, stated bluntly. The depth-50 scoring
-ranking was consumed AT RUN TIME to compute hit@K / MAP@K / MRR at
-preset K and the ranking itself was never written to any row (the
-recurring shape: computed, correct, not banked). recall@5 — the
-fraction of gold evidence units in the top-5 — is therefore NOT
-derivable post-hoc from the JSONLs, and this exporter refuses to fake
-it: the `recall_at_5` column is emitted EMPTY with this explanation,
-and `hit_at_5` (banked per row, exact) is emitted beside it as the
-rank@5 column the bank can actually stand behind. If true recall@5 is
-ruled in, it requires a retrieval-replay pass over the warm substrates
-with an identity gate against the banked per-row scores — a separate
-tool, not a silent recomputation here.
+R@5 — WHERE IT COMES FROM. The depth-50 scoring ranking was consumed
+AT RUN TIME to compute hit@K / MAP@K / MRR and was never written to any
+row, so recall@K is NOT derivable from the JSONLs. It is read from the
+`rankings.<stem>.jsonl` sidecars that scripts/replay_retrieval.py
+produced from the warm substrates behind a per-row identity gate
+(every replayed row reproduced the banked set-F1 / hit@K / MAP@K /
+MRR). A missing sidecar REFUSES the cell; this exporter never falls
+back to hit@5, which is emitted in the CSV only.
 
 Retrieval columns are GENERATOR-IDENTICAL BY CONSTRUCTION for M2/M3
 (model-free substrates; bit-identity proven on all six cells) but NOT
@@ -38,10 +34,13 @@ show M4's rank figures moving and that is real, not drift.
 system (there is no sparse-only system in the matrix). Row order as
 requested: LLM (M1), flat (M2), raptor (M4), bm25-hybrid (M3).
 
-Same discipline as export_matrix: every number read from the banked
-summaries or recomputed from the banked rows under gates (the shared
-`read_cell` supplies F1/supplementary and the credited assertions);
-refusal on any missing or partial cell and on any population mismatch;
+ONE SOURCE, NO DRIFT: every number is read from the banked summaries
+or recomputed from the banked rows under gates. `read_cell` below
+supplies F1 / supplementary and asserts each cell's recomputed
+credited-refusal (n, mass) against the recorded battery
+(`RECORDED_CREDITED`, living record section 5c) — the record is the
+gate, the bank is the source, nothing is retyped into the output.
+Refusal on any missing or partial cell and on any population mismatch;
 checksum line printed and embedded; generating commit in the header.
 
 Run-host invocation (loaders need the HF cache there):
@@ -57,6 +56,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import subprocess
 import sys
 from datetime import date
 from pathlib import Path
@@ -64,16 +64,160 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.eval.scorers.extractive import normalize_qasper_answer
-from scripts.export_matrix import (
-    BENCHMARKS,
-    LLAMA,
-    QWEN,
-    NULL_METHOD,
-    RECORDED_CREDITED,
-    _fail,
-    _generating_commit,
-    read_cell,
-)
+
+QWEN = "Qwen/Qwen2.5-7B-Instruct"
+LLAMA = "meta-llama/Llama-3.1-8B-Instruct"
+BENCHMARKS = ("multihop_rag", "narrativeqa", "hotpotqa", "hotpotqa_pooled")
+SYSTEMS = ("M1", "M2", "M3", "M4")
+CANONICAL_REFUSAL = "no answer available"
+NULL_METHOD = "unanswerable_rule"
+
+# The battery record (living record §5c / §4.1): per-cell credited-refusal
+# count and mass. These are RECORDED COMMITMENTS the recomputation must
+# reproduce — the gate, not the source. Masses recorded at 2 dp where the
+# record rounds (NarrativeQA); MultiHop masses are exact halves.
+RECORDED_CREDITED: dict[tuple[str, str, str], tuple[int, float]] = {
+    (QWEN, "multihop_rag", "M1"): (315, 157.5),
+    (QWEN, "multihop_rag", "M2"): (462, 231.0),
+    (QWEN, "multihop_rag", "M3"): (458, 229.0),
+    (QWEN, "multihop_rag", "M4"): (504, 252.0),
+    (QWEN, "narrativeqa", "M1"): (7, 1.58),
+    (QWEN, "narrativeqa", "M2"): (3, 0.68),
+    (QWEN, "narrativeqa", "M3"): (3, 0.77),
+    (QWEN, "narrativeqa", "M4"): (6, 1.36),
+    (LLAMA, "multihop_rag", "M1"): (558, 279.0),
+    (LLAMA, "multihop_rag", "M2"): (506, 253.0),
+    (LLAMA, "multihop_rag", "M3"): (510, 255.0),
+    (LLAMA, "multihop_rag", "M4"): (496, 248.0),
+    (LLAMA, "narrativeqa", "M1"): (7, 1.58),
+    (LLAMA, "narrativeqa", "M2"): (6, 1.30),
+    (LLAMA, "narrativeqa", "M3"): (6, 1.44),
+    (LLAMA, "narrativeqa", "M4"): (6, 1.36),
+}
+# HotpotQA-family cells (both variants, both generators): the official
+# sentinel guard forces exact match on yes/no golds, so credited is zero
+# everywhere — recorded in §4.1 and §5c.
+for _gen in (QWEN, LLAMA):
+    for _bench in ("hotpotqa", "hotpotqa_pooled"):
+        for _sys in SYSTEMS:
+            RECORDED_CREDITED[(_gen, _bench, _sys)] = (0, 0.0)
+
+MASS_TOLERANCE = 0.005  # the record rounds NarrativeQA masses to 2 dp
+
+
+def _fail(msg: str) -> None:
+    raise SystemExit(f"[export] REFUSED: {msg}")
+
+
+def _norm_pred(text: str) -> str:
+    return (text or "").strip().lower().rstrip(".")
+
+
+def read_cell(bank: Path, generator: str, benchmark: str, system: str,
+              recorded: dict[tuple[str, str, str], tuple[int, float]]) -> dict:
+    """One matrix row, from one cell's summary + rows. Refuses loudly."""
+    stem = f"{benchmark}_{system}_validation"
+    spath = bank / f"{stem}.summary.json"
+    jpath = bank / f"{stem}.jsonl"
+    if not spath.is_file():
+        _fail(f"missing summary {spath}")
+    if not jpath.is_file():
+        _fail(f"missing rows {jpath}")
+    s = json.loads(spath.read_text(encoding="utf-8"))
+
+    if s.get("partial_run"):
+        _fail(f"{stem}: partial_run is true")
+    if s.get("generator") != generator:
+        _fail(f"{stem}: summary generator {s.get('generator')!r} != bank's "
+              f"{generator!r}")
+    if s.get("system") != system or s.get("benchmark") != benchmark:
+        _fail(f"{stem}: identity mismatch in summary")
+    if s.get("n_queries_scored") != s.get("expected_n_queries"):
+        _fail(f"{stem}: n_queries_scored {s.get('n_queries_scored')} != "
+              f"expected {s.get('expected_n_queries')}")
+
+    n_answerable = int(s["n_answerable"])
+    n_abstained = 0
+    n_credited = 0
+    credited_mass = 0.0
+    plain_sum = 0.0
+    n_plain = 0
+    with jpath.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            r = json.loads(line)
+            a = r["answer"]
+            if a.get("method") == NULL_METHOD:
+                continue  # null rows: their mean is a summary field
+            value = float(a["value"])
+            abstained = bool((a.get("metadata") or {}).get("abstained"))
+            if abstained:
+                n_abstained += 1
+                if (_norm_pred(r.get("predicted_answer")) == CANONICAL_REFUSAL
+                        and value > 0):
+                    n_credited += 1
+                    credited_mass += value
+            else:
+                n_plain += 1
+                plain_sum += value
+
+    if n_abstained + n_plain != n_answerable:
+        _fail(f"{stem}: answerable rows {n_abstained + n_plain} != summary "
+              f"n_answerable {n_answerable}")
+    exp_n, exp_mass = recorded[(generator, benchmark, system)]
+    if n_credited != exp_n or abs(credited_mass - exp_mass) > MASS_TOLERANCE:
+        _fail(f"{stem}: recomputed credited ({n_credited}, "
+              f"{credited_mass:.4f}) disagrees with the recorded battery "
+              f"({exp_n}, {exp_mass}) -- wrong rows or drifted rule; a "
+              "matrix over unverified cells must not exist")
+
+    primary = float(s["mean_answer_score_answerable"])
+    supplementary = primary - (credited_mass / n_answerable if n_answerable else 0.0)
+
+    if system == "M1":
+        retr, absence = "", "no_retrieval"
+    elif benchmark == "narrativeqa":
+        retr, absence = "", "no_gold"
+    else:
+        retr, absence = repr(float(s["mean_retrieval_f1"])), ""
+
+    null_mean = s.get("mean_answer_score_null")
+    return {
+        "generator": generator,
+        "benchmark": benchmark,
+        "system": system,
+        "mean_retrieval_f1": retr,
+        "retrieval_absence": absence,
+        "mean_answer_score": repr(float(s["mean_answer_score"])),
+        "mean_answer_score_answerable": repr(primary),
+        "supplementary_mean": repr(supplementary),
+        "mean_answer_score_null": "" if null_mean is None else repr(float(null_mean)),
+        "n_queries": int(s["n_queries_scored"]),
+        "n_credited": n_credited,
+        "credited_mass": repr(round(credited_mass, 10)),
+        "abstain_pct": repr(round(100.0 * n_abstained / n_answerable, 4)),
+        "mean_plain": repr(round(plain_sum / n_plain, 10)) if n_plain else "",
+        "elapsed_s": repr(float(s["elapsed_s"])),
+        "git_commit": s.get("git_commit", ""),
+        "timestamp": s.get("timestamp", ""),
+        "python": (s.get("environment") or {}).get("python", ""),
+        "lockfile_hash": (s.get("environment") or {}).get("lockfile_hash", ""),
+        "generator_revision": ((s.get("model_revisions") or {})
+                               .get("revisions") or {}).get("generator", ""),
+    }
+
+
+def _generating_commit() -> str:
+    try:
+        return subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                              capture_output=True, text=True, check=True,
+                              cwd=Path(__file__).resolve().parents[1]
+                              ).stdout.strip()
+    except Exception:
+        return "unknown"
+
 
 ROW_ORDER = (("LLM", "M1"), ("flat", "M2"), ("raptor", "M4"),
              ("bm25-hybrid", "M3"))
@@ -339,11 +483,12 @@ def gold_texts(q) -> tuple[str, ...]:
 
 
 def _gold_maps_from_loaders() -> dict[str, dict[str, tuple[str, ...]]]:
-    from scripts.report_children_per_parent import _benchmark
+    from src.eval.runner import BENCHMARK_REGISTRY
     maps: dict[str, dict[str, tuple[str, ...]]] = {}
     for benchmark in BENCHMARKS:
         m: dict[str, tuple[str, ...]] = {}
-        for unit in _benchmark(benchmark).iter_eval_units(split="validation"):
+        loader = BENCHMARK_REGISTRY[benchmark]()
+        for unit in loader.iter_eval_units(split="validation"):
             for q in unit.queries:
                 golds = gold_texts(q)
                 if golds:

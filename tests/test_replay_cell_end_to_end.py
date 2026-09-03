@@ -27,7 +27,7 @@ from src.chunking import Chunk
 from src.eval.types import EvalQuery, EvalUnit, RetrievalScore
 from src.raptor_paper import PAPER_TREE_BUILD_ENV
 from src.retrievers.base import PreparedQuery, RetrievedChunk
-from scripts.export_matrix import QWEN
+from scripts.export_comparison import QWEN
 from scripts.replay_retrieval import _parse_env, replay_cell
 
 ATOM = ("docA", "<whole>")

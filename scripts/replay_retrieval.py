@@ -78,7 +78,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from scripts.export_matrix import LLAMA, QWEN, _fail, _generating_commit
+from scripts.export_comparison import LLAMA, QWEN, _fail, _generating_commit
 
 RANKED_BENCHMARKS = ("multihop_rag", "hotpotqa", "hotpotqa_pooled")
 RANKED_SYSTEMS = ("M2", "M3", "M4")

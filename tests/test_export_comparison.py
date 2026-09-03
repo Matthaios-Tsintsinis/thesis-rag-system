@@ -1,8 +1,13 @@
-"""export_comparison: the post-hoc EM + hit@5 comparison exporter.
+"""export_comparison: the one export (F1 | EM | R@5), plus read_cell.
 
-Synthetic fixture, measured expectations, injected recorded table —
-same discipline as test_export_matrix. The EM-immunity case runs the
-REAL frozen normaliser against the real canonical refusal string.
+Synthetic fixture, measured expectations, injected recorded table: the
+fixture's expected credited table is MEASURED from its own rows and
+injected, while the production `RECORDED_CREDITED` is tested separately
+as the recorded-battery commitment it is — and behaviourally, because
+the mismatch case proves the pipeline READS the table and refuses on
+disagreement, so the constants cannot go inert. The EM-immunity case
+runs the REAL frozen normaliser against the real canonical refusal
+string.
 """
 
 from __future__ import annotations
@@ -15,13 +20,18 @@ from tempfile import TemporaryDirectory
 from src.eval.scorers.extractive import normalize_qasper_answer
 from src.eval.types import EvalQuery, GoldAnswer
 from scripts.export_comparison import (
+    BENCHMARKS,
+    LLAMA,
+    QWEN,
+    RECORDED_CREDITED,
     ROW_ORDER,
+    SYSTEMS,
     build_comparison,
     checksum_line,
     gold_texts,
+    read_cell,
     write_outputs,
 )
-from scripts.export_matrix import BENCHMARKS, LLAMA, QWEN, SYSTEMS
 
 CANON = "No answer available."
 
@@ -90,18 +100,20 @@ GOLD_QUERIES = (
 GOLDS = {str(q.query_id): gold_texts(q) for q in GOLD_QUERIES}
 
 
-def _write_cell(bank: Path, generator, benchmark, system):
+def _write_cell(bank: Path, generator, benchmark, system, *,
+                partial=False, wrong_generator=None, retrieval_f1=0.5):
     rows = _cell_rows(benchmark, system)
     n_null = 1 if benchmark == "multihop_rag" else 0
     ranked = system != "M1" and benchmark != "narrativeqa"
     primary = (0.5 + 0.0 + 0.8 + 0.4) / 4
     summary = {
-        "system": system, "benchmark": benchmark, "generator": generator,
-        "partial_run": False,
+        "system": system, "benchmark": benchmark,
+        "generator": wrong_generator or generator,
+        "partial_run": partial,
         "n_queries_scored": 4 + n_null, "expected_n_queries": 4 + n_null,
         "n_answerable": 4,
         "n_retrieval_scored": 4 if ranked else 0,
-        "mean_retrieval_f1": 0.5, "mean_answer_score": primary,
+        "mean_retrieval_f1": retrieval_f1, "mean_answer_score": primary,
         "mean_answer_score_answerable": primary,
         "mean_answer_score_null": (1.0 if n_null else None),
         "elapsed_s": 1.0, "git_commit": "abc", "timestamp": "t",
@@ -143,6 +155,105 @@ def _fixture(tmp: Path):
                 for g in (QWEN, LLAMA) for b in BENCHMARKS for s in SYSTEMS}
     gold_maps = {b: dict(GOLDS) for b in BENCHMARKS}
     return p10, p11, gold_maps, recorded
+
+
+class TestReadCell(unittest.TestCase):
+    """read_cell: the per-cell reader every table row starts from."""
+
+    def test_arithmetic_from_one_cell(self):
+        with TemporaryDirectory() as td:
+            p10, p11, _, rec = _fixture(Path(td))
+            r = read_cell(p10, QWEN, "multihop_rag", "M1", rec)
+            self.assertEqual(r["n_credited"], 1)
+            # supplementary = primary - mass/n_answerable = 0.425 - 0.125
+            self.assertAlmostEqual(float(r["supplementary_mean"]), 0.3, places=12)
+            # abstain: 2 of 4 answerable; plain mean = (0.8+0.4)/2
+            self.assertEqual(float(r["abstain_pct"]), 50.0)
+            self.assertAlmostEqual(float(r["mean_plain"]), 0.6, places=12)
+            # null mean comes from the summary, never recomputed
+            self.assertEqual(float(r["mean_answer_score_null"]), 1.0)
+
+    def test_absence_encoding(self):
+        with TemporaryDirectory() as td:
+            p10, p11, _, rec = _fixture(Path(td))
+            _write_cell(p10, QWEN, "hotpotqa", "M2",
+                        retrieval_f1=0.1234567890123456)
+            m1 = read_cell(p10, QWEN, "hotpotqa", "M1", rec)
+            self.assertEqual((m1["mean_retrieval_f1"], m1["retrieval_absence"]),
+                             ("", "no_retrieval"))
+            # M1 on NarrativeQA: the system-level absence wins
+            self.assertEqual(read_cell(p10, QWEN, "narrativeqa", "M1", rec)
+                             ["retrieval_absence"], "no_retrieval")
+            self.assertEqual(read_cell(p10, QWEN, "narrativeqa", "M2", rec)
+                             ["retrieval_absence"], "no_gold")
+            m2 = read_cell(p10, QWEN, "hotpotqa", "M2", rec)
+            # full precision survives the string round-trip
+            self.assertEqual(float(m2["mean_retrieval_f1"]), 0.1234567890123456)
+            self.assertEqual(m2["retrieval_absence"], "")
+
+    def test_refuses_missing_summary(self):
+        with TemporaryDirectory() as td:
+            p10, p11, _, rec = _fixture(Path(td))
+            (p11 / "hotpotqa_M4_validation.summary.json").unlink()
+            with self.assertRaises(SystemExit) as cm:
+                read_cell(p11, LLAMA, "hotpotqa", "M4", rec)
+            self.assertIn("missing summary", str(cm.exception))
+
+    def test_refuses_partial_run(self):
+        with TemporaryDirectory() as td:
+            p10, p11, _, rec = _fixture(Path(td))
+            _write_cell(p10, QWEN, "hotpotqa", "M2", partial=True)
+            with self.assertRaises(SystemExit) as cm:
+                read_cell(p10, QWEN, "hotpotqa", "M2", rec)
+            self.assertIn("partial_run", str(cm.exception))
+
+    def test_refuses_generator_mismatch(self):
+        with TemporaryDirectory() as td:
+            p10, p11, _, rec = _fixture(Path(td))
+            _write_cell(p10, QWEN, "hotpotqa", "M3", wrong_generator=LLAMA)
+            with self.assertRaises(SystemExit) as cm:
+                read_cell(p10, QWEN, "hotpotqa", "M3", rec)
+            self.assertIn("generator", str(cm.exception))
+
+    def test_refuses_credited_disagreement(self):
+        """The pipeline READS the recorded table -- the gate cannot go inert."""
+        with TemporaryDirectory() as td:
+            p10, p11, _, rec = _fixture(Path(td))
+            rec[(QWEN, "multihop_rag", "M1")] = (2, 1.0)  # wrong on purpose
+            with self.assertRaises(SystemExit) as cm:
+                read_cell(p10, QWEN, "multihop_rag", "M1", rec)
+            self.assertIn("recorded battery", str(cm.exception))
+
+    def test_the_table_builder_reads_every_cell_through_it(self):
+        """A refusal inside read_cell must stop build_comparison too."""
+        with TemporaryDirectory() as td:
+            p10, p11, gold_maps, rec = _fixture(Path(td))
+            _write_cell(p11, LLAMA, "narrativeqa", "M4", partial=True)
+            with self.assertRaises(SystemExit) as cm:
+                build_comparison(p10, p11, gold_maps, recorded=rec)
+            self.assertIn("partial_run", str(cm.exception))
+
+
+class TestRecordedBattery(unittest.TestCase):
+    """The default table is a recorded-battery commitment: 32 cells, the
+    HotpotQA family all zero (the sentinel guard), the spot values the
+    living record banked. Breaking on change is these tests working."""
+
+    def test_shape_and_guard_zeros(self):
+        self.assertEqual(len(RECORDED_CREDITED), 32)
+        for (g, b, s), (n, mass) in RECORDED_CREDITED.items():
+            if b in ("hotpotqa", "hotpotqa_pooled"):
+                self.assertEqual((n, mass), (0, 0.0), (g, b, s))
+
+    def test_spot_values_from_the_living_record(self):
+        self.assertEqual(RECORDED_CREDITED[(QWEN, "multihop_rag", "M4")],
+                         (504, 252.0))
+        self.assertEqual(RECORDED_CREDITED[(LLAMA, "multihop_rag", "M1")],
+                         (558, 279.0))
+        self.assertEqual(RECORDED_CREDITED[(QWEN, "narrativeqa", "M4")],
+                         (6, 1.36))
+        self.assertEqual(RECORDED_CREDITED[(LLAMA, "narrativeqa", "M3")],
+                         (6, 1.44))
 
 
 class TestComparison(unittest.TestCase):
