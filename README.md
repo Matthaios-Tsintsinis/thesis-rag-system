@@ -98,49 +98,50 @@ os.environ.update({
 })
 ```
 
-**Block E — the interpreter and the locked environment.** Creates the
-3.12.13 environment the lock names and installs into IT, never into the
-notebook kernel. `requirements.txt` is the reduced import graph;
-`requirements.lock` then pins every version. The lock names the CUDA
-12.8 build of torch (`torch==2.11.0+cu128`), which PyPI does not serve,
-so the lock install carries the PyTorch index. (This block is the
-reconstruction of the operator's `py312` cell from the recorded
-interpreter path and version; if your own notebook cell differs, your
-cell is the record — what must hold is `python --version` printing
-3.12.13 and the pin gate below printing OK.)
+**Block E — the interpreter.** The operator's block, verbatim: CPython
+3.12.13 from conda-forge at `/content/py312`, the interpreter every
+later command runs as a subprocess.
 
 ```bash
 cd /content && curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xvj bin/micromamba
 /content/bin/micromamba create -y -p /content/py312 python=3.12.13 -c conda-forge
 /content/py312/bin/python --version                      # Python 3.12.13, exactly
-cp /content/drive/MyDrive/thesis_rag/requirements.lock /content/thesis-rag-system/requirements.lock
+```
+
+**Block F — the locked environment and the pin gate: the PROVEN
+sequence.** The order is the result of an incident, not a preference:
+torch FIRST from the PyTorch CUDA-12.8 index at the lock's exact
+version (PyPI does not serve the `+cu128` build), then
+`requirements.txt` (the reduced import graph), then the lock's pins
+with the same index as an extra, then the uninstall line, then the
+gate. The uninstall line is PERMANENT by ruling: installing over a fresh
+environment once dragged a `torchvision` wheel in over the locked torch
+and broke `PreTrainedModel` AFTER the pin had printed OK (2026-08-24).
+torchvision, torchaudio and the docling family are in no lockfile line,
+so absence is the clean state; the line may become a comment only after
+a fresh-environment `pip check` proves the pruned `requirements.txt` no
+longer pulls them — not before. The gate must print
+`[pin] lockfile_hash=17878bc8740173be`, `[pin] python=3.12.13 (locked
+3.12.13)`, `[pin] checked N pinned package(s)` and `[pin] OK —
+environment matches the lockfile.`; it screens `pip check` itself and
+FAILS on any conflict naming a locked package.
+
+```bash
 cd /content/thesis-rag-system
+cp /content/drive/MyDrive/thesis_rag/requirements.lock requirements.lock
+/content/py312/bin/python -m pip install $(grep -E "^torch==" requirements.lock) --index-url https://download.pytorch.org/whl/cu128
 /content/py312/bin/python -m pip install -r requirements.txt
 /content/py312/bin/python -m pip install -r requirements.lock --extra-index-url https://download.pytorch.org/whl/cu128
+/content/py312/bin/python -m pip uninstall -y torchvision torchaudio docling-ibm-models docling docling-core docling-parse docling-slim
+/content/py312/bin/python -m scripts.pin_environment check --lockfile requirements.lock
 ```
+
+The stack check, once the gate is green (numba >= 0.66 is load-bearing:
+older numba pins numpy < 2.1; fix by upgrading numba, never by lowering
+numpy):
 
 ```bash
 cd /content/thesis-rag-system && /content/py312/bin/python -c "import numpy, numba, umap, faiss, torch, sentence_transformers, tiktoken, sklearn; import importlib.metadata as m; assert tuple(int(x) for x in m.version('numpy').split('.')[:2]) >= (2, 1) and tuple(int(x) for x in m.version('numba').split('.')[:2]) >= (0, 66), (m.version('numpy'), m.version('numba')); print('stack OK')"
-```
-
-numba >= 0.66 is load-bearing (older numba pins numpy < 2.1); fix by
-upgrading numba, never by lowering numpy.
-
-**Block F — the pin gate.** Must print `[pin] lockfile_hash=17878bc8740173be`,
-`[pin] python=3.12.13 (locked 3.12.13)`, `[pin] checked N pinned
-package(s)` and `[pin] OK — environment matches the lockfile.`, and
-`pip check` must be clean. The gate itself screens
-`pip check` and FAILS on any conflict that names a locked package. The
-uninstall line exists for one recorded incident (a `torchvision` wheel
-pulled in over the lock's torch broke `PreTrainedModel` after the pin
-had printed OK); with the reduced `requirements.txt` the orphan should
-not install — run the line only while `pip check` still needs it.
-
-```bash
-cd /content/thesis-rag-system
-/content/py312/bin/python -m pip check || /content/py312/bin/python -m pip uninstall -y torchvision torchaudio
-/content/py312/bin/python -m pip check
-/content/py312/bin/python -m scripts.pin_environment check --lockfile requirements.lock
 ```
 
 **Block F2a — the Hugging Face token (Llama column only).** The Llama
