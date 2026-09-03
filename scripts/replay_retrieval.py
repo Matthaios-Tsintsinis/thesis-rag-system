@@ -62,18 +62,23 @@ dominating):
       --p10 /content/drive/MyDrive/thesis_rag/outputs/p10 \\
       --p11 /content/drive/MyDrive/thesis_rag/outputs/p11
 
-An existing sidecar means DONE: the cell is SKIPPED with a printed
-line and never rewritten, so an interrupted session resumes by
-re-running the same command and a complete bank is a no-op. To
-regenerate one cell deliberately, delete its two sidecar files by hand
-first. All 18 ranked cells are visited in one invocation (the per-cell
-selector, the overwrite flag and the key dry-run left in the repo
-reduction).
+An existing sidecar means DONE only after it is VERIFIED: the summary
+must name this cell, the rows file must parse and hold exactly the
+summary's n_rows, and where the summary embeds rows_sha256 (written by
+this tool since the reduction) the rows file must hash to it. A verified
+cell is named on one printed line and never rewritten, so an
+interrupted session resumes by re-running the same command and a
+complete bank is a no-op that prints eighteen verified lines; any
+disagreement REFUSES the run and names the file. To regenerate one cell
+deliberately, delete its two sidecar files by hand first. All 18 ranked
+cells are visited in one invocation (the per-cell selector, the
+overwrite flag and the key dry-run left in the repo reduction).
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import time
@@ -275,10 +280,80 @@ def _assert_generator_never_loaded() -> None:
               "be trusted")
 
 
+def _rows_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _verify_present_sidecar(stem: str, generator: str, benchmark_name: str,
+                            system_id: str, side_rows: Path,
+                            side_sum: Path) -> None:
+    """A present sidecar is DONE only if it is this cell's own and intact.
+
+    Verified, never assumed: the summary exists and names this cell
+    (generator / benchmark / system); the rows file parses, every row
+    carries query_id and recall_at_k, and the count equals the summary's
+    n_rows; where the summary embeds rows_sha256 (written since the
+    reduction) the rows file hashes to it. Sidecars written before that
+    field existed are verified by identity and count and the printed
+    line says so. Any disagreement REFUSES: a corrupt or foreign sidecar
+    must not pass as done.
+    """
+    if not side_sum.is_file():
+        _fail(f"{stem}: {side_rows.name} is present but {side_sum.name} is "
+              "missing -- a half-written sidecar; delete the rows file by "
+              "hand and re-run")
+    try:
+        meta = json.loads(side_sum.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        _fail(f"{stem}: {side_sum.name} is not valid JSON ({e}); delete "
+              "both sidecar files by hand and re-run")
+    ident = (meta.get("generator"), meta.get("benchmark"), meta.get("system"))
+    if ident != (generator, benchmark_name, system_id):
+        _fail(f"{stem}: {side_sum.name} names {ident}, not this cell "
+              f"({generator!r}, {benchmark_name!r}, {system_id!r}) -- a "
+              "foreign sidecar; delete both files by hand and re-run")
+    n = 0
+    with side_rows.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as e:
+                _fail(f"{stem}: {side_rows.name} row {n + 1} is not valid "
+                      f"JSON ({e}); delete both sidecar files by hand and "
+                      "re-run")
+            if "query_id" not in row or "recall_at_k" not in row:
+                _fail(f"{stem}: {side_rows.name} row {n + 1} lacks "
+                      "query_id / recall_at_k; delete both sidecar files by "
+                      "hand and re-run")
+            n += 1
+    if n != int(meta.get("n_rows", -1)):
+        _fail(f"{stem}: {side_rows.name} holds {n} rows but {side_sum.name} "
+              f"records n_rows={meta.get('n_rows')}; delete both sidecar "
+              "files by hand and re-run")
+    embedded = meta.get("rows_sha256")
+    if embedded is not None:
+        actual = _rows_sha256(side_rows)
+        if actual != embedded:
+            _fail(f"{stem}: {side_rows.name} sha256 {actual} != the embedded "
+                  f"rows_sha256 {embedded} -- the sidecar was altered after "
+                  "it was written; delete both files by hand and re-run")
+        how = f"rows_sha256 {embedded[:16]}... verified"
+    else:
+        how = ("no rows_sha256 field (written before the reduction); "
+               "identity and row count verified")
+    print(f"[replay] {generator.split('/')[-1]} {benchmark_name} "
+          f"{system_id}: sidecar present, DONE -- {n} rows, {how}; the "
+          f"replay never repeats a cell (delete {side_rows.name} and "
+          f"{side_sum.name} by hand to regenerate it deliberately)")
+
+
 def replay_cell(bank: Path, generator: str, benchmark_name: str,
                 system_id: str) -> dict | None:
     """Replay one cell behind the per-row gate; None when its sidecar
-    already exists (present = done, nothing touched)."""
+    already exists and verifies (present = done, nothing touched)."""
     from src.config import DEFAULT_CONFIG
     from src.eval.runner import BENCHMARK_REGISTRY, SYSTEM_REGISTRY
 
@@ -290,10 +365,8 @@ def replay_cell(bank: Path, generator: str, benchmark_name: str,
     if not spath.is_file() or not jpath.is_file():
         _fail(f"missing banked cell {stem} in {bank}")
     if side_rows.exists():
-        print(f"[replay] {generator.split('/')[-1]} {benchmark_name} "
-              f"{system_id}: sidecar present, DONE -- the replay never "
-              f"repeats a cell; delete {side_rows.name} and {side_sum.name} "
-              "by hand to regenerate it deliberately")
+        _verify_present_sidecar(stem, generator, benchmark_name, system_id,
+                                side_rows, side_sum)
         return None
     summary = json.loads(spath.read_text(encoding="utf-8"))
     if summary.get("partial_run"):
@@ -465,6 +538,9 @@ def replay_cell(bank: Path, generator: str, benchmark_name: str,
     side_summary = {
         "generator": generator, "benchmark": benchmark_name,
         "system": system_id, "n_rows": n_rank,
+        # Embedded so a present sidecar is verified, not trusted: the
+        # rows file must hash to this on every later invocation.
+        "rows_sha256": _rows_sha256(side_rows),
         "recall_at_1": recall[1], "recall_at_5": recall[5],
         "recall_at_10": recall[10],
         "hit_at_5_replayed": hit5,

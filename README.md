@@ -210,11 +210,15 @@ cd /content/thesis-rag-system && /content/py312/bin/python -m scripts.export_com
 Drive). The replay re-runs retrieval over the warm substrates for the 18
 ranked cells and writes `rankings.<stem>.jsonl` beside each; every
 replayed row must reproduce the banked set-F1, hit@K, MAP@K and MRR
-bit-for-bit or the cell refuses. An existing sidecar means done: the
-cell is skipped and never rewritten, so against the Drive banks the
-command is a no-op that prints eighteen "present" lines; delete a cell's
-two sidecar files by hand to regenerate it deliberately. Same GPU class
-as the bank, for the gate's sake.
+bit-for-bit or the cell refuses. An existing sidecar means done only
+after it is verified (the summary names the cell, the rows file parses
+and holds the summary's row count, and the embedded `rows_sha256`
+matches where present); a verified cell is named on one line and never
+rewritten, so against the Drive banks the command is a no-op that
+prints eighteen verified lines, and a corrupt or foreign sidecar
+refuses the run. Delete a cell's two sidecar files by hand to
+regenerate it deliberately. Same GPU class as the bank, for the gate's
+sake.
 
 ```bash
 cd /content/thesis-rag-system && /content/py312/bin/python -m scripts.replay_retrieval --p10 /content/drive/MyDrive/thesis_rag/outputs/p10 --p11 /content/drive/MyDrive/thesis_rag/outputs/p11

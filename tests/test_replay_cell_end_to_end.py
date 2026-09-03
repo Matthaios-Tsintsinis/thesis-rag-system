@@ -17,6 +17,7 @@ old key.
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import unittest
 from pathlib import Path
@@ -219,7 +220,7 @@ class TestReplayCellEndToEnd(unittest.TestCase):
             self.assertIn("OTHER", str(cm.exception))
 
     @_patched
-    def test_existing_sidecar_is_skipped_untouched_until_deleted_by_hand(self):
+    def test_existing_sidecar_is_verified_and_skipped_until_deleted_by_hand(self):
         with TemporaryDirectory() as td:
             bank = Path(td)
             _write_bank(bank, dict(BANKED_MATCH))
@@ -229,13 +230,72 @@ class TestReplayCellEndToEnd(unittest.TestCase):
                 first = replay_cell(bank, QWEN, "multihop_rag", "M2")
                 self.assertIsInstance(first, dict)
                 side = bank / "rankings.multihop_rag_M2_validation.jsonl"
+                meta_path = bank / "rankings.multihop_rag_M2_validation.json"
                 before = side.read_bytes()
-                # present = done: skipped, and the sidecar is not rewritten
+                # the embedded checksum IS the rows file's hash
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                self.assertEqual(meta["rows_sha256"],
+                                 hashlib.sha256(before).hexdigest())
+                # present = done: verified, skipped, not rewritten
                 self.assertIsNone(replay_cell(bank, QWEN, "multihop_rag", "M2"))
                 self.assertEqual(side.read_bytes(), before)
                 side.unlink()
                 self.assertIsInstance(
                     replay_cell(bank, QWEN, "multihop_rag", "M2"), dict)
+
+    @_patched
+    def test_present_sidecar_written_before_the_checksum_is_verified_by_identity_and_count(self):
+        with TemporaryDirectory() as td:
+            bank = Path(td)
+            _write_bank(bank, dict(BANKED_MATCH))
+            holder = {"dir": bank}
+            with mock.patch("scripts.replay_retrieval.resolve_substrate",
+                            _fake_resolution(holder)):
+                replay_cell(bank, QWEN, "multihop_rag", "M2")
+                meta_path = bank / "rankings.multihop_rag_M2_validation.json"
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                del meta["rows_sha256"]  # a Drive sidecar from the tag era
+                meta_path.write_text(json.dumps(meta), encoding="utf-8")
+                self.assertIsNone(replay_cell(bank, QWEN, "multihop_rag", "M2"))
+                meta["n_rows"] = meta["n_rows"] + 1  # count disagrees
+                meta_path.write_text(json.dumps(meta), encoding="utf-8")
+                with self.assertRaises(SystemExit) as cm:
+                    replay_cell(bank, QWEN, "multihop_rag", "M2")
+                self.assertIn("n_rows", str(cm.exception))
+
+    @_patched
+    def test_present_sidecar_whose_rows_were_altered_refuses(self):
+        with TemporaryDirectory() as td:
+            bank = Path(td)
+            _write_bank(bank, dict(BANKED_MATCH))
+            holder = {"dir": bank}
+            with mock.patch("scripts.replay_retrieval.resolve_substrate",
+                            _fake_resolution(holder)):
+                replay_cell(bank, QWEN, "multihop_rag", "M2")
+                side = bank / "rankings.multihop_rag_M2_validation.jsonl"
+                row = json.loads(side.read_text(encoding="utf-8").splitlines()[0])
+                row["recall_at_k"]["5"] = 0.0  # same shape, different bytes
+                side.write_text(json.dumps(row) + "\n", encoding="utf-8")
+                with self.assertRaises(SystemExit) as cm:
+                    replay_cell(bank, QWEN, "multihop_rag", "M2")
+                self.assertIn("rows_sha256", str(cm.exception))
+
+    @_patched
+    def test_present_sidecar_naming_another_cell_refuses(self):
+        with TemporaryDirectory() as td:
+            bank = Path(td)
+            _write_bank(bank, dict(BANKED_MATCH))
+            holder = {"dir": bank}
+            with mock.patch("scripts.replay_retrieval.resolve_substrate",
+                            _fake_resolution(holder)):
+                replay_cell(bank, QWEN, "multihop_rag", "M2")
+                meta_path = bank / "rankings.multihop_rag_M2_validation.json"
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                meta["system"] = "M3"
+                meta_path.write_text(json.dumps(meta), encoding="utf-8")
+                with self.assertRaises(SystemExit) as cm:
+                    replay_cell(bank, QWEN, "multihop_rag", "M2")
+                self.assertIn("foreign", str(cm.exception))
 
 
 class TestPerSystemKeyLogic(unittest.TestCase):
