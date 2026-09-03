@@ -1,6 +1,11 @@
 """Verify every `path:line` citation in docs/PROVENANCE_TABLE.md and
 docs/METHODS_AND_FIDELITY.md AGAINST THE PINNED TAG'S TREE.
 
+DOCUMENTATION TOOLING, OFF THE OUTPUT PATH — kept in the reduced tree as
+an explicit exemption (ruled 2026-09-03): nothing that runs a cell, the
+replay or the export imports it; it exists so the disk-only fidelity
+documents stay honest against the tag they cite.
+
 WHY THIS EXISTS, and why it is stricter than "does the line number exist".
 The living fidelity record cites our code as `path:line`. The first checker
 only tested that each line number was in range - and a three-line edit
