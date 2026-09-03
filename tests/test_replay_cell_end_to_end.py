@@ -219,19 +219,23 @@ class TestReplayCellEndToEnd(unittest.TestCase):
             self.assertIn("OTHER", str(cm.exception))
 
     @_patched
-    def test_existing_sidecar_refuses_until_deleted_by_hand(self):
+    def test_existing_sidecar_is_skipped_untouched_until_deleted_by_hand(self):
         with TemporaryDirectory() as td:
             bank = Path(td)
             _write_bank(bank, dict(BANKED_MATCH))
             holder = {"dir": bank}
             with mock.patch("scripts.replay_retrieval.resolve_substrate",
                             _fake_resolution(holder)):
-                replay_cell(bank, QWEN, "multihop_rag", "M2")
-                with self.assertRaises(SystemExit) as cm:
-                    replay_cell(bank, QWEN, "multihop_rag", "M2")
-                self.assertIn("already exists", str(cm.exception))
-                (bank / "rankings.multihop_rag_M2_validation.jsonl").unlink()
-                replay_cell(bank, QWEN, "multihop_rag", "M2")
+                first = replay_cell(bank, QWEN, "multihop_rag", "M2")
+                self.assertIsInstance(first, dict)
+                side = bank / "rankings.multihop_rag_M2_validation.jsonl"
+                before = side.read_bytes()
+                # present = done: skipped, and the sidecar is not rewritten
+                self.assertIsNone(replay_cell(bank, QWEN, "multihop_rag", "M2"))
+                self.assertEqual(side.read_bytes(), before)
+                side.unlink()
+                self.assertIsInstance(
+                    replay_cell(bank, QWEN, "multihop_rag", "M2"), dict)
 
 
 class TestPerSystemKeyLogic(unittest.TestCase):

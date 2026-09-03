@@ -10,8 +10,8 @@ to a SIDECAR beside the banked cell (`rankings.<stem>.jsonl` +
 and computes recall@{1,5,10}. THE SIDECAR NAMES ARE GLOB-SAFE BY
 AUDIT: they begin with `rankings.` and end without `.summary.json`, so
 they match NONE of the bank's discovery patterns -- not the bank
-gates' `*.summary.json` (runner.py), not aggregate's rglob, and not
-significance_diagnostic's `{bench}_{sys}_*.jsonl` fallback. A
+gates' `*.summary.json` (runner.py) and not the `{bench}_{sys}_*.jsonl`
+globs the analysis tools used at the tag. A
 `<stem>.rankings.summary.json` name would have been swept into the
 bank-gate population; found and renamed in the pre-flight audit. Once the sidecars exist, recall
 at any K is derivable forever and this replay never needs repeating.
@@ -62,11 +62,13 @@ dominating):
       --p10 /content/drive/MyDrive/thesis_rag/outputs/p10 \\
       --p11 /content/drive/MyDrive/thesis_rag/outputs/p11
 
-An existing sidecar means DONE and refuses, so an interrupted session
-resumes by re-running the same command; to regenerate a cell
-deliberately, delete its two sidecar files by hand first. All 18 ranked
-cells are replayed in one invocation (the per-cell selector, the
-overwrite flag and the key dry-run left in the repo reduction).
+An existing sidecar means DONE: the cell is SKIPPED with a printed
+line and never rewritten, so an interrupted session resumes by
+re-running the same command and a complete bank is a no-op. To
+regenerate one cell deliberately, delete its two sidecar files by hand
+first. All 18 ranked cells are visited in one invocation (the per-cell
+selector, the overwrite flag and the key dry-run left in the repo
+reduction).
 """
 
 from __future__ import annotations
@@ -274,7 +276,9 @@ def _assert_generator_never_loaded() -> None:
 
 
 def replay_cell(bank: Path, generator: str, benchmark_name: str,
-                system_id: str) -> dict:
+                system_id: str) -> dict | None:
+    """Replay one cell behind the per-row gate; None when its sidecar
+    already exists (present = done, nothing touched)."""
     from src.config import DEFAULT_CONFIG
     from src.eval.runner import BENCHMARK_REGISTRY, SYSTEM_REGISTRY
 
@@ -286,9 +290,11 @@ def replay_cell(bank: Path, generator: str, benchmark_name: str,
     if not spath.is_file() or not jpath.is_file():
         _fail(f"missing banked cell {stem} in {bank}")
     if side_rows.exists():
-        _fail(f"{side_rows} already exists -- the replay never needs "
-              "repeating; delete the sidecar by hand to deliberately "
-              "regenerate this cell")
+        print(f"[replay] {generator.split('/')[-1]} {benchmark_name} "
+              f"{system_id}: sidecar present, DONE -- the replay never "
+              f"repeats a cell; delete {side_rows.name} and {side_sum.name} "
+              "by hand to regenerate it deliberately")
+        return None
     summary = json.loads(spath.read_text(encoding="utf-8"))
     if summary.get("partial_run"):
         _fail(f"{stem}: partial_run")
@@ -490,9 +496,14 @@ def main() -> None:
         for bench in RANKED_BENCHMARKS:
             for sysid in RANKED_SYSTEMS:
                 targets.append((gen, bank, bench, sysid))
+    n_done = n_present = 0
     for gen, bank, bench, sysid in targets:
-        replay_cell(bank, gen, bench, sysid)
-    print(f"[replay] done: {len(targets)} cell(s)")
+        if replay_cell(bank, gen, bench, sysid) is None:
+            n_present += 1
+        else:
+            n_done += 1
+    print(f"[replay] done: {n_done} cell(s) replayed, {n_present} already "
+          f"present of {len(targets)}")
 
 
 if __name__ == "__main__":
