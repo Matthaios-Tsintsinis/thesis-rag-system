@@ -106,7 +106,10 @@ class TestTheRunnerRecordsIt(unittest.TestCase):
         recorded error, not abort a 20-cell pass."""
         from src.eval.runner import _environment_provenance, _model_revisions
 
-        self.assertIsInstance(_environment_provenance(), dict)
+        with tempfile.TemporaryDirectory() as td:
+            prov = _environment_provenance(Path(td) / "absent.lock")
+        self.assertIsInstance(prov, dict)
+        self.assertIsNone(prov["lockfile_hash"])
 
         class _Broken:
             @property
