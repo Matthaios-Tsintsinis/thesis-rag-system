@@ -14,10 +14,8 @@ the retrieval comparison. ResolvedComponents therefore carries no
 generator slot — the invariant is enforced structurally.
 
 Index-time LLM names differ per paper (RAPTOR calls it the summariser
-and stores it as M4Config.summary_model;
-HippoRAG calls it OpenIE and a future M6 config will carry openie_llm).
-The resolver checks both names and normalises to a single index_llm_id
-for the per-system audit log.
+and stores it as M4Config.summary_model). The resolver normalises the
+paper-side name to a single index_llm_id for the per-system audit log.
 
 The resolver also produces the structured log line that smoke + harness
 emit per system at index time, which feeds the per-paper audit table
@@ -100,8 +98,9 @@ def resolve_components(
 
     # Index-time LLM normalisation: paper-faithful field names on each
     # system config, single id at the resolver. RAPTOR-family configs
-    # carry `summary_model` (M4/M7); a future HippoRAG config will carry
-    # `openie_llm`. An explicit `index_llm` field overrides both if set.
+    # carry `summary_model` (M4); `openie_llm` was HippoRAG's name and is
+    # read through getattr, so a config without it resolves to None. An
+    # explicit `index_llm` field overrides both if set.
     explicit = (
         getattr(system_cfg, "index_llm", None) if system_cfg is not None else None
     )

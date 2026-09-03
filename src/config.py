@@ -319,10 +319,9 @@ class M4Config:
     # reverse-engineered into a cap. Expect visible truncation near 100 —
     # that discrepancy is itself a finding about the reference.
     summary_max_tokens: int = 100
-    # M4-LOCAL prompt id. Deliberately NOT summarization.SUMMARY_PROMPT_VERSION:
-    # that is a module-level constant the FROZEN M7 also reads, so bumping
-    # it would move M7's substrate key. Proven, not assumed — see the
-    # frozen-M7 key landmine table in CLAUDE.md.
+    # M4-LOCAL prompt id. Deliberately its own field rather than a shared
+    # module constant: a shared constant would have moved every reader's
+    # substrate key at once (the frozen-M7 key landmine, now historical).
     summary_prompt_version: str = "raptor_paper_v1"
 
     first_stage_top_k: int = FIRST_STAGE_TOP_K

@@ -1,9 +1,9 @@
 """BaseSystem ABC.
 
-The active benchmarked roster is M1, M2, M3, M4, M6, M7; M5 (GraphRAG)
-and M8 (hierarchical cluster-tree port) are archived under
-src/retrievers/deprecated/. The harness treats each system as a black
-box: `index(corpus_path)` once, then `answer(query)` per question.
+The benchmarked roster is M1, M2, M3, M4 (the withdrawn and archived
+systems live at tag thesis-full-2026-09-03). The harness treats each
+system as a black box: `index(corpus_path)` once, then `answer(query)`
+per question.
 
 `retrieve` is exposed separately so the harness can score retrieval
 quality (Recall@k, RAGAS context_precision) independently from answer
@@ -289,9 +289,7 @@ class BaseSystem(ABC):
 
         The default asks the system for a deeper cut of the SAME
         retrieval it would otherwise do. That costs one extra vector or
-        BM25 search per query and no LLM call. A system whose pipeline is
-        expensive or decision-dependent overrides this instead of paying
-        it twice — see M9.
+        BM25 search per query and no LLM call.
         """
         return self.retrieve(query, k=depth)
 
@@ -299,10 +297,7 @@ class BaseSystem(ABC):
         """PHASE A: retrieve, pack, assemble the prompt. No generation.
 
         Systems whose generation context differs materially from "the
-        retrieved chunks, packed" override THIS rather than answer() —
-        that keeps them batchable. M9 overrides it to run its corrective
-        loop and strip refinement; M9's rewrite is an LLM call, so its
-        phase A is not LLM-free, which is accepted and expected.
+        retrieved chunks, packed" override THIS rather than answer().
         """
         # Late import to break the retrievers/base <-> prompt_packing
         # circular (prompt_packing's tiktoken init touches no retriever
