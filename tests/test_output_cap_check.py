@@ -115,6 +115,24 @@ class TestTheMethod(unittest.TestCase):
         self._runner()._check_output_length("hi", "q1", 1)  # within 1*1.25+2
 
 
+class TestSpecialTokenLiterals(unittest.TestCase):
+    """tiktoken refuses special-token literals by default. A prompt keeps
+    that refusal (a corpus must not smuggle control tokens); an ANSWER
+    is data the reader emitted and must be counted, never crash a cell."""
+
+    def test_an_answer_carrying_a_special_literal_is_counted(self):
+        r = BenchmarkRunner(output_path=Path(tempfile.mkdtemp()) / "o.jsonl",
+                            verbose=False)
+        r._check_output_length("<|endoftext|> the answer", "q1", 512)
+
+    def test_the_prompt_counter_still_refuses_special_literals(self):
+        from src.prompt_packing import count_tokens
+
+        with self.assertRaises(ValueError):
+            count_tokens("<|endoftext|>")
+        self.assertGreater(count_tokens("<|endoftext|>", allow_special=True), 0)
+
+
 class TestThePipelineReadsTheCap(unittest.TestCase):
     def _run(self, cap: int):
         with tempfile.TemporaryDirectory() as td:

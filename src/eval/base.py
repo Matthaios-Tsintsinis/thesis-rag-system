@@ -136,7 +136,7 @@ class BenchmarkRunner:
         """
         from ..prompt_packing import count_tokens
 
-        n = count_tokens(answer)
+        n = count_tokens(answer, allow_special=True)
         if n > cap * 1.25 + 2:
             raise RuntimeError(
                 f"generation cap NOT APPLIED: query {query_id!r} returned "
