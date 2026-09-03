@@ -14,8 +14,8 @@ numpy>=2.1,<3                    # Floored at 2.1 to stay on the numpy 2.x ABI
 sentence-transformers>=3.0      # bge-m3 (M2/M3) and multi-qa-mpnet (M4) embedders
 faiss-cpu>=1.8                  # swap to faiss-gpu on CUDA hosts
 rank-bm25>=0.2.2                # M3's sparse leg
-tiktoken>=0.7                   # token counting: evidence blocks, the output-cap
-                                # check, and M4's ~100-token RAPTOR leaves
+tiktoken>=0.7                   # token counting: evidence blocks / prompts and
+                                # M4's ~100-token RAPTOR leaves
                                 # (encoding_for_model("gpt-4o-mini"))
 
 # --- M4 paper-faithful RAPTOR clustering (src/raptor_paper.py) ---

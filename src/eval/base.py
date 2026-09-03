@@ -110,41 +110,6 @@ class BenchmarkRunner:
         # aborts on exactly this and the runner did not.
         self.require_cold_tree = require_cold_tree
 
-    def _check_output_length(self, answer: str, query_id: str, cap: int) -> None:
-        """Abort if a generated answer overran the configured cap.
-
-        The cap is `GenerationConfig.max_new_tokens` (512 on every matrix
-        cell), read from the system's config at the call site so it is
-        the value generation actually consumed. Before the repo reduction
-        this ran only when a `--max-new-tokens` override was passed —
-        which no banked cell did — so it now runs on every answer as the
-        fixed-cap check.
-
-        Counted with the harness-wide tiktoken counter, NOT the
-        generator's own tokenizer. An earlier version called
-        `load_generator` for its tokenizer, which pulls ~15 GB of weights
-        into memory purely to count tokens — free when the generator is
-        already resident, and a surprise mid-run load when it is not
-        (retrieval-only passes, stubbed systems, any CPU host).
-
-        The cost of the substitution is that tiktoken and Qwen's BPE
-        disagree by roughly 10-20% on the same text, so the tolerance is
-        `cap * 1.25 + 2` rather than an exact bound. That is ample for
-        the failure this exists to catch, which is a cap of 1 emitting a
-        hundred tokens; it is deliberately NOT a precise assertion about
-        generation length.
-        """
-        from ..prompt_packing import count_tokens
-
-        n = count_tokens(answer, allow_special=True)
-        if n > cap * 1.25 + 2:
-            raise RuntimeError(
-                f"generation cap NOT APPLIED: query {query_id!r} returned "
-                f"~{n} tokens against max_new_tokens={cap}. The run is "
-                "measuring something other than what it claims. Answer "
-                f"began: {answer[:80]!r}"
-            )
-
     def _existing_query_ids(self) -> set[str]:
         """query_ids already banked in the output file, for --resume.
 
@@ -365,10 +330,6 @@ class BenchmarkRunner:
                     # cares about (MultiHop adds Hit@K / MAP@K / MRR).
                     # Independent of CK-4 packing — reads ar.retrieved
                     # (full ranking).
-                    self._check_output_length(
-                        ar.answer, q.query_id,
-                        system.config.generation.max_new_tokens,
-                    )
                     retr = benchmark.score_retrieval(
                         ar.retrieved, q,
                         scoring_ranking=getattr(

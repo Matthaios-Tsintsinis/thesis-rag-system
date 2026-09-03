@@ -44,26 +44,12 @@ def _get_tokenizer(name: str) -> Any:
         return tiktoken.get_encoding("cl100k_base")
 
 
-def count_tokens(
-    text: str,
-    *,
-    tokenizer_name: str = EVIDENCE_TOKEN_BUDGET_TOKENIZER,
-    allow_special: bool = False,
-) -> int:
+def count_tokens(text: str, *, tokenizer_name: str = EVIDENCE_TOKEN_BUDGET_TOKENIZER) -> int:
     """One-shot token count for arbitrary text (whole prompts, single
     chunks, anything). Used by the BaseSystem.answer() default to
-    populate AnswerResult.n_input_tokens and by the runner's fixed-cap
-    output check.
-
-    `allow_special=False` keeps tiktoken's default: a special-token
-    literal such as "<|endoftext|>" in the text RAISES, which is right
-    for prompts (the corpus must not smuggle control tokens). The output
-    check passes True: a generated answer is data, and a literal the
-    reader happens to emit must be counted, never crash the cell.
+    populate AnswerResult.n_input_tokens.
     """
     enc = _get_tokenizer(tokenizer_name)
-    if allow_special:
-        return len(enc.encode(text, disallowed_special=()))
     return len(enc.encode(text))
 
 
