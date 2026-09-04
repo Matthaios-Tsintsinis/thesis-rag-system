@@ -113,14 +113,16 @@ sequence.** The order is the result of an incident, not a preference:
 torch FIRST from the PyTorch CUDA-12.8 index at the lock's exact
 version (PyPI does not serve the `+cu128` build), then
 `requirements.txt` (the reduced import graph), then the lock's pins
-with the same index as an extra, then the uninstall line, then the
-gate. The uninstall line is PERMANENT by ruling: installing over a fresh
-environment once dragged a `torchvision` wheel in over the locked torch
-and broke `PreTrainedModel` AFTER the pin had printed OK (2026-08-24).
-torchvision, torchaudio and the docling family are in no lockfile line,
-so absence is the clean state; the line may become a comment only after
-a fresh-environment `pip check` proves the pruned `requirements.txt` no
-longer pulls them — not before. The gate must print
+with the same index as an extra, then `pip check`, then the gate. The
+commented uninstall line is the record of an incident: installing over
+a fresh environment once dragged a `torchvision` wheel in over the
+locked torch and broke `PreTrainedModel` AFTER the pin had printed OK
+(2026-08-24). torchvision, torchaudio and the docling family are in no
+lockfile line, so absence is the clean state. The line was retired on
+2026-09-04 by the ruled proof: the fresh-clone smoke on an L4 ran `pip
+check` BEFORE it and was clean — the reduced `requirements.txt` pulls
+none of them. Re-enable it only if `pip check` names one of those
+packages. The gate must print
 `[pin] lockfile_hash=17878bc8740173be`, `[pin] python=3.12.13 (locked
 3.12.13)`, `[pin] checked N pinned package(s)` and `[pin] OK —
 environment matches the lockfile.`; it screens `pip check` itself and
@@ -132,7 +134,9 @@ cp /content/drive/MyDrive/thesis_rag/requirements.lock requirements.lock
 /content/py312/bin/python -m pip install $(grep -E "^torch==" requirements.lock) --index-url https://download.pytorch.org/whl/cu128
 /content/py312/bin/python -m pip install -r requirements.txt
 /content/py312/bin/python -m pip install -r requirements.lock --extra-index-url https://download.pytorch.org/whl/cu128
-/content/py312/bin/python -m pip uninstall -y torchvision torchaudio docling-ibm-models docling docling-core docling-parse docling-slim
+/content/py312/bin/python -m pip check
+# retired 2026-09-04 (fresh-clone smoke: pip check clean before this line) -- re-enable only if pip check names one of these:
+# /content/py312/bin/python -m pip uninstall -y torchvision torchaudio docling-ibm-models docling docling-core docling-parse docling-slim
 /content/py312/bin/python -m scripts.pin_environment check --lockfile requirements.lock
 ```
 
@@ -238,7 +242,7 @@ md5sum /content/drive/MyDrive/thesis_rag/outputs/COMPARISON.csv
 
 Two further checks a stranger can run without the banks:
 
-- **CPU:** `python -m unittest discover -s tests -t .` is green (481
+- **CPU:** `python -m unittest discover -s tests -t .` is green (483
   tests; no GPU, no model — the suite fakes generation). The three CLIs
   print their reduced surfaces: `python -m src.eval.runner --help`
   (`--lockfile --system --benchmark --split --output --generator --resume`),
@@ -276,7 +280,7 @@ scripts/
   export_comparison.py   the one export: COMPARISON.csv / COMPARISON.md
   verify_provenance_citations.py   documentation tooling, off the output path: checks the disk-only
                          fidelity documents' citations against the tag
-tests/                   481 tests; python -m unittest discover -s tests -t .
+tests/                   483 tests; python -m unittest discover -s tests -t .
 requirements.txt         the reduced import graph (the lock on Drive is the version authority)
 ```
 
