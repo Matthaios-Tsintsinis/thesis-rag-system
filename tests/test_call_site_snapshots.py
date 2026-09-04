@@ -11,15 +11,22 @@ against 21.51 GB peak with ~0.5 GB free in a build.
 Every reading so far was taken BEFORE or AFTER a build. These snapshots
 fire immediately before `model.generate()`, inside the call that is slow.
 
-SCOPE. The snapshot helpers are torch-dependent, but their no-torch
-behaviour is itself the contract worth pinning: this host has no torch,
-and a helper that raised there would take the probe down instead of
-reporting what it could not see.
+SCOPE. The snapshot helpers are torch-dependent, and BOTH sides of that
+contract are pinned by stubbing torch rather than by relying on the host:
+without torch or CUDA the helper reports absence (None, never a raise
+that would take the probe down); with CUDA it reports the measured
+numbers. The first version asserted None against the REAL helper, which
+held only on the torch-less agent host and failed on the run host with
+`0.0 is not None` on an idle L4 (2026-09-04) — a test that encoded an
+accident of where it ran.
 """
 
 from __future__ import annotations
 
+import sys
+import types
 import unittest
+from unittest import mock
 
 from src.models import (
     GENERATE_CALLS,
@@ -31,15 +38,52 @@ from src.models import (
 )
 
 
+def _fake_torch(*, cuda_available: bool) -> types.SimpleNamespace:
+    """A torch stand-in exposing exactly what cuda_memory_snapshot reads."""
+    cuda = types.SimpleNamespace(
+        is_available=lambda: cuda_available,
+        memory_allocated=lambda: 3 * 2**30,
+        memory_reserved=lambda: 4 * 2**30,
+        mem_get_info=lambda: (18 * 2**30, 24 * 2**30),
+    )
+    return types.SimpleNamespace(cuda=cuda)
+
+
 class TestSnapshotsDegradeHonestly(unittest.TestCase):
-    """No torch, no CUDA: report absence, never fabricate a number."""
+    """Absence is reported, never fabricated; presence is measured.
+
+    Simulated on every host: `sys.modules["torch"] = None` makes
+    `import torch` raise (the agent host), a stub module with a CUDA
+    device stands in for the run host. Neither case depends on what the
+    machine running the suite actually has."""
 
     def test_memory_snapshot_reports_none_without_torch(self):
-        snap = cuda_memory_snapshot()
+        with mock.patch.dict(sys.modules, {"torch": None}):
+            snap = cuda_memory_snapshot()
         self.assertIsNone(snap["allocated_gb"])
         self.assertIsNone(snap["reserved_gb"])
         self.assertIsNone(snap["free_gb"])
         self.assertFalse(snap["cuda_available"])
+
+    def test_memory_snapshot_reports_none_with_torch_but_no_cuda(self):
+        with mock.patch.dict(sys.modules,
+                             {"torch": _fake_torch(cuda_available=False)}):
+            snap = cuda_memory_snapshot()
+        self.assertIsNone(snap["allocated_gb"])
+        self.assertFalse(snap["cuda_available"])
+
+    def test_memory_snapshot_reports_the_measured_numbers_with_cuda(self):
+        """The run-host case: an idle L4 reads 0.0 allocated, which is a
+        measurement, not an absence — the case the old test refused."""
+        with mock.patch.dict(sys.modules,
+                             {"torch": _fake_torch(cuda_available=True)}):
+            snap = cuda_memory_snapshot()
+        self.assertTrue(snap["cuda_available"])
+        self.assertEqual(snap["allocated_gb"], 3.0)
+        self.assertEqual(snap["reserved_gb"], 4.0)
+        self.assertEqual(snap["reserved_minus_allocated_gb"], 1.0)
+        self.assertEqual(snap["free_gb"], 18.0)
+        self.assertEqual(snap["total_gb"], 24.0)
 
     def test_memory_snapshot_still_has_every_key(self):
         """A missing key would read as a probe bug at 3 a.m. on Colab;
