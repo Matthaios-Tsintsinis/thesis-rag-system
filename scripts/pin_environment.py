@@ -1,22 +1,4 @@
-"""P9: write and verify the environment lockfile that M4's topology needs.
-
-WHY A LOCKFILE AT ALL. UMAP + GMM output is version-sensitive even when
-seeded, so an M4 tree is reproducible against a PINNED stack rather than
-absolutely. Without a lockfile "reproducible" is a claim nobody can
-check; with one it is a command.
-
-WHY THIS IS WRITTEN ON THE RUN HOST, NOT COMMITTED BY HAND. The stack
-that matters is the one the matrix runs on — Colab — and a lockfile
-transcribed from a developer laptop would pin the wrong versions with
-full confidence. `write` snapshots the environment it is executed in;
-`check` compares a later environment against that snapshot.
-
-THE ACCEPTANCE TEST IS OPERATOR-EXECUTED, not agent-verified: build a
-fresh environment from the lockfile, on the SAME GPU CLASS, and confirm
-one M4 unit's tree node count reproduces exactly. It cannot be run from a
-machine without the GPU, and it is recorded as an operator line for the
-same reason the tree-cache preflight is.
-
+"""Write and check the lockfile that pins the M4 topology stack.
     python -m scripts.pin_environment write --out requirements.lock
     python -m scripts.pin_environment check --lockfile requirements.lock
 """
@@ -30,10 +12,8 @@ import sys
 from pathlib import Path
 
 
-# Pinned exactly, because they determine M4 tree topology or the numbers
-# that flow from it. A drift here invalidates trees; a drift elsewhere
-# does not, which is why the cold-tree cache lever keys on the first
-# three of these rather than on the whole file.
+# Packages pinned exactly: they decide M4 tree topology or the numbers
+# that follow from it. The M4 substrate cache key folds the first three.
 TOPOLOGY_CRITICAL = (
     "umap-learn",
     "scikit-learn",
@@ -54,6 +34,7 @@ TOPOLOGY_CRITICAL = (
 
 
 def _installed() -> dict[str, str]:
+    """Map every installed distribution's lower-cased name to its version."""
     from importlib.metadata import distributions
 
     out: dict[str, str] = {}
@@ -65,8 +46,7 @@ def _installed() -> dict[str, str]:
 
 
 def lockfile_hash(text: str) -> str:
-    """Hash of the REQUIREMENT LINES only, so a comment or a reordering
-    does not read as an environment change."""
+    """Hash the requirement lines only, so comments and order do not count."""
     lines = sorted(
         ln.strip() for ln in text.splitlines()
         if ln.strip() and not ln.strip().startswith("#")
@@ -75,9 +55,7 @@ def lockfile_hash(text: str) -> str:
 
 
 def gpu_model() -> str:
-    """The GPU string, recorded because the reproducibility target is
-    same-lockfile-SAME-GPU-CLASS. A tree that reproduces on an L4 is not
-    thereby claimed to reproduce on an A100."""
+    """Name the GPU; a tree reproduces on the same lockfile and GPU class."""
     try:
         import torch
 
@@ -89,6 +67,7 @@ def gpu_model() -> str:
 
 
 def write_lockfile(out: Path) -> int:
+    """Snapshot this environment's pinned packages into a lockfile."""
     installed = _installed()
     lines = [
         "# Environment lock for the thesis RAG matrix.",
@@ -99,6 +78,7 @@ def write_lockfile(out: Path) -> int:
         f"# python={sys.version.split()[0]}",
         "",
     ]
+    # One requirement line per pinned package; absent ones go in a trailer.
     missing: list[str] = []
     for pkg in TOPOLOGY_CRITICAL:
         version = installed.get(pkg)
@@ -123,23 +103,9 @@ def write_lockfile(out: Path) -> int:
 
 
 def locked_python(text: str) -> str | None:
-    """The interpreter version `write_lockfile` recorded, or None.
-
-    IT WAS ALWAYS IN THE FILE. `write_lockfile` has always emitted
-    `# python=3.12.13`, and NOTHING EVER READ IT: `lockfile_hash` strips
-    comments by design (so a comment cannot read as an environment
-    change) and `check_lockfile` skipped every line starting with `#`.
-    A value that was written correctly and consumed by nothing — the
-    fourteenth instance of this project's recurring defect, and the one
-    that let cells 1-5 run on CPython 3.12.13 and cell 6 on 3.13.15 with
-    the pin reporting OK both times.
-
-    Parsed from the comment RATHER THAN promoted to a requirement line,
-    deliberately: a `python==3.12.13` line would enter `lockfile_hash`
-    and move it off `17878bc8740173be`, firing the environment gate on
-    every remaining cell and orphaning the hash recorded in six banked
-    summaries. The data is already on disk; only the reader was missing.
-    """
+    """Read the interpreter version from the lockfile's python= comment."""
+    # The version lives in a comment, not a requirement line, so it does
+    # not enter lockfile_hash.
     for line in text.splitlines():
         line = line.strip()
         if line.startswith("#") and "python=" in line:
@@ -148,23 +114,10 @@ def locked_python(text: str) -> str | None:
 
 
 def _pip_check_conflicts() -> list[str]:
-    """`pip check` conflict lines for THIS interpreter, [] when clean.
-
-    Why this exists: torchvision 0.28.0 was installed against torch
-    2.13.0, torch was then downgraded to the locked 2.11.0+cu128
-    underneath it, and its C++ extension could no longer register
-    `torchvision::nms` — transformers imports torchvision through
-    `image_utils` when present, so `PreTrainedModel` failed and the
-    embedder never loaded. torchvision is not in the lockfile, so
-    `[pin] OK` printed over an environment pip itself knew was broken.
-    Pip HAD warned at install time; nothing enforced. One subprocess
-    closes the class.
-
-    A failure to RUN pip check degrades to a warning, never a crash —
-    this is a gate's helper, and a helper that can take the gate down
-    with it is a second defect."""
+    """Return pip check's conflict lines for this interpreter, [] if clean."""
     import subprocess
 
+    # A pip check that cannot run degrades to a warning, never a crash.
     try:
         out = subprocess.run(
             [sys.executable, "-m", "pip", "check"],
@@ -180,45 +133,27 @@ def _pip_check_conflicts() -> list[str]:
 
 
 def _canon(name: str) -> str:
-    """PEP 503-ish canonical form: case and -/_ are not identity."""
+    """Fold case and -/_ so two spellings of one package name compare equal."""
     return name.strip().lower().replace("_", "-")
 
 
 def _line_package_tokens(line: str) -> set[str]:
-    """Candidate package names in a pip-check line, as WHOLE tokens.
-
-    Tokens must start with a letter (versions like 3.14.0 drop out) and
-    may carry the characters package names carry. English words in the
-    line ("requires", "installed") ride along harmlessly — they collide
-    with no locked name."""
+    """Collect whole tokens in a pip-check line that could name a package."""
     import re
 
+    # Tokens start with a letter, so bare versions drop out; English words
+    # ride along and collide with no locked name.
     return {_canon(t) for t in re.findall(r"[A-Za-z][A-Za-z0-9._-]*", line)}
 
 
 def classify_conflicts(
     conflicts: list[str], locked_names: list[str]
 ) -> tuple[list[str], list[str]]:
-    """Split pip-check conflict lines into (failing, warn-only).
-
-    A conflict FAILS the pin when it names a LOCKED package — pip is then
-    reporting that a package the lock vouches for has a violated
-    contract, and printing OK over that is a gate reporting success
-    incorrectly. A conflict among packages the lock never mentions is
-    printed as a warning only: the run host's system python routinely
-    carries preinstalled-package conflicts that touch nothing the matrix
-    uses, and a gate that fails on those blocks cells for noise.
-
-    MATCHING IS BY WHOLE PACKAGE TOKEN, NOT SUBSTRING — the first
-    version used substring matching and misclassified
-    "docling-ibm-models ... requires torchvision, which is not
-    installed." as FAILING, because locked "torch" is a substring of
-    "torchvision". Neither named package was in the lock; under the
-    stated rule that line is a WARNING. The same substring defect was
-    latent in the other direction: locked "transformers" would have
-    matched every "sentence-transformers" line. Tokens are compared
-    canonicalised (case and -/_ folded), so "rank_bm25" matches locked
-    "rank-bm25" while "torchvision" no longer matches "torch"."""
+    """Split pip-check lines into (naming a locked package, warn-only)."""
+    # Match on whole canonical tokens, not substrings: "torchvision" must
+    # not match locked "torch", and "rank_bm25" must match "rank-bm25".
+    # A conflict that names no locked package is noise from the host's
+    # preinstalled packages and only warns.
     failing: list[str] = []
     warn: list[str] = []
     names = {_canon(n) for n in locked_names}
@@ -231,11 +166,13 @@ def classify_conflicts(
 
 
 def check_lockfile(lockfile: Path) -> int:
+    """Compare this environment to a lockfile; 0 on match, 1 on mismatch."""
     text = lockfile.read_text(encoding="utf-8")
     installed = _installed()
     mismatches: list[str] = []
     checked = 0
     locked_names: list[str] = []
+    # Every requirement line must be installed at exactly the locked version.
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "==" not in line:
@@ -249,12 +186,9 @@ def check_lockfile(lockfile: Path) -> int:
         elif have != want:
             mismatches.append(f"{pkg}: locked {want}, installed {have}")
 
-    # THE INTERPRETER IS A PINNED INPUT. Identical package VERSIONS do
-    # not mean identical package CODE: cp312 and cp313 install different
-    # compiled wheels for numpy, numba, llvmlite and torch, and UMAP's
-    # JIT-compiled paths are exactly where a float can move in its last
-    # digits and flip a GMM argmax on a near-tie. Counted with the
-    # packages so `checked N pinned` is honest about what was checked.
+    # The interpreter is a pinned input too: cp312 and cp313 install
+    # different compiled wheels, and UMAP's JIT paths can move a float's
+    # last digits and flip a GMM argmax. It counts toward `checked`.
     want_py = locked_python(text)
     have_py = sys.version.split()[0]
     if want_py is None:
@@ -268,9 +202,8 @@ def check_lockfile(lockfile: Path) -> int:
                 "(different compiled wheels; M4 topology is not claimed "
                 "to reproduce across interpreters)")
 
-    # THE RESOLVER'S OWN VERDICT, screened after the version loop so the
-    # locked-name list is complete. See _pip_check_conflicts for the
-    # torchvision incident this exists because of.
+    # Screen pip check after the version loop so the locked-name list is
+    # complete; a conflict naming a locked package fails the pin.
     failing, warn_only = classify_conflicts(_pip_check_conflicts(),
                                             locked_names)
     for line in failing:
@@ -278,6 +211,7 @@ def check_lockfile(lockfile: Path) -> int:
     for line in warn_only:
         print(f"[pin] WARN (pip check, unlocked packages): {line}")
 
+    # Report, then fail on any mismatch.
     print(f"[pin] lockfile_hash={lockfile_hash(text)}")
     print(f"[pin] python={have_py} (locked {want_py or 'UNRECORDED'})")
     print(f"[pin] gpu={gpu_model()}")
@@ -294,6 +228,7 @@ def check_lockfile(lockfile: Path) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Dispatch the write, check and json subcommands."""
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -316,22 +251,13 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def environment_provenance(lockfile: Path | None = None) -> dict:
-    """The block every run summary carries.
-
-    Recorded per CELL rather than per session: a matrix assembled from
-    several sessions must be able to say which environment produced which
-    row, and a session-level note cannot.
-    """
+    """Build the environment block every cell summary carries."""
+    # Hash the lockfile when present; warn loudly when it is not, because
+    # a null hash leaves the cell with no record of its environment.
     lock_hash = None
     if lockfile is not None and Path(lockfile).exists():
         lock_hash = lockfile_hash(Path(lockfile).read_text(encoding="utf-8"))
     else:
-        # LOUD, because a null hash is not a missing nicety: it means this
-        # cell's summary records NOTHING about the environment that
-        # produced it, and M4's substrate key folds three of those
-        # versions. Every probe run in the 2026-08-16 cost investigation
-        # carried lockfile_hash: null and nobody noticed, because it was
-        # written in silence.
         print(
             f"[pin] WARNING: lockfile_hash=null — no lockfile at "
             f"{lockfile!r}. This run's provenance records NO environment "
@@ -342,11 +268,7 @@ def environment_provenance(lockfile: Path | None = None) -> dict:
     return {
         "lockfile_hash": lock_hash,
         "gpu": gpu_model(),
-        # RECORDED so it cannot go inert unnoticed again. This setting was
-        # correct, was applied on the generation path only, and was
-        # therefore read after the embedder had already initialised the
-        # allocator — instance eleven. A value that is set and never
-        # asserted is not a check.
+        # Recorded so the allocator setting the run started under is visible.
         "cuda_alloc_conf": __import__("os").environ.get(
             "PYTORCH_CUDA_ALLOC_CONF"),
         "python": sys.version.split()[0],

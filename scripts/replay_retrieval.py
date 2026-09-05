@@ -1,79 +1,6 @@
-"""Retrieval replay: bank the depth-50 document rankings, gated, forever.
-
-WHY. The depth-50 scoring ranking was consumed at run time (hit@K /
-MAP@K / MRR) and never written to any row, so recall@5 was not
-derivable post-hoc. This tool re-runs RETRIEVAL ONLY over the warm
-substrates for the 18 ranked cells (M2/M3/M4 x MultiHop / HotpotQA /
-pooled x both generators), writes each cell's per-row document ranking
-to a SIDECAR beside the banked cell (`rankings.<stem>.jsonl` +
-`rankings.<stem>.json`; the banked JSONL is never opened for writing),
-and computes recall@{1,5,10}. THE SIDECAR NAMES ARE GLOB-SAFE BY
-AUDIT: they begin with `rankings.` and end without `.summary.json`, so
-they match NONE of the bank's discovery patterns -- not the bank
-gates' `*.summary.json` (runner.py) and not the `{bench}_{sys}_*.jsonl`
-globs the analysis tools used at the tag. A
-`<stem>.rankings.summary.json` name would have been swept into the
-bank-gate population; found and renamed in the pre-flight audit. Once the sidecars exist, recall
-at any K is derivable forever and this replay never needs repeating.
-
-THE GATE — the new artifact earns trust by re-deriving the old one
-(the R6 discipline). Per row, exactly, never on average:
-
-  1. the replayed retrieval is scored through the FROZEN
-     `benchmark.score_retrieval` and must reproduce the banked
-     set-F1/recall/precision AND the banked hit_at_k, map_at_k and mrr
-     bit-for-bit (JSON round-trips float64 exactly);
-  2. the sidecar's collapsed document ranking must itself re-derive the
-     scorer's hit@K and MRR per row, binding recall to the very ranking
-     that reproduced the bank.
-
-Any row disagreeing REFUSES the cell and names the row. A refused cell
-writes no sidecar.
-
-READ-ONLY, GUARANTEED BY CONSTRUCTION, three mechanisms:
-  * every unit is probed with `substrate_warm_path` (itself read-only:
-    key computation + completeness check, no embedding, no clustering)
-    BEFORE `index_items`; a MISS refuses the cell -- the build path is
-    never reachable, so no substrate can be written;
-  * for M4, `tree_cache_hit` must be True after the load (the inverse
-    of the run-time cold-tree gate): a replay that built anything is a
-    defect and refuses;
-  * no generation path is touched -- `prepare()` is Phase A by design
-    (retrieve + rank + pack, no LLM), and the generator cache is
-    asserted EMPTY after every cell (`load_generator.cache_info()`).
-
-EXPECTED BOUNDS, asserted per cell (a violation is a bug, never a
-finding): per-row recall@5 <= hit@5, so mean recall@5 <= mean hit@5
-everywhere; on HotpotQA (exactly two gold titles per question) a hit
-implies recall >= 1/2, so mean recall@5 sits in [hit@5 / 2, hit@5].
-
-HARDWARE. Run on the SAME GPU class as the bank (L4). Not for speed --
-~9,500 query encodings are minutes either way -- but for the GATE:
-query embeddings recomputed under a different BLAS (CPU) differ at
-epsilon, and the measured near-tie channel (living record §5c, the
-9-row classification) would flip knife-edge rankings and refuse rows
-that are not wrong. Same wheel + same hardware class reproduces
-bit-exact (the M1 identity and the re-diff demonstrated it end to end).
-
-Run-host invocation (all 18 cells; ~an hour class, M4 tree I/O
-dominating):
-
-    python -m scripts.replay_retrieval \\
-      --p10 /content/drive/MyDrive/thesis_rag/outputs/p10 \\
-      --p11 /content/drive/MyDrive/thesis_rag/outputs/p11
-
-An existing sidecar means DONE only after it is VERIFIED: the summary
-must name this cell, the rows file must parse and hold exactly the
-summary's n_rows, and where the summary embeds rows_sha256 (written by
-this tool since the reduction) the rows file must hash to it. A verified
-cell is named on one printed line and never rewritten, so an
-interrupted session resumes by re-running the same command and a
-complete bank is a no-op that prints eighteen verified lines; any
-disagreement REFUSES the run and names the file. To regenerate one cell
-deliberately, delete its two sidecar files by hand first. All 18 ranked
-cells are visited in one invocation (the per-cell selector, the
-overwrite flag and the key dry-run left in the repo reduction).
-"""
+"""Replay retrieval over the warm substrates of the 18 ranked cells, check
+every row against the banked scores, and write a rankings sidecar with
+recall@{1,5,10} beside each cell. Run it on the bank's GPU class (L4)."""
 
 from __future__ import annotations
 
@@ -89,19 +16,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.export_comparison import LLAMA, QWEN, _fail, _generating_commit
 
+# NarrativeQA is left out: it has no retrieval gold to rank against.
+# dataset: no passage annotation, retrieval never scored
 RANKED_BENCHMARKS = ("multihop_rag", "hotpotqa", "hotpotqa_pooled")
 RANKED_SYSTEMS = ("M2", "M3", "M4")
 RECALL_KS = (1, 5, 10)
+# harness choice: one scoring depth for every system (METHODS §D)
 DOC_RANKING_DEPTH = 50
 
 
 def collapse_to_doc_ranking(retrieved) -> list[tuple[str, str]]:
-    """First-occurrence document collapse — a verbatim mirror of the
-    frozen scorer's own collapse (`score_retrieval_rank_aware`,
-    src/eval/alignment.py). Two guarantees keep this copy honest: the
-    oracle test re-derives the scorer's outputs through it on shared
-    fixtures, and at replay time every row's hit@K/MRR are re-derived
-    from THIS collapse and asserted equal to the scorer's."""
+    """Collapse retrieved chunks to a first-occurrence document ranking."""
+    # Mirrors score_retrieval_rank_aware in src/eval/alignment.py; each
+    # replayed row checks that both collapses give the same hit@K and MRR.
+    # harness choice: document-level metrics (METHODS §C.5)
     doc_ranking: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
     for r in retrieved:
@@ -118,8 +46,9 @@ def collapse_to_doc_ranking(retrieved) -> list[tuple[str, str]]:
 
 
 def rank_stats_from_ranking(doc_ranking, gold, k_values) -> dict:
-    """hit@K / MRR / recall@K from a collapsed doc ranking + gold set."""
+    """Compute hit@K, MRR and recall@K from a doc ranking and its gold set."""
     relevance = [d in gold for d in doc_ranking]
+    # MRR is 1/rank of the first gold document, 0 when none appears.
     mrr = 0.0
     for i, rel in enumerate(relevance):
         if rel:
@@ -127,6 +56,7 @@ def rank_stats_from_ranking(doc_ranking, gold, k_values) -> dict:
             break
     out = {"mrr": mrr, "hit_at_k": {}, "recall_at_k": {}}
     n_gold = len(gold)
+    # hit@K is any gold in the top K; recall@K is gold found over gold total.
     for k in k_values:
         top = relevance[:k]
         out["hit_at_k"][k] = 1.0 if any(top) else 0.0
@@ -135,18 +65,21 @@ def rank_stats_from_ranking(doc_ranking, gold, k_values) -> dict:
 
 
 def gold_and_ranked(benchmark_name: str, q, scoring_ranking):
-    """Per-benchmark (gold document set, projected ranking) — using the
-    benchmark's OWN projection, never a reimplementation."""
+    """Return gold documents and the ranking in the benchmark's own units."""
     atoms = q.gold_passage_sets[0] if q.gold_passage_sets else frozenset()
+    # MultiHop's unit is the whole document, so its atoms are already docs.
+    # deviation from official (retrieval_evaluate.py matches gold-fact substrings): see METHODS §B.1
     if benchmark_name == "multihop_rag":
         return frozenset(atoms), scoring_ranking
-    # HotpotQA family: document = title; project exactly as the scorer does
+    # HotpotQA family: the document is the title; project as the scorer does.
+    # harness choice: supporting facts are (title, sentence) pairs (METHODS §B.3)
     from src.eval.hotpotqa import _TITLE_SPAN, _project_to_titles
     gold = frozenset((t, _TITLE_SPAN) for t, _ in atoms)
     return gold, _project_to_titles(list(scoring_ranking))
 
 
 def _parse_env(env: str) -> dict[str, str]:
+    """Parse a 'pkg=version;pkg=version' env string into a dict."""
     out = {}
     for part in (env or "").split(";"):
         if "=" in part:
@@ -156,21 +89,24 @@ def _parse_env(env: str) -> dict[str, str]:
 
 
 def _floats_equal(a, b) -> bool:
+    """Compare two values as float64, exactly."""
     return float(a) == float(b)
 
 
 def _norm_kdict(d) -> dict[int, float]:
+    """Normalise a per-K dict to int keys and float values."""
     return {int(k): float(v) for k, v in (d or {}).items()}
 
 
 def compare_row(banked_retr: dict, replayed) -> list[str]:
-    """Field-by-field banked-vs-replayed comparison; returns mismatch
-    descriptions (empty = row reproduces)."""
+    """Compare a banked retrieval row to its replay; return the mismatches."""
     bad = []
+    # The skipped flag must agree; a skipped row has nothing else to compare.
     if bool(banked_retr.get("skipped")) != bool(replayed.skipped):
         return [f"skipped {banked_retr.get('skipped')} vs {replayed.skipped}"]
     if banked_retr.get("skipped"):
         return []
+    # Set metrics, MRR and the per-K dicts must match float-exact.
     for f in ("f1", "recall", "precision"):
         if not _floats_equal(banked_retr.get(f, 0.0), getattr(replayed, f)):
             bad.append(f"set {f} {banked_retr.get(f)} vs {getattr(replayed, f)}")
@@ -185,6 +121,7 @@ def compare_row(banked_retr: dict, replayed) -> list[str]:
 
 
 def _load_banked_rows(jpath: Path) -> dict[str, dict]:
+    """Load a banked JSONL into a dict keyed by query_id."""
     rows = {}
     with jpath.open(encoding="utf-8") as f:
         for line in f:
@@ -196,26 +133,11 @@ def _load_banked_rows(jpath: Path) -> dict[str, dict]:
 
 
 def assemble_cdir(system, system_id: str, corpus_hash: str):
-    """(cdir, required_files, inputs) via the SYSTEM'S OWN index-path
-    key assembly -- pinned to the banked keys by the manifest-oracle
-    tests (M2 reproduces 51a2e3f9..., M4 reproduces cc068144... from
-    the recorded corpus hashes).
-
-    WHY THIS EXISTS (the three-refusal session, 2026-08-31):
-    `BaseSystem.substrate_warm_path` defaults to an UNCONDITIONAL None
-    meaning "this system has no probe" -- its own docstring warns None
-    must not be read as checked-and-cold -- and the first replay read
-    exactly that None as a cache miss and refused the most-proven
-    substrate in the project. Only M4 overrides the probe. So the
-    replay now assembles M2/M3 keys EXACTLY as their index() does
-    (M2: no extra; M3: the sparse/fusion/rrf_k extra) and uses M4's
-    own override-aware `_cache_dir`. The key function is pure given
-    (chunking config, embedder, corpus_hash, extra), which is what lets
-    the key oracles in tests/test_key_oracles.py feed a recorded corpus
-    hash directly."""
+    """Build the substrate cache dir with the system's own key assembly."""
     from src import paths as _paths
     from src.cache import CacheDir, compute_cache_key
 
+    # M4 owns its key through _cache_dir, which honours the env override.
     if system_id == "M4":
         from src.retrievers.m4_raptor import (
             REQUIRED_FILES as M4_REQ,
@@ -233,6 +155,9 @@ def assemble_cdir(system, system_id: str, corpus_hash: str):
         }
         return cdir, M4_REQ, inputs
 
+    # M2 and M3 assemble their keys exactly as their index() does: M2 folds
+    # no extra, M3 folds its sparse/fusion/rrf_k extra.
+    # harness choice: content-addressed substrates (METHODS §D)
     from dataclasses import asdict
     from src.components import resolve_components
     res = resolve_components(None, system.config)
@@ -255,16 +180,16 @@ def assemble_cdir(system, system_id: str, corpus_hash: str):
 
 
 def resolve_substrate(system, system_id: str, items):
-    """(warm_dir_or_None, corpus_hash, expected_dir) for one unit --
-    read-only: corpus layout into a TemporaryDirectory, hash, the
-    system's own key assembly, completeness check. Never builds."""
+    """Find a unit's warm substrate without building; None when incomplete."""
     import tempfile
     from src.cache import corpus_content_hash
 
+    # Lay the corpus out in a temp dir only to hash it.
     with tempfile.TemporaryDirectory(prefix="replay_warm_") as td:
         tdp = Path(td)
         system._write_corpus_layout(list(items), tdp)
         chash = corpus_content_hash(tdp)
+    # Warm means every required file is present under the expected dir.
     cdir, req, _ = assemble_cdir(system, system_id, chash)
     expected = Path(str(cdir.manifest_path)).parent
     warm = expected if cdir.is_complete(req) else None
@@ -272,6 +197,7 @@ def resolve_substrate(system, system_id: str, items):
 
 
 def _assert_generator_never_loaded() -> None:
+    """Refuse if a generator is loaded; the replay never generates."""
     from src.models import load_generator
     info = load_generator.cache_info()
     if info.currsize != 0:
@@ -281,23 +207,15 @@ def _assert_generator_never_loaded() -> None:
 
 
 def _rows_sha256(path: Path) -> str:
+    """Return the sha256 hex digest of a file's bytes."""
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _verify_present_sidecar(stem: str, generator: str, benchmark_name: str,
                             system_id: str, side_rows: Path,
                             side_sum: Path) -> None:
-    """A present sidecar is DONE only if it is this cell's own and intact.
-
-    Verified, never assumed: the summary exists and names this cell
-    (generator / benchmark / system); the rows file parses, every row
-    carries query_id and recall_at_k, and the count equals the summary's
-    n_rows; where the summary embeds rows_sha256 (written since the
-    reduction) the rows file hashes to it. Sidecars written before that
-    field existed are verified by identity and count and the printed
-    line says so. Any disagreement REFUSES: a corrupt or foreign sidecar
-    must not pass as done.
-    """
+    """Refuse unless a present sidecar is this cell's own and intact."""
+    # The summary must exist, parse, and name this cell.
     if not side_sum.is_file():
         _fail(f"{stem}: {side_rows.name} is present but {side_sum.name} is "
               "missing -- a half-written sidecar; delete the rows file by "
@@ -312,6 +230,7 @@ def _verify_present_sidecar(stem: str, generator: str, benchmark_name: str,
         _fail(f"{stem}: {side_sum.name} names {ident}, not this cell "
               f"({generator!r}, {benchmark_name!r}, {system_id!r}) -- a "
               "foreign sidecar; delete both files by hand and re-run")
+    # Every row must parse and carry query_id and recall_at_k.
     n = 0
     with side_rows.open(encoding="utf-8") as f:
         for line in f:
@@ -329,6 +248,8 @@ def _verify_present_sidecar(stem: str, generator: str, benchmark_name: str,
                       "query_id / recall_at_k; delete both sidecar files by "
                       "hand and re-run")
             n += 1
+    # The row count, and the rows hash when the summary embeds one, must
+    # match the summary.
     if n != int(meta.get("n_rows", -1)):
         _fail(f"{stem}: {side_rows.name} holds {n} rows but {side_sum.name} "
               f"records n_rows={meta.get('n_rows')}; delete both sidecar "
@@ -352,11 +273,12 @@ def _verify_present_sidecar(stem: str, generator: str, benchmark_name: str,
 
 def replay_cell(bank: Path, generator: str, benchmark_name: str,
                 system_id: str) -> dict | None:
-    """Replay one cell behind the per-row gate; None when its sidecar
-    already exists and verifies (present = done, nothing touched)."""
+    """Replay one cell behind the row gate; None if its sidecar verifies."""
     from src.config import DEFAULT_CONFIG
     from src.eval.runner import BENCHMARK_REGISTRY, SYSTEM_REGISTRY
 
+    # A verified sidecar means the cell is done; a partial or foreign bank
+    # refuses. Sidecar names start with "rankings." so no bank glob sees them.
     stem = f"{benchmark_name}_{system_id}_validation"
     spath = bank / f"{stem}.summary.json"
     jpath = bank / f"{stem}.jsonl"
@@ -376,20 +298,11 @@ def replay_cell(bank: Path, generator: str, benchmark_name: str,
               f"{generator!r}")
     banked = _load_banked_rows(jpath)
 
-    # KEY IDENTITY, scoped per system (corrected after the first-run
-    # refusal). M2/M3 keys carry NO topology component -- their
-    # substrates warm-hit across eras BY DESIGN (the six bit-identity
-    # proofs), so for them the recorded tree_build_env is informational
-    # and key identity IS the warm probe (chunker + embedder + corpus
-    # all fold into compute_cache_key). M4's key DOES fold the env, and
-    # three P10 cells predate the python token, so string equality is
-    # wrong even in principle: instead (i) assert the HOST is
-    # COMPATIBLE with the banked tree -- identical umap/sklearn/numpy
-    # versions, and the summary's python major.minor equal to the
-    # host's -- then (ii) reconstruct the banked key by injecting the
-    # RECORDED env string verbatim (token-less stays token-less) via
-    # the replay-only topology_env_override lever, which the runner
-    # never sets and which is byte-identical to the old key when None.
+    # Key identity per system. M2/M3 keys fold no topology component, so
+    # the warm check alone identifies them. M4's key folds the tree-build
+    # env, so first check the host runs the banked umap/sklearn/numpy and
+    # python major.minor, then inject the recorded env string verbatim
+    # through topology_env_override so the key rebuilds the banked one.
     env_override = None
     if system_id == "M4":
         banked_env = summary.get("tree_build_env")
@@ -418,6 +331,7 @@ def replay_cell(bank: Path, generator: str, benchmark_name: str,
                   f"host {host['python']}")
         env_override = banked_env
 
+    # Build the system for this bank's generator; M4 also summarises with it.
     cfg = replace(
         DEFAULT_CONFIG,
         generation=replace(DEFAULT_CONFIG.generation, model=generator),
@@ -435,6 +349,8 @@ def replay_cell(bank: Path, generator: str, benchmark_name: str,
     recall_sums = {k: 0.0 for k in RECALL_KS}
     hit5_sum = 0.0
 
+    # Per unit: check the substrate is warm ahead of index_items so the
+    # build path is never reachable, then replay every query against the bank.
     n_units = 0
     for unit in benchmark.iter_eval_units(split="validation"):
         warm, chash, expected = resolve_substrate(
@@ -444,8 +360,8 @@ def replay_cell(bank: Path, generator: str, benchmark_name: str,
                   f"substrate at the expected directory {expected} -- a "
                   "replay must never build; refusing before the build "
                   "path is reachable")
-        # KEY IDENTITY SEEN, NOT INFERRED: the resolved directory's own
-        # manifest must record the corpus hash this replay derived.
+        # The resolved directory's manifest must record the corpus hash
+        # this replay derived.
         mpath = warm / "manifest.json"
         if mpath.is_file():
             man = json.loads(mpath.read_text(encoding="utf-8"))
@@ -461,6 +377,7 @@ def replay_cell(bank: Path, generator: str, benchmark_name: str,
         if n_units <= 3:
             print(f"[replay] {stem}: unit {unit.corpus_id} substrate "
                   f"{warm.name} (manifest corpus_hash verified)")
+        # M4 must load a warm tree; a build of any kind refuses the cell.
         system.index_items(list(unit.corpus))
         if system_id == "M4" and getattr(system, "tree_cache_hit", None) is not True:
             _fail(f"{stem}: unit {unit.corpus_id!r} loaded without a warm "
@@ -470,6 +387,8 @@ def replay_cell(bank: Path, generator: str, benchmark_name: str,
             row = banked.get(str(q.query_id))
             if row is None:
                 _fail(f"{stem}: banked row missing for {q.query_id!r}")
+            # prepare() retrieves, ranks and packs without an LLM; score it
+            # through the frozen scorer and compare to the banked row.
             prepared = system.prepare(q.question_text)
             replayed = benchmark.score_retrieval(
                 prepared.retrieved, q,
@@ -482,6 +401,8 @@ def replay_cell(bank: Path, generator: str, benchmark_name: str,
                 continue
             if replayed.skipped:
                 continue
+            # The sidecar's own collapse must re-derive the scorer's hit@K
+            # and MRR before its recall@K counts.
             gold, ranked = gold_and_ranked(benchmark_name, q,
                                            prepared.scoring_ranking)
             doc_ranking = collapse_to_doc_ranking(ranked)
@@ -516,6 +437,8 @@ def replay_cell(bank: Path, generator: str, benchmark_name: str,
               "reproduce the bank on these rows (first "
               f"{len(mismatches)}):\n  " + "\n  ".join(mismatches))
 
+    # MultiHop ranks only its answerable rows; the others rank every
+    # scored query.
     expected = (int(summary["n_answerable"])
                 if benchmark_name == "multihop_rag"
                 else int(summary["n_queries_scored"]))
@@ -523,6 +446,8 @@ def replay_cell(bank: Path, generator: str, benchmark_name: str,
         _fail(f"{stem}: rank-scored population {n_rank} != expected "
               f"{expected}")
 
+    # Bounds: recall@5 <= hit@5 always; with two gold titles per question
+    # a hit gives recall >= 1/2, so recall@5 >= hit@5 / 2 on HotpotQA.
     recall = {k: recall_sums[k] / n_rank for k in RECALL_KS}
     hit5 = hit5_sum / n_rank
     if recall[5] > hit5 + 1e-12:
@@ -532,14 +457,14 @@ def replay_cell(bank: Path, generator: str, benchmark_name: str,
         _fail(f"{stem}: recall@5 {recall[5]} < hit@5/2 {hit5 / 2} on a "
               "two-gold benchmark -- impossible; a bug, not a finding")
 
+    # Write the rows first, then the summary with the rows hash embedded so
+    # a later run can verify the rows file instead of trusting it.
     with side_rows.open("w", encoding="utf-8", newline="\n") as f:
         for r in out_rows:
             f.write(json.dumps(r, ensure_ascii=False) + "\n")
     side_summary = {
         "generator": generator, "benchmark": benchmark_name,
         "system": system_id, "n_rows": n_rank,
-        # Embedded so a present sidecar is verified, not trusted: the
-        # rows file must hash to this on every later invocation.
         "rows_sha256": _rows_sha256(side_rows),
         "recall_at_1": recall[1], "recall_at_5": recall[5],
         "recall_at_10": recall[10],
@@ -561,10 +486,12 @@ def replay_cell(bank: Path, generator: str, benchmark_name: str,
 
 
 def main() -> None:
+    """Visit all 18 ranked cells of both banks in one invocation."""
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--p10", required=True)
     ap.add_argument("--p11", required=True)
     args = ap.parse_args()
+    # Both banks, three ranked benchmarks, three ranked systems.
     banks = {"p10": (QWEN, Path(args.p10)), "p11": (LLAMA, Path(args.p11))}
     targets = []
     for tag in ("p10", "p11"):

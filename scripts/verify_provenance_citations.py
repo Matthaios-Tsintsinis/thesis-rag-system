@@ -1,53 +1,6 @@
-"""Verify every `path:line` citation in docs/PROVENANCE_TABLE.md and
-docs/METHODS_AND_FIDELITY.md AGAINST THE PINNED TAG'S TREE.
-
-DOCUMENTATION TOOLING, OFF THE OUTPUT PATH — kept in the reduced tree as
-an explicit exemption (ruled 2026-09-03): nothing that runs a cell, the
-replay or the export imports it; it exists so the disk-only fidelity
-documents stay honest against the tag they cite.
-
-WHY THIS EXISTS, and why it is stricter than "does the line number exist".
-The living fidelity record cites our code as `path:line`. The first checker
-only tested that each line number was in range - and a three-line edit
-near the top of `raptor_paper.py` shifted every citation below it by +3
-while that checker kept passing, because line 488 still held SOME text. A
-check that cannot fail for the right reason has not passed; this is the
-project's recurring lesson applied to its own tooling.
-
-Two layers of verification:
-
-1. RANGE + CONTENT PRINT. Every citation must resolve to a real line, and
-   the line is PRINTED so the final check is a human reading it. The number
-   is verified by the content shown, not by the exit code alone.
-
-2. SYMBOL ANCHORING, where the table provides it. Most rows put a backticked
-   symbol right beside the citation - `` `src/raptor_paper.py:300`
-   `split_text_raptor` `` or `` `src/config.py:93` (`RRF_K = 60`, ...) ``.
-   When a backticked identifier directly follows the citation in the same
-   table cell, the cited line (+/- 2 lines, since a def's decorator or a
-   dataclass field's comment can sit adjacent) must CONTAIN that
-   identifier's first token. A uniform shift now fails loudly instead of
-   printing plausible-looking wrong lines.
-
-THE CITED TREE IS A TAG, NOT THE WORKING TREE (2026-09-03). The repo is
-being reduced to the reproduction path; everything else leaves HEAD and
-lives at tag `thesis-full-2026-09-03` (= `cd2c8dd`, the closed experiment's
-full tree). The fidelity documents cite THAT tree, so this checker reads
-every cited file with `git show <tag>:<path>` and never from the working
-tree. A citation therefore stays valid through the reduction by
-construction; `--rev` exists only for a deliberate future re-anchoring.
-
-TWO DOCUMENTS, ONE CHECK. `docs/PROVENANCE_TABLE.md` is the living fidelity
-record; `docs/METHODS_AND_FIDELITY.md` is the reader-facing document
-derived from it. A MISSING document is a refusal, never a silent skip.
-
-Run on the agent host (docs are disk-only, so it runs where they live):
-
-    python -m scripts.verify_provenance_citations            # against the tag
-    python -m scripts.verify_provenance_citations --rev HEAD # deliberate only
-
-Exit 0 = all resolve and every anchored citation matches. Exit 1 = a broken
-or drifted citation, listed.
+"""Check every `path:line` citation in docs/PROVENANCE_TABLE.md and
+docs/METHODS_AND_FIDELITY.md against the tree at the pinned tag.
+Documentation tooling off the output path; no runner, replay or export uses it.
 """
 
 from __future__ import annotations
@@ -69,12 +22,10 @@ CITATION_TAG = "thesis-full-2026-09-03"
 CITE = re.compile(
     r"`((?:src|tests|scripts)/[A-Za-z0-9_/]+\.py):(\d+(?:[,\-]\d+)*)`"
 )
-# A backticked identifier IMMEDIATELY following the citation - at most one
-# space and an optional "(" before the backtick, and no "/" inside the
-# backticks (which would make it a path, i.e. some OTHER citation). Prose
-# between citation and backtick means the backtick is not this citation's
-# anchor, and greedily adopting it produced eleven false DRIFTED reports
-# on the first run of this checker.
+# A backticked identifier right after the citation: at most one space and
+# an optional "(" before the backtick, and no "/" inside it (that would be
+# a path, so another citation). Prose in between means the backtick is
+# not this citation's anchor.
 ANCHOR = re.compile(r"^ ?\(?`([A-Za-z_][A-Za-z0-9_]*)[^`/]*`")
 
 ANCHOR_WINDOW = 2  # lines either side of the cited line
@@ -94,22 +45,21 @@ def read_at_rev(path: str, rev: str) -> list[str] | None:
 def check_document(
     doc: Path, files: dict[str, list[str] | None], rev: str
 ) -> tuple[int, int, list[str]]:
-    """Check one document at `rev`. Returns (n_checked, n_anchored, problems).
-
-    `files` is a shared line cache so a source file read for one document
-    is not re-read for the other.
-    """
+    """Check one document at `rev`: (n_checked, n_anchored, problems)."""
     text = doc.read_text(encoding="utf-8")
     problems: list[str] = []
     n_checked = n_anchored = 0
     print(f"\n[cite] {doc.name} @ {rev}")
 
+    # Each citation, plus the symbol anchored beside it when there is one.
     for m in CITE.finditer(text):
         path, spec = m.group(1), m.group(2)
         tail = text[m.end():m.end() + 40]
         am = ANCHOR.match(tail)
         anchor = am.group(1) if am else None
 
+        # Read each cited file once from the pinned revision; the cache is
+        # shared across both documents.
         if path not in files:
             files[path] = read_at_rev(path, rev)
             if files[path] is None:
@@ -118,6 +68,8 @@ def check_document(
         if not lines:
             continue
 
+        # Every cited line must exist; an anchored one must hold its symbol
+        # within the window. Resolved lines are printed for a human to read.
         for part in re.split(r"[,\-]", spec):
             line_no = int(part)
             n_checked += 1
@@ -151,6 +103,7 @@ def main(argv: list[str] | None = None) -> None:
                          f"from (default: the pinned tag {CITATION_TAG})")
     args = ap.parse_args(argv)
 
+    # The revision must resolve in this clone before any file is read.
     probe = subprocess.run(["git", "rev-parse", "--verify", "--quiet",
                             f"{args.rev}^{{commit}}"], cwd=ROOT,
                            capture_output=True, text=True)
@@ -160,6 +113,7 @@ def main(argv: list[str] | None = None) -> None:
     print(f"[cite] reading cited files from {args.rev} "
           f"({probe.stdout.strip()[:12]}), not the working tree")
 
+    # A missing document is a refusal, never a silent skip.
     missing = [d for d in DOCS if not d.exists()]
     if missing:
         raise SystemExit(
@@ -168,6 +122,7 @@ def main(argv: list[str] | None = None) -> None:
             + ", ".join(str(d) for d in missing)
         )
 
+    # Check both documents against one shared file cache.
     files: dict[str, list[str] | None] = {}
     problems: list[str] = []
     n_checked = n_anchored = 0
@@ -177,6 +132,7 @@ def main(argv: list[str] | None = None) -> None:
         n_anchored += a
         problems.extend(p)
 
+    # Print the tally; any problem exits 1.
     print(f"\n[cite] {n_checked} citations checked across {len(DOCS)} "
           f"documents at {args.rev}, {n_anchored} symbol-anchored")
     if problems:
