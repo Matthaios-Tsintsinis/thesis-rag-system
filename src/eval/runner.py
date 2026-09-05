@@ -397,63 +397,33 @@ def main() -> None:
         "--benchmark",
         required=True,
         choices=sorted(BENCHMARK_REGISTRY),
-        help="Benchmark id. hotpotqa = standard distractor, one corpus per "
-        "question. M4 there is a REAL RAPTOR result with a small flat "
-        "tail, MEASURED from the banked cell (2026-08-22): "
-        "917/1000 (91.7%%) build a 2-layer hierarchy, 83/1000 (8.3%%) fall "
-        "at or below RAPTOR's own stop condition "
-        "(<= reduction_dimension + 1 = 11 leaves) and are scored on flat "
-        "dense retrieval. Leaves: 17,443 total, median 17, max 37. The "
-        "old 36/1000 (3.6%%) figure is DEAD - it predates the "
-        "single-item-rule corpus layout. "
-        "hotpotqa_pooled = shards of 100 questions (a real tree, but NOT "
-        "comparable to published HotpotQA).",
+        help="Benchmark id; hotpotqa is the distractor setting, "
+        "hotpotqa_pooled the shard-pooled construction.",
     )
     parser.add_argument(
         "--split",
         required=True,
-        help="Benchmark-specific split; every matrix cell runs 'validation'. "
-        "MultiHop-RAG: validation/test/all (single underlying split).",
+        help="Dataset split; every matrix cell runs 'validation'.",
     )
     parser.add_argument(
         "--output",
         type=Path,
         default=None,
-        help="JSONL output path. Defaults to "
-        "<OUTPUT_DIR>/eval/{benchmark}_{system}_{split}_{stamp}.jsonl",
+        help="JSONL output path (a bank cell is "
+        "<bank>/<benchmark>_<system>_validation.jsonl).",
     )
     parser.add_argument(
         "--generator",
         type=str,
         default=None,
-        help=(
-            "Run this cell under a DIFFERENT model. Sets the READER "
-            "(HarnessConfig.generation.model) AND the INDEX-TIME "
-            "SUMMARISER (M4 summary_model) together, because the "
-            "matrix design is FULL INDEPENDENT REPLICATION: each column "
-            "builds its own trees with its own summariser and reads them "
-            "with the same model. "
-            "Rebinding src.config.GENERATOR_MODEL or JUDGE_MODEL "
-            "in-process does NOT work -- both are dataclass field "
-            "defaults evaluated once at class-definition time. "
-            "VERIFIED: changing this moves M4's substrate cache "
-            "key, so a Llama cell cannot silently hit a Qwen tree. "
-            "M2/M3 keys do NOT move, which is CORRECT -- their "
-            "substrate contains no LLM output, so it is a "
-            "model-independent artifact and rebuilding it would produce "
-            "byte-identical files."
-        ),
+        help="Reader model id; also M4's summariser (moves M4's cache key, "
+        "not M2/M3's).",
     )
     parser.add_argument(
         "--resume",
         action="store_true",
-        help=(
-            "Append to an existing output JSONL and SKIP query_ids already "
-            "in it, instead of truncating and starting over. Use after a "
-            "session dies mid-pass: index caches survive on their own, but "
-            "without this the answers do not. A torn final line from a "
-            "killed write is tolerated and that query is re-answered."
-        ),
+        help="Append to an existing output JSONL, skipping questions "
+        "already in it.",
     )
     args = parser.parse_args()
 
