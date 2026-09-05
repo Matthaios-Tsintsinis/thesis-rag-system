@@ -1,16 +1,6 @@
-"""Answer-side scorers for the benchmark eval layer.
-
-extractive: SQuAD/HotpotQA-style token-F1 under the official normaliser
-            (+ NFKC), max over references — the ONE answer-scoring
-            contract every live loader applies.
-unanswerable: canonical-string match plus a fuzzy-phrase abstention
-              detector (metadata only; never a score) and the
-              pure-refusal null rule.
-free_form: substring match, recorded in MultiHop answer metadata.
-
-All scorers operate on a SINGLE predicted answer string and a SINGLE
-gold annotation; the benchmark-level wrapper applies max-over-references.
-"""
+"""Answer-side scorers: token-F1 with max over references (extractive),
+the abstention detector and pure-refusal null rule (unanswerable), and
+substring match (free_form). Each scores one prediction, one gold."""
 
 from .extractive import (
     assert_gold_not_empty,

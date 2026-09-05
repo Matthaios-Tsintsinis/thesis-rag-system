@@ -1,55 +1,6 @@
-"""Anchored abstention detection.
-
-WHAT CHANGED AND WHY (P3). The detector used to substring-match a list of
-phrases anywhere in the prediction, so "insufficient information" fired
-inside a complete, informative answer: "The report gives insufficient
-information about Q3, but revenue rose to 4.1 billion." was classified as
-a refusal. Anchoring fixes that.
-
-A prediction abstains iff its FIRST CLAUSE is a PURE HEDGE — a clause
-that, once its refusal frame is removed, contains nothing but filler
-words. That single rule covers both admissible shapes:
-
-  * the hedge IS the whole utterance ("No answer available.")
-  * the hedge is the leading clause ("I don't know, but ...")
-
-and rejects the case above, where the refusal frame sits inside a clause
-that also carries content ("the report gives ... about q3").
-
-TWO FAMILIES OF FRAME, and the distinction is semantic, not cosmetic:
-
-  * NEGATIVE-EXISTENCE frames ("the evidence does not mention X") consume
-    the object to the end of the clause. Everything after the verb is the
-    thing declared ABSENT, so it asserts nothing. This is what makes "The
-    evidence does not cover 2023." a pure refusal rather than a claim
-    about 2023 — the case that killed the entity/digit heuristic
-    originally proposed, which would have scored it as a fabrication.
-  * NOUN-PHRASE hedges ("insufficient information") are matched tightly,
-    and the filler test on the remainder does the work. "There is
-    insufficient information" leaves "there is" (filler, abstains);
-    "the report gives insufficient information about q3" leaves "the
-    report gives about q3" (contentful, does not abstain).
-
-`detect_abstention` returns the matched SPAN as well as the boolean,
-because the unanswerable rule (P2) strips the hedge and inspects what is
-left. Detection and the null-query rule therefore share one primitive
-instead of running two heuristics that can disagree.
-
-WHERE THIS IS LOAD-BEARING. On answerable queries the result is pure
-metadata (`answer.metadata.abstained`) and never touches a score — see
-the scoring contract in `src/eval/multihop.py`. It is load-bearing only
-for the MultiHop null-query rule.
-
-DEVIATION FROM THE OFFICIAL QASPER METRIC (answer side, unanswerable
-type), unchanged by P3 and restated here because it belongs with the
-detector. The official QASPER evaluator scores
-token_f1(prediction, "Unanswerable"); this harness scores an abstention
-DETECTION instead, because the shared reader prompt instructs every
-system to emit "No answer available." rather than the word
-"Unanswerable", so the official reference string would score ~0 on every
-correct abstention under our prompt. Applied identically to all systems.
-Not comparable to published QASPER Unanswerable-F1. Methods-section note.
-"""
+"""Anchored abstention detection and the pure-refusal rule for null queries.
+A prediction abstains when its leading clause is a pure hedge; the null
+rule credits it only when the rest of the utterance is filler."""
 
 from __future__ import annotations
 
@@ -60,12 +11,11 @@ from ...config import ABSTENTION_RESPONSE
 
 
 # --- vocabulary -----------------------------------------------------------
+# harness addition: see METHODS §C.9
 
 # Words that may surround a hedge without making the clause contentful.
-# Deliberately CLOSED and small: every addition widens what counts as a
-# refusal, and the failure mode is silent (an informative answer scored
-# as an abstention). Content words are absent on purpose — "report",
-# "gives", "revenue" must fall outside it.
+# The set is closed and small: every addition widens what counts as a
+# refusal, so content words like "report" or "revenue" stay outside it.
 _FILLER = frozenset("""
 there here it this that these those they
 i we you one
@@ -81,8 +31,8 @@ sorry unfortunately apologies please note also well actually really
 currently given provided based unable able possible
 """.split())
 
-# NEGATIVE-EXISTENCE frames. The object runs to the end of the clause
-# (`.*`) because it names what is ABSENT.
+# Negative-existence frames. The object runs to the end of the clause
+# because it names what is absent, so it asserts nothing.
 _SUBJECT = (
     r"(?:the\s+|this\s+|that\s+)?"
     r"(?:evidence|context|passage|document|documents|text|article|excerpt|"
@@ -113,19 +63,15 @@ _CONSUMING_PATTERNS = tuple(
         r"\bunable\s+to\s+(?:answer|determine|find|say|tell)\b.*$",
         r"\bno\s+(?:answer|information|data|details?)\s+"
         r"(?:is\s+|are\s+)?(?:available|provided|given|found)\b.*$",
-        # "cannot be answered FROM THE EVIDENCE" — the trailing phrase
-        # names the source that fails to supply the answer, so it is
-        # frame material, not an assertion. Classifying it here rather
-        # than widening _FILLER to admit "evidence" keeps the filler set
-        # closed: "the report gives insufficient information about Q3"
-        # must still read as contentful.
+        # "cannot be answered from the evidence": the trailing phrase names
+        # the source that lacks the answer, so it is frame, not a claim.
         r"\b(?:cannot|can\s?not|can't)\s+be\s+"
         r"(?:answered|determined|established|found)\b.*$",
         r"\bnot\s+(?:answerable|determinable)\b.*$",
     )
 )
 
-# NOUN-PHRASE hedges. Matched tightly; the filler test on the remainder
+# Noun-phrase hedges, matched tightly; the filler test on the remainder
 # decides whether the clause is pure.
 _TIGHT_PATTERNS = tuple(
     re.compile(p)
@@ -139,9 +85,8 @@ _TIGHT_PATTERNS = tuple(
     )
 )
 
-# Legacy name, kept because src/eval/scorers/__init__.py re-exports it.
-# The literal cores of the patterns above, for documentation only — the
-# detector no longer substring-matches this tuple.
+# Re-exported by src/eval/scorers/__init__.py. The literal cores of the
+# patterns above, for documentation only; the detector does not read it.
 ABSTENTION_PHRASES = (
     "no answer available",
     "unanswerable",
@@ -153,8 +98,8 @@ ABSTENTION_PHRASES = (
     "does not contain the answer",
 )
 
-# Clause boundaries: punctuation, or a contrastive conjunction, or a
-# sentence break. A hedge after one of these is NOT leading.
+# Clause boundaries: punctuation, a contrastive conjunction, or a
+# sentence break. A hedge after one of these is not leading.
 _CLAUSE_BOUNDARY_RE = re.compile(
     r"[,;:]\s*|\s+(?:but|however|although|though|yet|while|whereas)\s+|\.\s+"
 )
@@ -165,13 +110,7 @@ _WORD_RE = re.compile(r"[a-z0-9']+")
 
 @dataclass(frozen=True)
 class AbstentionMatch:
-    """Result of anchored detection.
-
-    `span` indexes `text` (the NORMALISED utterance), not the raw
-    prediction — the null-query rule works in normalised coordinates, and
-    handing back raw offsets would invite a caller to slice the wrong
-    string.
-    """
+    """Detector verdict plus the hedge span, in normalised-text offsets."""
 
     matched: bool
     text: str
@@ -187,6 +126,7 @@ class AbstentionMatch:
 
 
 def _normalise(text: str) -> str:
+    """Lowercase, collapse whitespace and drop a trailing full stop."""
     return _WHITESPACE_RE.sub(" ", (text or "").strip().lower().rstrip(".")).strip()
 
 
@@ -194,24 +134,22 @@ _CANONICAL_NORMALISED = _normalise(ABSTENTION_RESPONSE)
 
 
 def is_filler_only(text: str) -> bool:
-    """True when `text` carries no content word.
-
-    Shared by the detector (is the clause a PURE hedge?) and by the
-    null-query rule (is the REMAINDER a pure refusal?). One primitive,
-    so the two cannot drift apart.
-    """
+    """True when every word of the text is in the filler set."""
     words = _WORD_RE.findall(text or "")
     return all(w in _FILLER for w in words)
 
 
 def _first_clause(text: str) -> str:
+    """The text up to the first clause boundary."""
     m = _CLAUSE_BOUNDARY_RE.search(text)
     return text[: m.start()] if m else text
 
 
 def _clause_is_pure_hedge(clause: str) -> bool:
+    """True when a hedge frame matches and only filler surrounds it."""
     if not clause:
         return False
+    # Either frame family fires when the text around the match is filler.
     for pattern in _CONSUMING_PATTERNS:
         m = pattern.search(clause)
         if m and is_filler_only(clause[: m.start()] + " " + clause[m.end():]):
@@ -224,16 +162,15 @@ def _clause_is_pure_hedge(clause: str) -> bool:
 
 
 def detect_abstention(predicted: str) -> AbstentionMatch:
-    """Anchored detection. Returns the verdict AND the hedge-clause span."""
+    """Return the verdict and the hedge-clause span for a prediction."""
     text = _normalise(predicted)
     if not text:
         return AbstentionMatch(False, text)
-    # The canonical response the reader prompt asks for, matched exactly
-    # before anything else: it is the one string every system is
-    # instructed to emit verbatim, so it must never depend on the
-    # grammar below continuing to cover it.
+    # The canonical refusal string matches exactly, ahead of the grammar.
+    # harness choice: the string the null rule recognises (METHODS §C.9)
     if text == _CANONICAL_NORMALISED:
         return AbstentionMatch(True, text, (0, len(text)))
+    # Otherwise the leading clause must be a pure hedge.
     clause = _first_clause(text)
     if _clause_is_pure_hedge(clause):
         return AbstentionMatch(True, text, (0, len(clause)))
@@ -241,53 +178,20 @@ def detect_abstention(predicted: str) -> AbstentionMatch:
 
 
 def is_abstention(predicted: str) -> bool:
-    """True iff the prediction reads as an abstention.
-
-    ANCHORED: the hedge must be the whole utterance or the leading
-    clause. A hedge buried inside an informative clause does not count.
-    """
+    """True when the hedge is the whole utterance or its leading clause."""
     return detect_abstention(predicted).matched
 
 
 def score_abstention(predicted: str) -> float:
-    """1.0 if the prediction is an abstention; 0.0 otherwise.
-
-    NOT the null-query rule — see `score_unanswerable`, which
-    additionally requires that the prediction assert nothing beyond the
-    hedge. This remains for the dropped-benchmark callers (QASPER) that
-    score on detection alone.
-    """
+    """1.0 when the prediction abstains, 0.0 otherwise; not the null rule."""
     return 1.0 if is_abstention(predicted) else 0.0
 
 
 def score_unanswerable(predicted: str) -> float:
-    """THE NULL-QUERY RULE (P2). Credit a PURE REFUSAL, nothing else.
-
-    Detection alone used to decide this, and it credited fabrication: "I
-    don't know the year, but the answer is Tesla." scored 1.0 on a
-    MultiHop null_query, full marks for naming an entity the corpus does
-    not support. Measured in docs/EVAL_AUDIT.md ISSUE-2.
-
-    Two parts:
-      1. the anchored detector must fire (P3), and
-      2. the utterance with the hedge clause REMOVED must carry no
-         content word.
-
-    WHAT THIS DELIBERATELY IS NOT. An earlier proposal credited 1.0
-    unless the remainder held a digit or a non-sentence-initial
-    capitalised token. That is an entity detector, and it fails in both
-    directions: "The evidence does not cover 2023." would score 0.0 for
-    echoing a year it explicitly declines to answer about, and "Tesla is
-    not mentioned in the evidence." would score 1.0 because the entity
-    happens to sit sentence-initially. This rule asks the simpler
-    question - is anything asserted at all - and needs no notion of what
-    an entity is, no capitalisation, and no language-specific casing
-    convention.
-
-    The remainder test reuses `is_filler_only`, the same primitive the
-    detector uses to decide a clause is a pure hedge, so the two halves
-    of the rule cannot drift apart.
-    """
+    """The null-query rule: credit 1.0 for a pure refusal, nothing else."""
+    # harness addition: see METHODS §C.9
+    # The detector must fire and the utterance minus the hedge clause must
+    # carry no content word, so a hedge followed by a claim scores 0.0.
     match = detect_abstention(predicted)
     if not match.matched:
         return 0.0
