@@ -1,30 +1,6 @@
-"""CK-2 retrieval-recall scoring — chunker-agnostic alignment to gold-passage atoms.
-
-Each `RetrievedChunk` carries `chunk.gold_provenance`: a tuple of
-(parent_id, span_id) pairs identifying the gold-passage atoms that
-chunk touches. The eval loader populated this field via the default
-BaseSystem.index_items fallback (see retrievers/base.py).
-
-This module aggregates those atom sets across the retrieved chunks
-and computes precision / recall / F1 against the gold atom set for
-each annotator, returning max-over-annotators per QASPER convention.
-
-PER-RULING behaviour:
-  * FLOAT SELECTED (QASPER table-grounded evidence): the loader does
-    NOT add table atoms to the gold set, so they shrink the
-    denominator naturally without becoming an irreducible-0 floor on
-    text-only retrieval.
-  * No-match QASPER evidence (~6.9% after exact -> ws-normalised ->
-    substring fallback): the loader DROPS unalignable evidence + bumps
-    a manifest counter. No fuzzy-wrong atom corrupts the gold set.
-  * Unanswerable / empty gold (every annotator's gold set is empty):
-    retrieval recall is SKIPPED (returns RetrievalScore.skipped=True);
-    the answer-side abstention scorer judges instead.
-
-Chunker-independent: this function reads only chunk.gold_provenance
-(atom set), never chunk text or boundaries. CK-1 chunking ablation
-(eval grid runs under native + shared-word_window) does NOT change
-this scorer's behaviour.
+"""Retrieval scoring over gold-passage atoms: set-F1 and rank-aware metrics.
+Reads only chunk.gold_provenance, the (parent_id, span_id) pairs a chunk
+touches, never chunk text, so the scores do not depend on the chunker.
 """
 
 from __future__ import annotations
@@ -36,8 +12,9 @@ from .types import RetrievalScore
 
 
 def _f1(intersect: int, n_pred: int, n_gold: int) -> tuple[float, float, float]:
+    """Recall, precision and F1 of the atom overlap; all zero on empty gold."""
     if n_gold == 0:
-        # Caller should have skipped this annotator already.
+        # The caller skips empty annotators; this is a guard, not a score.
         return 0.0, 0.0, 0.0
     recall = intersect / n_gold
     precision = intersect / max(1, n_pred)
@@ -51,13 +28,9 @@ def _f1(intersect: int, n_pred: int, n_gold: int) -> tuple[float, float, float]:
 def _retrieved_atoms(
     retrieved: Sequence[RetrievedChunk],
 ) -> frozenset[tuple[str, str]]:
-    """Union of (parent_id, span_id) atoms across retrieved chunks.
-
-    chunk.gold_provenance comes back from on-disk JSON as a list of
-    2-element lists rather than tuple-of-tuples (json round-trip drops
-    the tuple type). Normalise both shapes to tuple[str, str] for the
-    frozenset.
-    """
+    """Union of (parent_id, span_id) atoms across the retrieved chunks."""
+    # Provenance read back from JSON arrives as 2-element lists, not
+    # tuples; both shapes become tuple[str, str], anything else is dropped.
     atoms: set[tuple[str, str]] = set()
     for r in retrieved:
         for p in (r.chunk.gold_provenance or ()):
@@ -73,15 +46,8 @@ def score_retrieval_ck2(
     retrieved: Sequence[RetrievedChunk],
     gold_passage_sets: Sequence[frozenset[tuple[str, str]]],
 ) -> RetrievalScore:
-    """Max-over-annotators CK-2 retrieval-F1.
-
-    `gold_passage_sets` length = number of annotators (1 for MultiHop).
-    Each entry is a frozenset of (parent_id, span_id) atoms. Empty
-    entries are skipped at the annotator level (the annotator marked
-    the question unanswerable or every piece of their evidence was
-    table-grounded). If EVERY annotator's set is empty, the whole
-    query is skipped — answer-side abstention judges instead.
-    """
+    """Set-level recall/precision/F1 over atoms, max over annotators."""
+    # harness choice: chunker-independent recall (METHODS §C.4)
     covered = _retrieved_atoms(retrieved)
     n_retrieved_atoms = len(covered)
 
@@ -90,6 +56,8 @@ def score_retrieval_ck2(
     best_block: dict | None = None
     any_scored = False
 
+    # Score each annotator's gold set and keep the best F1; an annotator
+    # with no gold atoms gets None instead of a block.
     for gold in gold_passage_sets:
         if not gold:
             per_annotator.append(None)
@@ -109,6 +77,8 @@ def score_retrieval_ck2(
             best_f1 = f1
             best_block = block
 
+    # No annotator has gold: the query is skipped here and the null rule
+    # (METHODS §C.9) scores it on the answer side.
     if not any_scored:
         return RetrievalScore(
             skipped=True,
@@ -135,75 +105,16 @@ def score_retrieval_rank_aware(
     *,
     k_values: tuple[int, ...] = (1, 5, 10),
 ) -> dict:
-    """Rank-aware retrieval metrics over a single gold atom set.
-
-    Returns a dict with keys {skipped, hit_at_k, map_at_k, mrr,
-    n_relevant_retrieved, n_gold}. The caller (MultiHopBenchmark.
-    score_retrieval) merges these into a RetrievalScore alongside the
-    CK-2 set-F1 numbers.
-
-    UNIT OF ANALYSIS — DOCUMENT (atom) level, not chunk level. The
-    metrics collapse the retrieved-chunk ranking to a DEDUPLICATED
-    ranking of gold-provenance atoms by FIRST occurrence, then score
-    that document ranking. This is mandatory, not cosmetic: MultiHop
-    gold is document-level (atom = (url, "<whole>")) and our chunker
-    emits MANY chunks per article, each stamped (index_items) with its
-    article's atom. Ranking raw chunks lets one gold article occupy
-    several "relevant" positions, which drives MAP ABOVE its [0,1]
-    bound — the AP numerator counts relevant CHUNKS (can exceed n_gold)
-    while the denominator normalises by DISTINCT gold atoms. Collapsing
-    to a document ranking credits each gold atom at most once and keeps
-    all three metrics on one consistent K (document positions). NOTE:
-    this also makes Hit@K / MRR document-rank rather than chunk-rank —
-    they stayed in [0,1] under the old chunk-level code so the bug was
-    invisible there, but the unit was still wrong for document gold.
-
-    Over the deduplicated document ranking:
-
-      Hit@K  — 1.0 if any relevant document appears within the top-K
-               documents, else 0.0.
-      MAP@K  — Average Precision at K: sum of precision-at-each-
-               relevant-document-rank within the top-K documents,
-               normalised by min(K, n_gold). Bounded [0, 1].
-               THIS IS THE STANDARD AP NUMERATOR, AND IT IS NOT THE
-               OFFICIAL MultiHop-RAG ONE (second fidelity audit,
-               2026-09-02, executed against the fetched
-               retrieval_evaluate.py): the official script adds
-               (number of gold facts NEWLY matched at this rank) / rank
-               at each relevant rank -- for one gold per document that is
-               1/rank per newly-found gold, not the cumulative precision
-               (relevant-so-far)/rank. The two agree only while at most
-               one gold is found in the top-K; otherwise ours is HIGHER
-               (worked example, gold {D1, D2}, ranking [D3, D1, D2]:
-               ours (1/2 + 2/3)/2 = 7/12, official (1/2 + 1/3)/2 = 5/12).
-               Only the denominator rule, min(K, n_gold), matches the
-               official script. DECLARED-DEVIATION in the living record
-               (docs/PROVENANCE_TABLE.md section 3.1); frozen mid-matrix,
-               and an official-style MAP@10 is derivable post-hoc from
-               the replay sidecars' document rankings without a re-run.
-      MRR    — 1 / (rank of first relevant document), 0 if none.
-               1-indexed. Uncapped (over the full ranking); the
-               MultiHop-RAG paper reports MRR@10. For top-15 retrieval
-               these coincide unless the first relevant doc is at rank
-               11-15.
-
-    Skip when `gold_atoms` is empty (null_query / unanswerable): the
-    answer-side abstention scorer handles those queries. Returns
-    {"skipped": True} so the caller treats the score as absent
-    rather than 0-everywhere (which would skew the aggregate).
-
-    Used by MultiHop-RAG; QASPER skips this scorer (its gold is
-    paragraph-level multi-annotator, set-F1 via score_retrieval_ck2
-    is the right metric there).
-    """
+    """Hit@K, MAP@K and MRR over the document ranking implied by the chunks."""
+    # No gold atoms means a null query; the answer-side null rule scores it
+    # (METHODS §C.9), so return skipped rather than zeros.
     if not gold_atoms:
         return {"skipped": True}
 
-    # Collapse the chunk ranking to a deduplicated document ranking by
-    # first occurrence. Every chunk carries its article's atom in
-    # gold_provenance (gold AND non-gold articles alike), so this is
-    # the order in which DISTINCT documents first surface in the
-    # retrieval. relevance[j] marks whether document j is a gold atom.
+    # Collapse the chunk ranking to a document ranking: each atom is placed
+    # at its first occurrence, so a gold document is credited once and
+    # every metric below counts document positions, not chunks.
+    # harness choice: document-level metrics (METHODS §C.5)
     doc_ranking: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
     for r in retrieved:
@@ -222,22 +133,27 @@ def score_retrieval_rank_aware(
     n_gold = len(gold_atoms)
     n_relevant_retrieved = sum(relevance)
 
-    # MRR: 1-indexed rank of the first relevant DOCUMENT.
+    # MRR: 1 / (1-based rank of the first gold document), 0 if none; the
+    # rank is not capped at 10.
+    # deviation from official (MRR@10): see METHODS §B.1
     mrr = 0.0
     for i, rel in enumerate(relevance):
         if rel:
             mrr = 1.0 / (i + 1)
             break
 
+    # Hit@K is 1 if any gold document sits in the top K. MAP@K sums the
+    # precision at each gold rank in the top K and divides by
+    # min(K, n_gold); with one credit per document the sum never exceeds
+    # the denominator, so MAP@K stays in [0, 1].
+    # official: retrieval_evaluate.py @ cde8e844 (Hits@4, Hits@10); K = 1, 5 are ours
+    # deviation from official (retrieval_evaluate.py adds newly-matched/rank): see METHODS §C.8
+    # official: retrieval_evaluate.py @ cde8e844 (denominator only)
     hit_at_k: dict[int, float] = {}
     map_at_k: dict[int, float] = {}
     for k in k_values:
         top_k = relevance[:k]
         hit_at_k[k] = 1.0 if any(top_k) else 0.0
-        # AP@K over the document ranking. Each gold doc is credited at
-        # most once (dedup above), so n_relevant_so_far <= n_gold and
-        # the relevant-position count in top_k <= min(k, n_gold); every
-        # precision term <= 1, hence sum <= denom and MAP@K in [0, 1].
         n_relevant_so_far = 0
         precision_sum = 0.0
         for i, rel in enumerate(top_k):

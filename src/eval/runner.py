@@ -1,20 +1,6 @@
 """CLI runner: one system x one benchmark x one split, JSONL output.
 
-Usage:
-    python -m src.eval.runner --system M2 --benchmark multihop_rag --split validation \
-        --output /content/drive/MyDrive/thesis_rag/outputs/p10/multihop_rag_M2_validation.jsonl --resume
-
-Sharding across systems / benchmarks is done by running this script
-once per combination from a wrapper (shell script or Colab notebook
-cell). One process, one system, one benchmark — simple to bisect, simple
-to retry, no shared state. Each invocation writes a single JSONL file
-plus a `.summary.json` beside it; scripts/export_comparison.py reads
-both.
-
-There is no small-sample mode: every cell is the full declared
-population. The caps and escapes that once existed were pruned in the
-repo reduction (the full tree lives at tag thesis-full-2026-09-03), so
-the only way to run a cell is to run all of it under every gate.
+One process per cell. Writes the JSONL plus a .summary.json beside it.
 """
 
 from __future__ import annotations
@@ -48,44 +34,29 @@ SYSTEM_REGISTRY: dict[str, type[BaseSystem]] = {
 BENCHMARK_REGISTRY: dict[str, type] = {
     "multihop_rag": MultiHopBenchmark,
     "narrativeqa": NarrativeQABenchmark,
-    # HotpotQA ships as TWO benchmarks, not one flag: variant A is the
-    # comparable headline, variant B is where a hierarchy exists. They
-    # produce different corpora and different unit counts, so a shared
-    # entry with a mode switch would make every downstream table
-    # ambiguous about which was run.
+    # HotpotQA is two benchmarks with different corpora and unit counts:
+    # distractor is the comparable headline, pooled is where a tree exists.
+    # harness choice: our construction, not comparable to published HotpotQA (METHODS §B.4)
     "hotpotqa": HotpotQABenchmark,
     "hotpotqa_pooled": HotpotQAPooledBenchmark,
 }
 
 
 def _environment_provenance(lockfile: Path) -> dict:
-    """Lockfile hash, GPU model, python and the pinned versions.
-
-    The GPU string is here because the reproducibility target is
-    same-lockfile-SAME-GPU-CLASS: a tree that reproduces on an L4 is not
-    thereby claimed to reproduce on another accelerator, and a row that
-    does not say which GPU produced it cannot support either claim.
-    """
+    """Lockfile hash, GPU model, python and pinned versions for the summary."""
     try:
         from scripts.pin_environment import environment_provenance
 
-        # THE LOCKFILE THE GATE CHECKED, never a hardcoded path: the first
-        # version read ./requirements.lock regardless of --lockfile, so a
-        # cell gated against a lock elsewhere banked lockfile_hash=null.
+        # Read the lockfile the gate checked, so the recorded hash matches.
         return environment_provenance(Path(lockfile))
-    except Exception as e:  # never fatal: provenance must not kill a run
+    except Exception as e:  # provenance never kills a run
         return {"error": f"{type(e).__name__}: {e}"}
 
 
 def _model_revisions(system) -> dict:
-    """Resolved model ids for the three roles, with HF revision hashes.
-
-    An id alone does not pin a model: a repo can move. The revision is
-    what makes "the same embedder" checkable rather than assumed. Absent
-    revisions degrade to None rather than failing the run — this is
-    provenance, not a gate.
-    """
+    """Resolved model ids per role plus their HF revision hashes."""
     out: dict = {}
+    # Collect the ids the system resolved; the generator comes from config.
     try:
         resolved = getattr(system, "resolved_components", None)
         if resolved is not None:
@@ -96,6 +67,7 @@ def _model_revisions(system) -> dict:
     except Exception as e:
         return {"error": f"{type(e).__name__}: {e}"}
 
+    # Look up each hub id's revision; a missing one is None, never fatal.
     revisions: dict = {}
     try:
         from huggingface_hub import HfApi
@@ -115,8 +87,7 @@ def _model_revisions(system) -> dict:
 
 
 def _tree_build_env() -> str | None:
-    """The resolved topology stack, recorded per cell. None if raptor_paper
-    is not importable (no tree-building system in this run)."""
+    """The topology stack string, or None when raptor_paper cannot import."""
     try:
         from ..raptor_paper import PAPER_TREE_BUILD_ENV
 
@@ -126,9 +97,7 @@ def _tree_build_env() -> str | None:
 
 
 def _git_commit_short() -> str:
-    """Short HEAD hash for run provenance in summary.json. Never fatal —
-    a clone without git metadata (or no git binary) degrades to
-    "unknown" rather than killing an eval run."""
+    """Short HEAD hash for the summary; "unknown" without git."""
     try:
         import subprocess
 
@@ -145,26 +114,12 @@ def _git_commit_short() -> str:
 
 
 def assert_bank_generator_consistent(output_dir: Path, generator: str) -> None:
-    """Refuse to write a cell into a bank another generator owns.
-
-    ADDENDUM 2's Llama column is a SEPARATE bank (p11), and the plan
-    documents noted that output-dir separation was enforced by
-    convention only — a Llama cell written into p10 would sit beside
-    Qwen cells with nothing but a filename convention keeping analysis
-    from pooling them. This gate is DATA-DRIVEN rather than a name
-    registry: it reads the generator every existing summary in the
-    output directory records, and refuses on any mismatch with the
-    resolved generator — which also guards the reverse mistake (a Qwen
-    cell into p11) and any future third column, with no code change.
-
-    Summaries predating model_revisions, or unreadable ones, are skipped
-    with a warning rather than trusted: an unreadable file cannot vouch
-    for the bank, but it cannot convict it either — the P10 bank is
-    complete and every one of its summaries records the generator.
-    """
+    """Refuse a cell whose generator differs from the bank's summaries."""
     out = Path(output_dir)
     if not out.is_dir():
         return
+    # Compare the resolved generator with every readable summary in the
+    # bank; a summary that names no generator cannot vouch for it.
     mismatched: list[str] = []
     for sp in sorted(out.glob("*.summary.json")):
         try:
@@ -180,6 +135,7 @@ def assert_bank_generator_consistent(output_dir: Path, generator: str) -> None:
             continue
         if str(g) != generator:
             mismatched.append(f"{sp.name}: {g}")
+    # Any mismatch aborts: each generator column is its own bank directory.
     if mismatched:
         listing = "\n  ".join(mismatched[:8])
         more = "" if len(mismatched) <= 8 else f"\n  ... {len(mismatched) - 8} more"
@@ -198,29 +154,12 @@ def assert_bank_gpu_consistent(
     *,
     current_gpu: str | None = None,
 ) -> None:
-    """Refuse to add a cell to a bank on DIFFERENT hardware.
-
-    Instance 16 of the recurring lesson, caught by an incident rather
-    than a review: Colab silently assigned a Tesla T4 (14.56 GiB) to a
-    P11 canary, Llama-8B fp16 OOM'd at weight load (266/291 shards) —
-    and the pin gate had printed `gpu=Tesla T4` and said OK, because the
-    GPU string has been RECORDED per-cell since P9 and compared by
-    NOTHING. Had the model fit, the cell would have banked a hardware
-    confound: fp16 numerics differ across GPU architectures, and every
-    P10 cell ran on NVIDIA L4.
-
-    Data-driven like the bank-generator gate: the first cell into an
-    empty bank SETS the hardware; every later cell must match the GPU
-    strings the bank's summaries record. There is no escape: a cell on
-    different hardware belongs in a different bank directory. A current
-    GPU of "unknown" (no
-    CUDA visible) WARNS rather than fails: that is an absence of
-    measurement, not a measured change, and cells cannot run without a
-    GPU anyway.
-    """
+    """Refuse a cell whose GPU differs from the bank's recorded hardware."""
     out = Path(output_dir)
     if not out.is_dir():
         return
+    # Resolve this host's GPU. No visible CUDA device is an absence of
+    # measurement, not a measured change, so it warns instead of failing.
     if current_gpu is None:
         try:
             from scripts.pin_environment import gpu_model
@@ -235,6 +174,7 @@ def assert_bank_gpu_consistent(
               "consistency was NOT verified")
         return
 
+    # Collect the GPU strings the bank's summaries record.
     bank_gpus: set[str] = set()
     for sp in sorted(out.glob("*.summary.json")):
         try:
@@ -247,7 +187,9 @@ def assert_bank_gpu_consistent(
         if g:
             bank_gpus.add(str(g))
     if not bank_gpus:
-        return  # empty bank, or summaries predate the field: this cell sets it
+        return  # empty bank: this cell sets the hardware
+    # fp16 numerics differ across GPU architectures, so the first cell into
+    # a bank sets its hardware and every later cell must match it.
     if len(bank_gpus) > 1:
         print(f"[eval] WARN: the bank already holds MULTIPLE GPU strings "
               f"{sorted(bank_gpus)} — inspect before trusting any "
@@ -269,27 +211,8 @@ def assert_bank_gpu_consistent(
 
 
 def assert_generator_accessible(model_id: str) -> None:
-    """Fail LOUDLY before GPU time if the hub will not serve the model's
-    FILES — probed by downloading a gated file, never by repo metadata.
-
-    Earned twice. First: without a granted license and a valid HF_TOKEN
-    the failure arrives mid-session as a 401 inside from_pretrained,
-    after the setup blocks are paid for. Second, the sharper one: the
-    original probe called `model_info`, which SUCCEEDS on gated repos —
-    the metadata is public, only the files are gated — so it printed
-    "verified" over a 403-bound run (the operator fetched the revision
-    sha days BEFORE the license was granted, through this very gap). The
-    probe is now `hf_hub_download` of `config.json`: a file the license
-    actually gates. A cache-satisfied download counts as verified, which
-    is correct — cached files are how an offline run works.
-
-    Local-path and API-routed models are skipped (nothing to gate).
-    Errors that mean "no access" — gated/401/403/not-found — FAIL with
-    the fix steps; errors that mean "hub unreachable" WARN and continue,
-    because a locally cached model is a legitimate way to run and a
-    preflight must not add a network single-point-of-failure to an
-    offline-capable path.
-    """
+    """Fail before GPU time if the hub will not serve the model's files."""
+    # Local paths and API-routed models have nothing to gate.
     if "/" not in str(model_id):
         return
     low = str(model_id).lower()
@@ -307,11 +230,11 @@ def assert_generator_accessible(model_id: str) -> None:
         print(f"[eval] WARN: huggingface_hub unavailable for the access "
               f"preflight ({type(e).__name__}); model access NOT verified")
         return
+    # Download config.json, a file the license gates; repo metadata is
+    # public even on gated repos. A cached copy counts as access. No-access
+    # errors abort with the steps to gain access; an unreachable hub only
+    # warns, because a locally cached model still runs.
     try:
-        # A GATED FILE, never repo metadata: model_info succeeds on gated
-        # repos (metadata is public, files are not) and once printed
-        # "verified" over a 403-bound run. config.json is tiny and sits
-        # behind the same license as the weights.
         hf_hub_download(str(model_id), "config.json")
         print(f"[eval] PREFLIGHT: hub FILE access to {model_id} verified "
               "(config.json served or cached)")
@@ -350,28 +273,13 @@ def assert_generator_accessible(model_id: str) -> None:
 
 
 def assert_environment_pinned(lockfile: Path) -> None:
-    """Abort before any model loads unless this environment is the locked one.
-
-    THE FAILURE THIS GATES IS SILENT AND UNRECOVERABLE AFTER THE FACT.
-    The M4 substrate key folds `build_env` — the umap-learn / scikit-learn
-    / numpy triple. Colab updates its base image without notice, so a
-    session on a drifted image computes a DIFFERENT substrate key. The
-    cache then MISSES rather than colliding: the tree rebuilds cleanly,
-    the cell succeeds, and the matrix quietly holds two tree populations.
-    Nothing in any output says which image built which tree, so no
-    post-hoc check can separate them. The only place to catch it is
-    before it happens.
-
-    `scripts.pin_environment.check_lockfile` did this correctly and had
-    NO CALLERS. That is the sixth instance in this project of a check
-    that exists, works, and is inert in the pipeline.
-
-    There is no escape: a missing lockfile aborts and a present-but-
-    violated one aborts. Copy the banked `requirements.lock` (Drive root)
-    beside the checkout, or pass --lockfile, before running anything.
-    """
+    """Abort before any model loads unless the environment matches the lock."""
     from scripts.pin_environment import check_lockfile
 
+    # The M4 substrate key folds umap-learn/scikit-learn/numpy, so an
+    # unpinned session rebuilds trees under a different key and nothing
+    # afterwards can tell them apart. A missing lockfile aborts and a
+    # violated one aborts; no flag bypasses either.
     if not Path(lockfile).exists():
         raise SystemExit(
             f"PREFLIGHT FAILED: no lockfile at {lockfile}.\n"
@@ -398,29 +306,16 @@ def assert_environment_pinned(lockfile: Path) -> None:
 
 
 def resolve_expected_n_queries(benchmark) -> int | None:  # noqa: ANN001
-    """The loader-derived query count P8 asserts a cell against.
-
-    One key, read from one place. HotpotQA used to record only
-    `n_questions` while the other loaders recorded `n_queries`, so this
-    field was null on ten of twenty cells and P8's short-cell guard had
-    nothing to compare against. The loaders now agree; this reads the
-    agreed key and returns None rather than guessing at a synonym.
-    """
+    """The loader-derived query count the row-count check uses."""
+    # One agreed key across loaders; None rather than a guessed synonym.
     stats = getattr(benchmark, "stats", {}) or {}
     value = stats.get("n_queries")
     return int(value) if value else None
 
 
 def assert_expected_n_queries_usable(expected: int | None) -> None:
-    """A cell must carry a count to be checked against.
-
-    P8's guard exists so a TRUNCATED cell aborts instead of reporting a
-    partial mean. A null `expected_n_queries` removes that guard without
-    removing the appearance of it, which is worse than a short cell —
-    nothing downstream can tell the difference between "complete" and
-    "unchecked". Every run is a full cell (there are no caps), so the
-    check always applies.
-    """
+    """Abort when a cell carries no expected query count to check against."""
+    # A null count would disarm the short-cell guard while looking checked.
     if expected is not None:
         return
     raise SystemExit(
@@ -433,14 +328,9 @@ def assert_expected_n_queries_usable(expected: int | None) -> None:
 
 
 def resolve_chunking_strategy(system) -> str | None:  # noqa: ANN001
-    """The chunker the system RESOLVED, not the harness default.
-
-    `system.config.chunking.strategy` is the harness-wide default, which
-    M4 does not use: it resolves `raptor_100tok` through
-    `resolved_components.chunker_config`. Recording the default meant
-    every M4 row in the final table would have named the wrong chunker,
-    while the run's own components line printed the right one.
-    """
+    """The chunker the system resolved, else the harness default."""
+    # M4 resolves its own chunker through resolved_components; the other
+    # systems use the harness-wide default.
     resolved = getattr(system, "resolved_components", None)
     chunker = getattr(resolved, "chunker_config", None) if resolved else None
     strategy = getattr(chunker, "strategy", None)
@@ -457,20 +347,10 @@ def assert_population_as_declared(
     *,
     n_units_processed: int,
 ) -> None:
-    """Abort if the cell resolved to a different population than declared.
-
-    THE BACKSTOP to the loader default. NarrativeQA's seeded 40-story
-    draw used to materialise only when `--max-units` was typed, so a
-    forgotten flag produced a 115-story, 3,461-question cell that ran to
-    completion and looked entirely normal. The loader now carries that
-    property itself; this checks the OUTCOME, so a future loader change,
-    a dataset that grew, or a benchmark whose draw stops matching its
-    declaration cannot pass silently.
-
-    A benchmark with no declared `cell_units` is skipped WITH A PRINTED
-    NOTE rather than in silence — an undeclared population is exactly
-    the condition that hid this defect.
-    """
+    """Abort if the processed unit count differs from declared cell_units."""
+    # An undeclared population is skipped with a printed note, not silently.
+    # NarrativeQA declares 40 stories.
+    # harness choice: preregistered seeded draw of 40 (METHODS §B.2)
     declared = getattr(benchmark, "cell_units", None)
     if declared is None:
         print(
@@ -480,6 +360,7 @@ def assert_population_as_declared(
             "115-vs-40 defect hid."
         )
         return
+    # A cell on the wrong population runs to completion and looks normal.
     if n_units_processed != declared:
         raise SystemExit(
             f"POPULATION MISMATCH: {benchmark.name} processed "
@@ -496,6 +377,7 @@ def assert_population_as_declared(
 
 
 def main() -> None:
+    """Parse the CLI, run every gate, score one cell, write its summary."""
     parser = argparse.ArgumentParser(
         description="Run one system x one benchmark x one split to JSONL."
     )
@@ -575,10 +457,12 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # FIRST, before any model loads or any dataset is touched. A gate that
-    # fires after a 15 GB load has already cost the thing it protects.
+    # Gate the environment first, before any model or dataset loads.
     assert_environment_pinned(args.lockfile)
 
+    # Resolve the output path. A relative path lands in the current
+    # directory, which a runtime restart deletes; --resume would then find
+    # nothing there and truncate, so warn loudly.
     stamp = time.strftime("%Y%m%d-%H%M%S")
     if args.output is None:
         out_root = paths.output_dir() / "eval"
@@ -587,15 +471,6 @@ def main() -> None:
             f"{args.benchmark}_{args.system}_{args.split}_{stamp}.jsonl"
         )
     elif not args.output.is_absolute():
-        # A RELATIVE --output resolves against the CURRENT DIRECTORY, not
-        # against OUTPUT_DIR. On Colab that is the cloned repo under
-        # /content, which a runtime restart DELETES.
-        #
-        # Worse than losing the file: `--resume` reads the JSONL at this
-        # path to decide what to skip, and when the file is gone it finds
-        # nothing and opens in "w" mode. A resume aimed at a vanished
-        # path therefore TRUNCATES and silently restarts from zero, which
-        # is exactly the situation resume exists to prevent.
         resolved = args.output.resolve()
         print(
             "[eval] *** WARNING: --output is a RELATIVE path. It resolves "
@@ -611,17 +486,12 @@ def main() -> None:
     print(
         f"[eval] {args.system} x {args.benchmark} x {args.split} -> {args.output}"
     )
-    # Build the config EXPLICITLY rather than rebinding module constants:
-    # every constant in src/config.py is baked into a dataclass field
-    # default at import, so a rebind is silently ignored.
+    # Build the config explicitly: module constants are baked into
+    # dataclass defaults at import, so rebinding them does nothing.
     harness_cfg = HarnessConfig()
     if args.generator is not None:
-        # READER AND SUMMARISER TOGETHER. The matrix is a full
-        # independent replication: each column builds its own trees with
-        # its own summariser and reads them with the same model. Setting
-        # only the reader would produce a column whose trees came from
-        # the other model, which is the confound this design exists to
-        # avoid on M1/M2/M3 and cannot avoid on M4.
+        # --generator sets reader and index summariser together: each
+        # column builds its own trees and reads them with the same model.
         harness_cfg = replace(
             harness_cfg,
             generation=replace(harness_cfg.generation, model=args.generator),
@@ -637,9 +507,7 @@ def main() -> None:
             "in it, so a cache hit there reuses a model-INDEPENDENT "
             "artifact, not the other column's work."
         )
-    # TWO REPLICATION GATES, both before any model loads (ADDENDUM 2
-    # activation, 2026-08-24). Order matters: the bank check is pure disk
-    # and runs first; the hub check may touch the network.
+    # Bank gates before the hub check: disk first, then the network.
     assert_bank_generator_consistent(
         Path(args.output).parent, harness_cfg.generation.model
     )
@@ -649,48 +517,31 @@ def main() -> None:
     system_cls = SYSTEM_REGISTRY[args.system]
     system: BaseSystem = system_cls(config=harness_cfg)
 
-    # BENCHMARK FIRST, AND PREFLIGHT BEFORE ANY MODEL LOADS. A HotpotQA
-    # run once died on an unresolvable dataset id at the first
-    # iter_eval_units call -- after a prewarm had already pulled 15 GB of
-    # Qwen into VRAM. Cheap preconditions get checked before expensive
-    # ones are paid.
-    # `preflight` is optional: a benchmark without one is simply not
-    # checked, and any benchmark can add the same two-second guard.
+    # Build the benchmark and run its cheap preflight, when it has one,
+    # before any model loads.
     benchmark_cls = BENCHMARK_REGISTRY[args.benchmark]
     benchmark = benchmark_cls()
     preflight = getattr(benchmark, "preflight", None)
     if callable(preflight):
         preflight()
 
+    # Only M4 builds a tree, so only M4 must build it cold.
     runner = BenchmarkRunner(
         output_path=args.output,
         resume=args.resume,
-        # Tree systems only: M1/M2/M3 build no tree, so the rule has
-        # nothing to say about them and a blanket gate would fire on a
-        # legitimate embedding-substrate cache hit. M4 has no escape: a
-        # warm tree refuses the cell.
         require_cold_tree=(args.system == "M4"),
     )
+    # Running sums for the summary. The answer column mixes token-F1 on
+    # answerable queries with the null rule on null ones, so the null part
+    # is counted separately and reported beside the mean.
     n_scored = 0
     sum_retr_f1 = 0.0
     sum_retr_skipped = 0
     sum_ans = 0.0
-    # COMPOSITION DISCLOSURE. The answer column is ONE number, but on
-    # MultiHop it averages two different measurement scales: token-F1 on
-    # answerable queries and a binary rule on null ones. A micro-mean
-    # over two scales is not legible unless the split is published
-    # beside it, so the parts are counted here and reported in the
-    # summary. The table still carries one column; its caption states
-    # the composition.
     n_null = 0
     sum_ans_null = 0.0
-    # Timed HERE, around runner.run only, so every import sits outside
-    # it (the generator's own load happens inside the first answer and
-    # is part of the run, as on every banked cell). Recorded in the
-    # summary because otherwise
-    # the only source of a timing is stdout, and reading a wall clock off
-    # a Colab cell is how the first 1-token probe ended up quoting model
-    # downloads as compute.
+    # Time the pass alone; the generator loads inside the first answer and
+    # is part of it.
     t_run = time.perf_counter()
     for scored in runner.run(system, benchmark, split=args.split):
         n_scored += 1
@@ -705,22 +556,19 @@ def main() -> None:
 
     elapsed_s = time.perf_counter() - t_run
 
-    # POPULATION CHECK — after the pass, because the resolved unit count
-    # is only known once the units have been drawn, and BEFORE the
-    # summary is written, so a cell built on the wrong population does
-    # not acquire a provenance block that makes it look finished.
+    # Check the population after the pass, when the unit count is known,
+    # and before the summary is written.
     assert_population_as_declared(
         benchmark,
         n_units_processed=getattr(runner, "n_units_processed", 0),
     )
 
-    # Resolved AFTER the pass, because the loader fills its stats as it
-    # yields. Checked before the summary is written so a cell cannot be
-    # banked with P8's short-cell guard silently disarmed.
+    # The loader fills its stats while yielding, so read them after the
+    # pass and check them before the summary is written.
     _expected_n_queries = resolve_expected_n_queries(benchmark)
     assert_expected_n_queries_usable(_expected_n_queries)
 
-    # Aggregate summary alongside the JSONL.
+    # Write the summary beside the JSONL.
     summary_path = args.output.with_suffix(".summary.json")
     n_retr_scored = max(1, n_scored - sum_retr_skipped)
     summary = {
@@ -729,18 +577,13 @@ def main() -> None:
         "split": args.split,
         "n_queries_scored": n_scored,
         "n_retrieval_skipped": sum_retr_skipped,
-        # THE DENOMINATOR, NAMED. mean_retrieval_f1 is over the rows that
-        # HAD retrieval ground truth, not over every row: MultiHop's 301
-        # null queries are skipped, so the mean is over 2,255 of 2,556. A
-        # reader given only the mean assumes the cell's row count, and a
-        # mean without its n is the same defect class as a guard without
-        # its comparison. NarrativeQA makes this stark - every row there
-        # is skipped, so the denominator is zero and the column is n/a.
+        # mean_retrieval_f1 averages only rows with retrieval gold: MultiHop
+        # skips its 301 null queries and NarrativeQA skips every row.
+        # dataset: yixuantt/MultiHopRAG (609 articles, 2,556 queries, 301 null)
         "n_retrieval_scored": n_scored - sum_retr_skipped,
         "mean_retrieval_f1": sum_retr_f1 / n_retr_scored,
         "mean_answer_score": sum_ans / max(1, n_scored),
-        # The two parts of the one answer column, so the composition is
-        # inspectable without re-reading the JSONL.
+        # The two parts of the one answer column.
         "n_answerable": n_scored - n_null,
         "mean_answer_score_answerable": (
             (sum_ans - sum_ans_null) / (n_scored - n_null)
@@ -751,51 +594,36 @@ def main() -> None:
             sum_ans_null / n_null if n_null else None
         ),
         "benchmark_stats": getattr(benchmark, "stats", {}),
-        # LOADER-DERIVED, never a literal. P8 asserts the post-dedup row
-        # count against this, and a hardcoded constant would abort every
-        # NarrativeQA cell the moment P7 re-drew the sample.
+        # Loader-derived, never a literal.
         "expected_n_queries": _expected_n_queries,
-        # Constant since the reduction removed every cap: a run is always
-        # the full cell. Still written because the bank gates (the
-        # exporter's read_cell, the replay) refuse a truthy value.
+        # Always False: a run is the full cell. The bank gates refuse a
+        # truthy value.
         "partial_run": False,
-        # Run-condition provenance (the aggregator's conditions columns;
-        # every matrix row must be self-describing from birth). The
-        # generator field is what keeps Qwen-era and gpt-4o-mini-era
-        # numbers from ever conflating in one table.
+        # Run conditions, so every row is self-describing.
         "generator": system.config.generation.model,
-        # The INDEX-TIME LLM, recorded separately from the reader. Under
-        # full independent replication they are the same model, but they
-        # are distinct roles and a row must say which model built the
-        # trees it read -- that is precisely the M4 confound.
+        # The index-time model, recorded apart from the reader.
         "index_llm": system.config.m4.summary_model,
         "chunking_strategy": resolve_chunking_strategy(system),
-        # The harness imposes no evidence budget (locked decision 4);
-        # M4 carries its own 2,000-token paper budget, recorded here.
+        # M4 alone carries an evidence budget.
+        # harness choice: no shared evidence budget (METHODS §D)
+        # RAPTOR paper §3: "2000 maximum tokens ... top-20 nodes" (paper over repo): see METHODS §A.4.3
         "evidence_budget_effective": getattr(
             system.config.m4, "retrieval_budget_tokens", None
         ) if args.system == "M4" else None,
-        # Recorded so a probe artifact is self-describing. The 1-token
-        # probe that silently ran uncapped would have been caught here.
-        # ANSWER-path cap. The index-time summariser uses its own,
-        # recorded beside it so a reader is not left inferring which.
+        # Answer-path cap and the index summariser's own cap, side by side.
+        # harness choice: one reader across all systems (METHODS §D)
+        # ref: raptor/tree_builder.py::TreeBuilderConfig @ 7da1d48a (summarization_length=100); the paper's 131 is a measured mean (App. C)
         "max_new_tokens": harness_cfg.generation.max_new_tokens,
         "summary_max_new_tokens": getattr(
             system.config.m4, "summary_max_tokens", None
         ) if args.system == "M4" else None,
-        # Wall clock of runner.run() ALONE (the generator load happens
-        # inside the first answer and is part of it). s_per_query is the
-        # number every cost forecast in this project is built from, so
-        # it is recorded rather than re-derived by hand each time.
+        # Wall clock of runner.run alone, and the per-query rate.
         "elapsed_s": round(elapsed_s, 2),
         "s_per_query": (
             round(elapsed_s / n_scored, 4) if n_scored else None
         ),
-        # Cold-tree provenance. None for systems with no tree; False on
-        # the P10 pass means the lever took and the tree was rebuilt.
-        # P9: which environment produced this row. Recorded per CELL, not
-        # per session — a matrix assembled over several sessions must be
-        # able to say which stack produced which row.
+        # Provenance per cell: environment, model revisions, tree cache
+        # state (None without a tree), topology stack and code revision.
         "environment": _environment_provenance(args.lockfile),
         "model_revisions": _model_revisions(system),
         "tree_cache_hit": getattr(system, "tree_cache_hit", None),
