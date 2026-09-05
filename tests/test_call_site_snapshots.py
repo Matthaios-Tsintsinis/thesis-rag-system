@@ -1,24 +1,5 @@
-"""Placement and VRAM captured AT THE MOMENT OF THE CALL, not around it.
-
-WHY THIS EXISTS. An isolated `generate()` at the build's own call-3 shape
-runs in 6.87 s; inside a build the same shape takes 228 s. Placement is
-clean in isolation, the KV cache is on and healthy, and nothing in the
-build path releases or reloads the generator — so the generation path is
-exonerated and the BUILD CONTEXT is the trigger. The one measured
-difference is headroom: 14.6 GB peak with 7.58 GB free in isolation
-against 21.51 GB peak with ~0.5 GB free in a build.
-
-Every reading so far was taken BEFORE or AFTER a build. These snapshots
-fire immediately before `model.generate()`, inside the call that is slow.
-
-SCOPE. The snapshot helpers are torch-dependent, and BOTH sides of that
-contract are pinned by stubbing torch rather than by relying on the host:
-without torch or CUDA the helper reports absence (None, never a raise
-that would take the probe down); with CUDA it reports the measured
-numbers. The first version asserted None against the REAL helper, which
-held only on the torch-less agent host and failed on the run host with
-`0.0 is not None` on an idle L4 (2026-09-04) — a test that encoded an
-accident of where it ran.
+"""Tests for the placement and VRAM snapshots taken right before each
+generate() call. Torch is stubbed both ways so no test depends on the host.
 """
 
 from __future__ import annotations
@@ -39,7 +20,7 @@ from src.models import (
 
 
 def _fake_torch(*, cuda_available: bool) -> types.SimpleNamespace:
-    """A torch stand-in exposing exactly what cuda_memory_snapshot reads."""
+    """Build a torch stand-in exposing what cuda_memory_snapshot reads."""
     cuda = types.SimpleNamespace(
         is_available=lambda: cuda_available,
         memory_allocated=lambda: 3 * 2**30,
@@ -50,14 +31,10 @@ def _fake_torch(*, cuda_available: bool) -> types.SimpleNamespace:
 
 
 class TestSnapshotsDegradeHonestly(unittest.TestCase):
-    """Absence is reported, never fabricated; presence is measured.
-
-    Simulated on every host: `sys.modules["torch"] = None` makes
-    `import torch` raise (the agent host), a stub module with a CUDA
-    device stands in for the run host. Neither case depends on what the
-    machine running the suite actually has."""
+    """The snapshot reports absence as None and presence as numbers."""
 
     def test_memory_snapshot_reports_none_without_torch(self):
+        """Without torch every memory field is None and cuda is False."""
         with mock.patch.dict(sys.modules, {"torch": None}):
             snap = cuda_memory_snapshot()
         self.assertIsNone(snap["allocated_gb"])
@@ -66,6 +43,7 @@ class TestSnapshotsDegradeHonestly(unittest.TestCase):
         self.assertFalse(snap["cuda_available"])
 
     def test_memory_snapshot_reports_none_with_torch_but_no_cuda(self):
+        """With torch but no CUDA device the fields are still None."""
         with mock.patch.dict(sys.modules,
                              {"torch": _fake_torch(cuda_available=False)}):
             snap = cuda_memory_snapshot()
@@ -73,8 +51,7 @@ class TestSnapshotsDegradeHonestly(unittest.TestCase):
         self.assertFalse(snap["cuda_available"])
 
     def test_memory_snapshot_reports_the_measured_numbers_with_cuda(self):
-        """The run-host case: an idle L4 reads 0.0 allocated, which is a
-        measurement, not an absence — the case the old test refused."""
+        """With CUDA the snapshot carries the measured GB figures."""
         with mock.patch.dict(sys.modules,
                              {"torch": _fake_torch(cuda_available=True)}):
             snap = cuda_memory_snapshot()
@@ -86,14 +63,14 @@ class TestSnapshotsDegradeHonestly(unittest.TestCase):
         self.assertEqual(snap["total_gb"], 24.0)
 
     def test_memory_snapshot_still_has_every_key(self):
-        """A missing key would read as a probe bug at 3 a.m. on Colab;
-        an explicit None reads as what it is."""
+        """Every snapshot key is present even when its value is None."""
         snap = cuda_memory_snapshot()
         for k in ("allocated_gb", "reserved_gb", "free_gb", "total_gb",
                   "reserved_minus_allocated_gb", "cuda_available"):
             self.assertIn(k, snap)
 
     def test_placement_snapshot_survives_a_model_without_parameters(self):
+        """A model with no parameters yields None fraction and empty counts."""
         class Bare:
             config = type("C", (), {"_attn_implementation": "sdpa"})()
 
@@ -105,6 +82,7 @@ class TestSnapshotsDegradeHonestly(unittest.TestCase):
         self.assertEqual(snap["param_tensors_by_device"], {})
 
     def test_placement_snapshot_counts_devices_and_computes_the_fraction(self):
+        """Tensors are counted per device; the off-GPU fraction is by numel."""
         class P:
             def __init__(self, device, n):
                 self.device = device
@@ -131,12 +109,13 @@ class TestSnapshotsDegradeHonestly(unittest.TestCase):
 
 
 class TestCallRecordCarriesTheSnapshots(unittest.TestCase):
+    """Each generate-call record carries the snapshots it is given."""
+
     def setUp(self):
         reset_generate_calls()
 
     def test_snapshots_are_carried_wholesale_into_the_record(self):
-        """Whole structures, not named fields — the enumeration bug has
-        already cost this project two cold builds."""
+        """Snapshot dicts are stored whole, unknown keys included."""
         record_generate_call(
             width=2, prompt_tokens_padded=1092, new_tokens=100,
             max_new_tokens=100, tokenise_s=0.02, generate_s=228.0,
@@ -150,7 +129,7 @@ class TestCallRecordCarriesTheSnapshots(unittest.TestCase):
         self.assertEqual(call["memory"]["free_gb"], 0.5)
 
     def test_absent_snapshots_are_none_not_empty_dicts(self):
-        """An empty dict would read as 'measured, nothing there'."""
+        """A call recorded without snapshots stores None, not empty dicts."""
         record_generate_call(
             width=1, prompt_tokens_padded=10, new_tokens=1, max_new_tokens=1,
             tokenise_s=0.0, generate_s=0.0, decode_s=0.0,
@@ -161,11 +140,10 @@ class TestCallRecordCarriesTheSnapshots(unittest.TestCase):
 
 
 class TestGeneratorLoadAccounting(unittest.TestCase):
-    """A second load mid-build would mean re-placement into whatever VRAM
-    was left. `load_generator` is lru_cached so this should stay at one;
-    the point is that the run RECORDS it rather than assuming it."""
+    """Generator loads are recorded in a list the run summary can read."""
 
     def test_load_events_is_a_list_the_probe_can_read(self):
+        """GENERATOR_LOADS is a list."""
         self.assertIsInstance(GENERATOR_LOADS, list)
 
 

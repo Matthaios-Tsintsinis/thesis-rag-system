@@ -1,13 +1,6 @@
-"""P7: NarrativeQA draws a seeded sample, not the head of the split.
+"""NarrativeQA draws its 40-story cell through the shared seeded sampler.
 
-The 40-story subsample used to be `order[:40]` — a head slice of the 115
-validation stories, under exactly the objection HotpotQA's seeded draw
-exists to answer: dataset order is not guaranteed random, so a prefix can
-be skewed on any dimension the ordering carries. Two benchmarks, two
-sampling standards, no stated reason.
-
-Both now draw through `src/eval/sampling.py`, so they cannot drift into
-two conventions.
+Pins the seed, the draw, and that the drawn ids reach the run summary.
 """
 
 from __future__ import annotations
@@ -21,6 +14,7 @@ from src.eval.sampling import SUBSAMPLE_SEED, subsample_indices
 
 class TestTheSharedSampler(unittest.TestCase):
     def test_the_seed_is_the_one_dated_constant(self):
+        # harness choice: preregistered seed (METHODS §B)
         self.assertEqual(SUBSAMPLE_SEED, 20260805)
 
     def test_the_draw_is_reproducible(self):
@@ -47,29 +41,20 @@ class TestTheSharedSampler(unittest.TestCase):
 
 class TestTheLoaderNoLongerTakesAPrefix(unittest.TestCase):
     def test_no_break_on_first_n_pattern_remains(self):
-        """The Done-when line, asserted rather than eyeballed."""
+        """The loader has no first-n prefix loop."""
         src = inspect.getsource(narrativeqa.NarrativeQABenchmark.iter_eval_units)
         self.assertNotIn("n_done", src)
         self.assertNotIn("break", src)
 
     def test_the_loader_samples_through_the_shared_helper(self):
-        """The loader delegates the draw to `select_units`, which calls
-        the shared sampler.
-
-        NOTE ON WHAT THIS TEST IS WORTH. It is a SOURCE GREP, and it
-        passed continuously through the period when a cell launched
-        without `--max-units` ran all 115 stories: the loader did call the
-        shared sampler, just only sometimes. Grepping for a call proves
-        the call exists, never that it governs the run. The behavioural
-        counterpart lives in `test_cell_population_is_code.py`, and that
-        is the test that would have caught it."""
+        """The loader draws through select_units and the shared sampler."""
         src = inspect.getsource(narrativeqa.NarrativeQABenchmark.iter_eval_units)
         self.assertIn("select_units", src)
         helper = inspect.getsource(narrativeqa.select_units)
         self.assertIn("subsample_indices", helper)
 
     def test_the_default_draw_is_the_cell_not_the_split(self):
-        """The behavioural claim the grep above cannot make."""
+        """select_units with no limit returns the 40-story cell."""
         order = [f"s{i}" for i in range(115)]
         self.assertEqual(len(narrativeqa.select_units(order, None)),
                          narrativeqa.CELL_UNITS)
@@ -82,9 +67,7 @@ class TestTheLoaderNoLongerTakesAPrefix(unittest.TestCase):
 
 class TestDrawnIdsReachTheRunSummary(unittest.TestCase):
     def test_the_runner_copies_benchmark_stats_verbatim(self):
-        """`sampled_story_ids` is only reproducible-and-inspectable if it
-        actually lands in the summary; the runner writes benchmark.stats
-        wholesale, which is the mechanism."""
+        """The runner writes benchmark.stats whole into the summary."""
         from src.eval import runner
 
         self.assertIn('"benchmark_stats": getattr(benchmark, "stats", {})',

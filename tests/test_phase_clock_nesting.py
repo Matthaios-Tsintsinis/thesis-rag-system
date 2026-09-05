@@ -1,21 +1,5 @@
-"""Phase times must PARTITION the build, not overlap it.
-
-THE DEFECT. `_gmm_cluster` is decorated `@_timed("gmm_final_fit")` and
-calls `_get_optimal_clusters`, decorated `@_timed("gmm_bic_sweep")`. The
-sweep's wall time therefore accrued to BOTH buckets, so the phases summed
-to more than the build they were measuring: nqa_largest reported
-777+254+248+84+2 = 1,366 s against a 1,150 s build (+19%), MultiHop
-3,199 s against 2,852 s (+12%). The overshoot scaled with corpus size
-because the BIC sweep does.
-
-Wall clock was never affected — the tree took what it took. But phase
-attribution is now used to make decisions (it is what retired UMAP as a
-suspect and what surfaced GMM as the second cost), and a decision made on
-double-counted time is a decision made on a wrong number.
-
-THE INVARIANT: a parent phase records its own time only. Child time
-belongs to the child. The sum over phases is then bounded by the build,
-which is a property a probe can assert instead of a reader eyeballing.
+"""Pins that nested _timed phases partition the build: a parent phase
+records only its own time, so the phase sum never exceeds the wall clock.
 """
 
 from __future__ import annotations
@@ -50,15 +34,16 @@ class TestNestedPhasesDoNotDoubleCount(unittest.TestCase):
         _CLOCK.reset()
 
     def test_parent_excludes_its_child(self):
+        """A parent phase records its own time, not its child's."""
         _parent(0.05, 0.05)
         parent = _CLOCK.seconds["parent"]
         child = _CLOCK.seconds["child"]
         self.assertGreater(child, 0.03)
-        # Parent kept only its own ~0.05 s, not the full ~0.10 s.
+        # Parent keeps only its own ~0.05 s, not the full ~0.10 s.
         self.assertLess(parent, child * 1.8)
 
     def test_the_sum_does_not_exceed_the_wall_time(self):
-        """The property the build violated by 19%."""
+        """The sum over phases stays within the measured wall time."""
         t0 = time.perf_counter()
         _parent(0.05, 0.05)
         wall = time.perf_counter() - t0
@@ -66,20 +51,21 @@ class TestNestedPhasesDoNotDoubleCount(unittest.TestCase):
         self.assertLessEqual(total, wall * 1.05)
 
     def test_three_deep_nesting_still_partitions(self):
+        """Three levels of nesting still sum to at most the wall time."""
         t0 = time.perf_counter()
         _outer(0.03)
         wall = time.perf_counter() - t0
         self.assertLessEqual(sum(_CLOCK.seconds.values()), wall * 1.05)
 
     def test_siblings_still_add_normally(self):
+        """Sibling calls of one phase accumulate calls and seconds."""
         _child(0.02)
         _child(0.02)
         self.assertEqual(_CLOCK.calls["child"], 2)
         self.assertGreater(_CLOCK.seconds["child"], 0.03)
 
     def test_an_exception_still_closes_the_frame(self):
-        """A build that raises mid-phase must not leave the stack dirty
-        and mis-attribute every later phase to it."""
+        """A phase that raises still pops its frame; later phases are clean."""
 
         @_timed("boom")
         def _boom():
@@ -92,6 +78,7 @@ class TestNestedPhasesDoNotDoubleCount(unittest.TestCase):
         self.assertIn("boom", _CLOCK.seconds)
 
     def test_stats_report_the_partition_invariant(self):
+        """as_stats reports phase_measured_total_s as the rounded phase sum."""
         _parent(0.03, 0.03)
         stats = _CLOCK.as_stats()
         self.assertIn("phase_measured_total_s", stats)

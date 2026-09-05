@@ -1,26 +1,9 @@
-"""Guard (v): a GMM fit that raises must not kill the tree build.
+"""Pins the GMM fit guard: a fit that raises is skipped and counted.
 
-MEASURED, not anticipated. At production PaperTreeParams a layer of 16
-nodes and a layer of 25 nodes both died with sklearn's "ill-defined
-empirical covariance", while 20, 30 and 40 survived. The BIC sweep tries
-k up to n-1, and UMAP's reduction of few points into 10 components leaves
-tight local clumps for a high-k component to collapse onto.
-
-Two properties make this worth a guard rather than a retry-and-hope:
-
-  * it is NOT monotone in n, so a build passing at one corpus size proves
-    nothing about another;
-  * a raise loses the ENTIRE tree, which is the most expensive artifact
-    in the harness.
-
-Most trees hit a 12-30 node layer near the top, so this is not a
-HotpotQA-only concern — it is every benchmark.
-
-The failure is stubbed rather than reproduced from real UMAP output: the
-guard's contract is "skip what cannot be fitted, keep what can, count
-it", and that is what these pin. A test that depended on sklearn's exact
-numerics at a particular UMAP version would be testing the library.
+The failure is stubbed, so the tests pin the guard's contract and not
+sklearn's numerics.
 """
+# deviation from ref (ref crashes): see METHODS §A.4.4 (v)
 
 from __future__ import annotations
 
@@ -36,16 +19,12 @@ from src.raptor_paper import (
 
 
 class _StubGMM:
-    """GaussianMixture stand-in that raises for a chosen set of k.
+    """GaussianMixture stand-in that raises for a chosen set of k."""
 
-    Distinguishes the BIC sweep from the final fit by SEED, exactly as
-    the code under test does: the sweep runs at bic_random_state=224 and
-    the final fit at gmm_random_state=0. That seed mismatch is the
-    reference's own (ruling 3), and it is precisely why a k the sweep
-    fitted can still fail in the final fit — so the two failure sets have
-    to be settable independently or the walk-down cannot be tested.
-    """
-
+    # The sweep fits at seed 224 and the final fit at seed 0, so the two
+    # failure sets are told apart by random_state.
+    # ref: raptor/cluster_utils.py @ 7da1d48a (RANDOM_SEED = 224)
+    # ref: raptor/cluster_utils.py::GMM_cluster @ 7da1d48a (random_state=0; the ref uses both seeds)
     fail_for: set[int] = set()          # any fit
     fail_final_for: set[int] = set()    # final fit only (seed 0)
     bic_by_k: dict[int, float] = {}
@@ -77,10 +56,13 @@ class _StubGMM:
 
 
 class _StubMixture:
+    """Module stand-in for sklearn.mixture."""
+
     GaussianMixture = _StubGMM
 
 
 def _install_stub(fail_for, bic_by_k=None, fail_final_for=()):
+    """Install the stub mixture module and return what it replaced."""
     import sys
 
     _StubGMM.fail_for = set(fail_for)
@@ -92,6 +74,7 @@ def _install_stub(fail_for, bic_by_k=None, fail_final_for=()):
 
 
 def _restore(saved):
+    """Put the saved sklearn.mixture module back."""
     import sys
 
     if saved is None:
@@ -101,6 +84,8 @@ def _restore(saved):
 
 
 class _StubCase(unittest.TestCase):
+    """Shared params, a 12-point layer and stub cleanup."""
+
     def setUp(self):
         self.params = PaperTreeParams()
         self.X = np.zeros((12, 10), dtype=np.float32)
@@ -111,8 +96,11 @@ class _StubCase(unittest.TestCase):
 
 
 class TestBicSweepSkipsFailingK(_StubCase):
+    """The BIC sweep skips a k that cannot be fitted."""
+
     def test_a_failing_k_is_skipped_and_counted(self):
-        # k=3 would have won on BIC, but cannot be fitted.
+        """The best BIC k is skipped when its fit raises, and counted."""
+        # k=3 wins on BIC but cannot be fitted.
         self._saved = _install_stub(
             fail_for={3}, bic_by_k={2: 50.0, 3: 1.0, 4: 60.0}
         )
@@ -123,6 +111,7 @@ class TestBicSweepSkipsFailingK(_StubCase):
         self.assertEqual(stats["bic_fit_failures"], 1)
 
     def test_the_build_survives_when_most_k_fail(self):
+        """The sweep falls back to k=1 when every k above 1 fails."""
         self._saved = _install_stub(fail_for=set(range(2, 12)))
         stats: dict = {}
         k = _get_optimal_clusters(self.X, self.params, stats)
@@ -130,6 +119,7 @@ class TestBicSweepSkipsFailingK(_StubCase):
         self.assertEqual(stats["bic_fit_failures"], 10)
 
     def test_all_failing_falls_back_to_one_cluster(self):
+        """The sweep returns k=1 and sets bic_all_fits_failed when all fail."""
         self._saved = _install_stub(fail_for=set(range(1, 12)))
         stats: dict = {}
         k = _get_optimal_clusters(self.X, self.params, stats)
@@ -137,8 +127,7 @@ class TestBicSweepSkipsFailingK(_StubCase):
         self.assertEqual(stats["bic_all_fits_failed"], 1)
 
     def test_no_failures_leaves_no_trip_counters(self):
-        """The guard must be inert on a healthy layer, or a non-zero
-        counter stops meaning anything."""
+        """A healthy layer writes no failure counters."""
         self._saved = _install_stub(fail_for=set(), bic_by_k={5: -1.0})
         stats: dict = {}
         k = _get_optimal_clusters(self.X, self.params, stats)
@@ -148,12 +137,12 @@ class TestBicSweepSkipsFailingK(_StubCase):
 
 
 class TestFinalFitWalksDown(_StubCase):
+    """The final fit walks k down one step at a time when it raises."""
+
     def test_final_fit_failure_steps_down_instead_of_collapsing_to_one(self):
-        """The seed mismatch (224 for the sweep, 0 for the final fit) means
-        the final fit can fail at a k the sweep accepted. Falling straight
-        to k=1 would turn a splittable layer into a single parent."""
-        # Sweep (seed 224) fits everything and picks 6; the final fit
-        # (seed 0) fails at 6 and 5.
+        """A final fit that fails at the sweep's k steps down, not to 1."""
+        # The sweep fits everything and picks 6; the final fit fails at 6
+        # and 5.
         self._saved = _install_stub(
             fail_for=set(), bic_by_k={6: -100.0}, fail_final_for={6, 5}
         )
@@ -165,6 +154,7 @@ class TestFinalFitWalksDown(_StubCase):
         self.assertEqual(len(labels), len(self.X))
 
     def test_labels_are_still_well_formed_after_stepping_down(self):
+        """Labels after a step-down are non-empty and below the final k."""
         self._saved = _install_stub(
             fail_for=set(), bic_by_k={4: -100.0}, fail_final_for={4}
         )
@@ -178,9 +168,10 @@ class TestFinalFitWalksDown(_StubCase):
 
 
 class TestGuardIsReportedNotSilenced(unittest.TestCase):
+    """The guard's counters reach the reported index stats."""
+
     def test_counters_reach_the_index_stats(self):
-        """A reduced BIC candidate set is a FINDING about the clustering.
-        If it never leaves the tree's stats dict it cannot be reported."""
+        """Tree fit-failure counters are copied into the index stats."""
         from src.retrievers.m4_raptor import RaptorSystem
         from src.raptor_paper import PaperCollapsedIndex, PaperNode, PaperTree
 

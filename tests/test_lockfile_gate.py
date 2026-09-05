@@ -1,19 +1,7 @@
-"""The lockfile gate: the check that guards the silent matrix split.
+"""Tests for the runner's lockfile gate and the null-hash provenance warning.
 
-WHAT IT PREVENTS, and why a gate rather than a habit. The M4 substrate
-key folds `build_env` = `umap-learn=…;scikit-learn=…;numpy=…`. Colab
-updates its base image without notice, so a session that starts on a
-drifted image computes a DIFFERENT substrate key. The cache then MISSES
-rather than colliding: the tree rebuilds cleanly, the cell succeeds, and
-the matrix ends up holding two tree populations with no error anywhere.
-
-That failure is undetectable after the fact — nothing in the output says
-which image built which tree — which is exactly why it has to be caught
-before the fact.
-
-`scripts.pin_environment.check_lockfile` has existed and worked the whole
-time, with ZERO callers in the pipeline. Sixth instance of the project's
-recurring class: a check that exists, passes its own test, and is inert.
+The M4 substrate key folds the umap-learn, scikit-learn and numpy versions,
+so an unpinned environment would split the matrix into two tree populations.
 """
 
 from __future__ import annotations
@@ -27,8 +15,7 @@ from src.eval.runner import assert_environment_pinned
 
 
 class TestGate(unittest.TestCase):
-    """No escape since the repo reduction: a missing lockfile and a
-    violated one both abort; there is no flag that downgrades either."""
+    """A missing or violated lockfile aborts the run; no flag downgrades it."""
 
     def _lock(self, td: str, body: str = "numpy==2.2.6\n") -> Path:
         p = Path(td) / "requirements.lock"
@@ -36,12 +23,14 @@ class TestGate(unittest.TestCase):
         return p
 
     def test_missing_lockfile_aborts(self):
+        """An absent lockfile exits non-zero."""
         with tempfile.TemporaryDirectory() as td:
             with self.assertRaises(SystemExit) as ctx:
                 assert_environment_pinned(Path(td) / "absent.lock")
             self.assertNotEqual(ctx.exception.code, 0)
 
     def test_mismatched_environment_aborts(self):
+        """A non-zero check_lockfile result exits the run."""
         with tempfile.TemporaryDirectory() as td:
             lock = self._lock(td)
             with mock.patch("scripts.pin_environment.check_lockfile",
@@ -50,6 +39,7 @@ class TestGate(unittest.TestCase):
                     assert_environment_pinned(lock)
 
     def test_matching_environment_passes(self):
+        """A zero check_lockfile result lets the run continue."""
         with tempfile.TemporaryDirectory() as td:
             lock = self._lock(td)
             with mock.patch("scripts.pin_environment.check_lockfile",
@@ -57,6 +47,7 @@ class TestGate(unittest.TestCase):
                 assert_environment_pinned(lock)
 
     def test_the_abort_message_names_the_failure_mode(self):
+        """The abort carries a string message."""
         with tempfile.TemporaryDirectory() as td:
             with self.assertRaises(SystemExit) as ctx:
                 assert_environment_pinned(Path(td) / "absent.lock")
@@ -67,11 +58,10 @@ class TestGate(unittest.TestCase):
 
 
 class TestProvenanceWarnsOnNullHash(unittest.TestCase):
-    """A null hash in a cell summary means that cell recorded NOTHING
-    about the environment that produced it. It used to be written in
-    silence."""
+    """A null lockfile_hash in a cell summary is printed, never silent."""
 
     def test_null_hash_is_announced(self):
+        """An absent lockfile yields a null hash and a printed warning naming it."""
         from scripts.pin_environment import environment_provenance
 
         with tempfile.TemporaryDirectory() as td:
@@ -83,6 +73,7 @@ class TestProvenanceWarnsOnNullHash(unittest.TestCase):
             self.assertTrue("null" in printed or "none" in printed)
 
     def test_a_real_lockfile_still_hashes_without_warning(self):
+        """A present lockfile yields a non-null hash."""
         from scripts.pin_environment import environment_provenance
 
         with tempfile.TemporaryDirectory() as td:

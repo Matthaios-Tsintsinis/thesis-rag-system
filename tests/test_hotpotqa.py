@@ -1,21 +1,6 @@
-"""HotpotQA, both variants. No network, no model — a fake dataset stands in.
+"""Loader, subsample and scorer tests for HotpotQA, both variants.
 
-The loader's job is corpus SHAPE and gold PROVENANCE, and both are
-testable against a hand-built dataset. What a real download would add is
-confidence that the HF field names are right, which is one line of the
-loader and the first thing a smoke run reveals.
-
-The properties pinned here are the ones the design decisions turned on:
-
-  * variant A gives ONE unit per question over that question's own 10
-    paragraphs — the published setting;
-  * variant B pools across a shard and DEDUPLICATES by title, because
-    the same Wikipedia paragraph is a distractor for many questions;
-  * gold is SENTENCE-level for both (ruling (ii)), so a title's
-    sentences are separate CorpusItems under one parent;
-  * rank-aware is projected to TITLE level, and the projection COPIES
-    rather than mutates, because those Chunks are the system's live
-    index state.
+A hand-built dataset stands in; no network, no model.
 """
 
 from __future__ import annotations
@@ -78,7 +63,7 @@ def _fake_rows(n=4):
 
 
 def _install(bench, rows):
-    bench._rows = rows           # skip _load / _measure entirely
+    bench._rows = rows           # bypass _load and _measure
     bench.stats["n_questions"] = len(rows)
     return bench
 
@@ -96,8 +81,7 @@ class TestSentenceItems(unittest.TestCase):
         self.assertEqual(len({i.item_id for i in items}), 3)
 
     def test_blank_sentences_are_dropped_without_shifting_ids(self):
-        """A dropped sentence must not renumber the ones after it, or
-        gold sent_ids would point at the wrong text."""
+        """A dropped blank sentence does not renumber the ones after it."""
         items = _sentence_items(_ctx(("T", ["a.", "   ", "c."])))
         self.assertEqual([i.span_id for i in items], ["sent0", "sent2"])
         self.assertEqual([i.text for i in items], ["a.", "c."])
@@ -122,8 +106,7 @@ class TestVariantA(unittest.TestCase):
         self.assertEqual(gold, frozenset({("Alpha", "sent0"), ("Beta0", "sent1")}))
 
     def test_parent_scope_is_none(self):
-        """The corpus IS the candidate set; a further restriction would
-        be a second, silent filter."""
+        """The corpus is the candidate set; parent_scope adds no filter."""
         self.assertIsNone(self.units[0].queries[0].parent_scope)
 
     def test_question_type_carries_the_bridge_comparison_split(self):
@@ -150,9 +133,8 @@ class TestVariantBPooling(unittest.TestCase):
         self.assertEqual(len(self.units[0].queries), 2)
 
     def test_shared_titles_are_deduplicated(self):
-        """Alpha and Gamma appear in EVERY question. Indexing them once
-        per question would waste the build and put exact-duplicate
-        vectors into the clustering."""
+        """A title shared across questions is indexed once per shard."""
+        # harness choice: our construction, not comparable to published HotpotQA (METHODS §B.4)
         titles = [i.parent_id for i in self.units[0].corpus]
         self.assertEqual(titles.count("Alpha"), 2)   # 2 sentences, once
         self.assertEqual(titles.count("Gamma"), 1)
@@ -171,19 +153,14 @@ class TestVariantBPooling(unittest.TestCase):
         self.assertGreater(pooled, single)
 
     def test_variant_is_recorded_on_every_query(self):
-        """A row must say which variant produced it; the two are not
-        comparable to each other or to published numbers."""
+        """Every query records which variant produced it."""
         self.assertEqual(self.units[0].queries[0].metadata["variant"], "pooled")
 
 
 class TestSeededSubsample(unittest.TestCase):
-    """Seeded random, NOT the head of the file.
+    """The subsample is a seeded draw, not the head of the file."""
 
-    HotpotQA dev is not guaranteed randomly ordered — it can be grouped
-    by type and level — so a head slice risks skewing the sample on
-    exactly the bridge/comparison axis that justifies including the
-    benchmark.
-    """
+    # dataset: hotpotqa/hotpot_qa distractor, validation (7,405); seeded 1,000
 
     def test_it_is_not_the_head(self):
         idx = subsample_indices(7405, 1000)
@@ -198,9 +175,7 @@ class TestSeededSubsample(unittest.TestCase):
                             subsample_indices(7405, 1000, seed=1))
 
     def test_indices_are_sorted_unique_and_in_range(self):
-        """Sorted so the subsample keeps DATASET order — variant B's
-        shard boundaries must be a function of the sample, not of the
-        order sample() happened to emit."""
+        """Indices keep dataset order, so shards depend only on the sample."""
         idx = subsample_indices(7405, 1000)
         self.assertEqual(idx, sorted(idx))
         self.assertEqual(len(idx), len(set(idx)))
@@ -208,9 +183,7 @@ class TestSeededSubsample(unittest.TestCase):
         self.assertTrue(all(0 <= i < 7405 for i in idx))
 
     def test_both_variants_draw_the_SAME_sample(self):
-        """If A and B answered different questions, an A-vs-B comparison
-        would confound the pooling change with a change of question set —
-        and comparing them is the whole reason both exist."""
+        """Both variants draw the same question sample."""
         a = HotpotQABenchmark(max_questions=500)
         b = HotpotQAPooledBenchmark(max_questions=500)
         self.assertEqual(
@@ -223,14 +196,11 @@ class TestSeededSubsample(unittest.TestCase):
         self.assertEqual(subsample_indices(50, 999), list(range(50)))
 
     def test_the_seed_matches_the_project_convention(self):
+        # harness choice: preregistered seed (METHODS §B)
         self.assertEqual(SUBSAMPLE_SEED, 20260805)
 
     def test_the_registered_sample_is_the_DEFAULT_not_a_flag(self):
-        """The runner constructs benchmarks with NO arguments. If the
-        subsample only fired when max_questions was passed, no real run
-        would ever subsample, and --max-units 1000 would silently take
-        the first 1,000 of 7,405 — the head slice the seeding exists to
-        avoid, reintroduced through a different door."""
+        """A benchmark built with no arguments draws the seeded 1,000."""
         for cls in (HotpotQABenchmark, HotpotQAPooledBenchmark):
             with self.subTest(cls=cls.__name__):
                 self.assertEqual(cls().max_questions, PREREGISTERED_Q)
@@ -260,9 +230,7 @@ class TestTitleProjection(unittest.TestCase):
                          (("Alpha", "<title>"), ("Beta", "<title>")))
 
     def test_the_original_chunks_are_not_mutated(self):
-        """These Chunks are the system's LIVE index state, and CK-2 runs
-        on the same objects — rewriting provenance in place would corrupt
-        the set-F1 computed alongside."""
+        """Projection returns copies and leaves the input Chunks untouched."""
         original = self._rc("c0", (("Alpha", "sent0"),))
         _project_to_titles([original])
         self.assertEqual(original.chunk.gold_provenance, (("Alpha", "sent0"),))
@@ -280,8 +248,8 @@ class TestScoring(unittest.TestCase):
             question_type="bridge")
 
     def test_exact_match_uses_the_official_normalisation(self):
-        """Lowercase, strip articles, drop punctuation — so 'Eiffel
-        Tower' matches 'the Eiffel Tower'."""
+        """EM normalises both sides, so the article and the dot drop out."""
+        # official: hotpot_evaluate_v1.py::exact_match_score @ 36358534
         s = self.b.score_answer("Eiffel Tower.", self.q)
         self.assertEqual(s.metadata["exact_match"], 1.0)
         self.assertEqual(s.value, 1.0)
@@ -308,7 +276,8 @@ class TestScoring(unittest.TestCase):
         ]
         score = self.b.score_retrieval(chunks, self.q)
         self.assertFalse(score.skipped)
-        # Both gold TITLES retrieved in the top 2.
+        # both gold titles sit in the top 2
+        # harness choice: two gold titles, Hit@2 is the headline (METHODS §B.3)
         self.assertEqual(score.hit_at_k.get(2), 1.0)
         self.assertGreater(score.mrr, 0.0)
 
@@ -328,21 +297,15 @@ def _yn_query(gold: str, qtype: str = "comparison") -> EvalQuery:
 
 
 class TestOfficialYesNoGuard(unittest.TestCase):
-    """HotpotQA's yes/no/noanswer guard, against a transcribed reference.
-
-    The reference below is transcribed from the published
-    `hotpot_evaluate_v1.f1_score`, so each assertion carries its own
-    source instead of pointing at one. It uses THIS harness's normaliser
-    rather than the official `normalize_answer`, which is legitimate here
-    and only here: the two compose identically and our documented
-    NFKC/Unicode extension is provably inert on the ASCII inputs below.
-    """
+    """The yes/no/noanswer guard matches the official f1_score, transcribed."""
 
     @staticmethod
     def _official_f1(prediction: str, ground_truth: str) -> float:
-        """Shape of the official f1_score, returning the F1 term only."""
+        """The official f1_score, transcribed, returning the F1 term only."""
+        # official: hotpot_evaluate_v1.py::f1_score @ 36358534 (both early returns)
         from collections import Counter
 
+        # harness extension (inert on ASCII): see METHODS §C.11
         normalized_prediction = normalize_qasper_answer(prediction)
         normalized_ground_truth = normalize_qasper_answer(ground_truth)
 
@@ -365,7 +328,7 @@ class TestOfficialYesNoGuard(unittest.TestCase):
         recall = 1.0 * num_same / len(ground_truth_tokens)
         return (2 * precision * recall) / (precision + recall)
 
-    # The case measured on the preregistered sample, 2026-08-18.
+    # a real prediction/gold pair the guard zeroes
     MEASURED_PRED = "Yes, both films were directed by the same person."
     MEASURED_GOLD = "yes"
 
@@ -374,22 +337,19 @@ class TestOfficialYesNoGuard(unittest.TestCase):
             hotpot_token_f1(self.MEASURED_PRED, self.MEASURED_GOLD), 0.0)
 
     def test_the_guard_is_load_bearing_on_that_case(self):
-        """Without the guard this pair earns 2/9 — so the test above
-        cannot be passing for some incidental reason."""
+        """Unguarded, this pair scores 2/9; the zero above is the guard's."""
         self.assertAlmostEqual(
             token_f1(self.MEASURED_PRED, self.MEASURED_GOLD), 0.2222, places=4)
 
     def test_it_scores_zero_THROUGH_the_benchmark_scorer(self):
-        """The property is about the scorer a cell actually runs, not
-        about a helper reachable from a test."""
+        """The guard applies through the benchmark scorer a cell runs."""
         s = HotpotQABenchmark().score_answer(
             self.MEASURED_PRED, _yn_query(self.MEASURED_GOLD))
         self.assertEqual(s.value, 0.0)
         self.assertEqual(s.method, "token_f1")
 
     def test_the_pooled_variant_inherits_it(self):
-        """All ten HotpotQA cells score alike or the column is two
-        populations wearing one name."""
+        """The pooled variant scores with the same guard."""
         s = HotpotQAPooledBenchmark().score_answer(
             self.MEASURED_PRED, _yn_query(self.MEASURED_GOLD))
         self.assertEqual(s.value, 0.0)
@@ -403,12 +363,11 @@ class TestOfficialYesNoGuard(unittest.TestCase):
         self.assertEqual(hotpot_token_f1("yes", "no"), 0.0)
 
     def test_a_sentinel_prediction_against_a_real_gold_scores_zero(self):
-        """The FIRST official branch: prediction is the sentinel."""
+        """The first official branch: the prediction is the sentinel."""
         self.assertEqual(hotpot_token_f1("yes", "the Eiffel Tower"), 0.0)
 
     def test_non_sentinel_pairs_are_untouched(self):
-        """The guard must not disturb the 93.9% of rows it does not
-        concern."""
+        """Pairs with no sentinel score exactly as the shared token_f1."""
         for pred, gold in (
             ("Eiffel Tower", "the Eiffel Tower"),
             ("Paris France", "Paris"),
@@ -433,9 +392,8 @@ class TestOfficialYesNoGuard(unittest.TestCase):
                 places=12, msg=f"{pred!r} vs {gold!r}")
 
     def test_exact_match_is_NOT_routed_through_the_guard(self):
-        """Official `exact_match_score` has no guard, and this harness
-        already matched it. Wrapping EM would create a divergence where
-        none existed."""
+        """Exact match has no guard, as in the official exact_match_score."""
+        # official: hotpot_evaluate_v1.py::exact_match_score @ 36358534
         s = HotpotQABenchmark().score_answer("Yes", _yn_query("yes"))
         self.assertEqual(s.metadata["exact_match"], 1.0)
         s2 = HotpotQABenchmark().score_answer(
@@ -444,12 +402,10 @@ class TestOfficialYesNoGuard(unittest.TestCase):
 
 
 class TestOfficialAnswerPrecisionAndRecall(unittest.TestCase):
-    """`update_answer` accumulates em, f1, prec AND recall — four answer
-    numbers. We computed precision and recall inside token_f1 and threw
-    them away; they are surfaced now because a reader checking against
-    the official script looks for them."""
+    """Precision and recall reach the row metadata beside F1."""
 
     def test_the_triple_matches_the_official_arithmetic(self):
+        # official: hotpot_evaluate_v1.py::f1_score @ 36358534
         # pred 2 tokens, gold 3 tokens, 2 in common
         f1, p, r = hotpot_token_f1_prf("the Eiffel Tower", "Eiffel Tower Paris")
         self.assertAlmostEqual(p, 2 / 2)
@@ -464,7 +420,7 @@ class TestOfficialAnswerPrecisionAndRecall(unittest.TestCase):
                              hotpot_token_f1(pred, gold), (pred, gold))
 
     def test_the_yes_no_guard_zeroes_ALL_THREE(self):
-        """Reference ZERO_METRIC is (0, 0, 0), not an F1-only zero."""
+        """The guard zeroes all three, matching the official ZERO_METRIC."""
         self.assertEqual(
             hotpot_token_f1_prf("Yes, both films were directed by the same "
                                 "person.", "yes"),
@@ -477,7 +433,7 @@ class TestOfficialAnswerPrecisionAndRecall(unittest.TestCase):
         self.assertAlmostEqual(s.metadata["answer_recall"], 2 / 3)
 
     def test_the_primary_value_is_unchanged_by_surfacing_them(self):
-        """Additive metadata only — no score moves."""
+        """Surfacing precision and recall leaves the primary value alone."""
         q = _yn_query("Eiffel Tower Paris")
         s = HotpotQABenchmark().score_answer("the Eiffel Tower", q)
         self.assertEqual(s.value, hotpot_token_f1("the Eiffel Tower",
@@ -486,14 +442,7 @@ class TestOfficialAnswerPrecisionAndRecall(unittest.TestCase):
 
 
 class TestTheGuardIsHotpotLocal(unittest.TestCase):
-    """It must not reach the other two live benchmarks.
-
-    BEHAVIOURAL, not a source grep: each scorer is driven on the exact
-    pair the guard would zero, and asserted to return the UNGUARDED
-    value. A grep for the import would pass just as well if the shared
-    `token_f1` had been edited instead, which is the change this test
-    exists to forbid.
-    """
+    """The guard is HotpotQA-local; other benchmarks score unguarded."""
 
     PRED = "Yes, both films were directed by the same person."
     GOLD = "yes"

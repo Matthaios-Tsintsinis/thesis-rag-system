@@ -1,26 +1,5 @@
-"""Per-call breakdown of `model.generate()`, so 230 s becomes arithmetic.
-
-WHAT THIS EXISTS TO SETTLE. A tree build spends 96% of its time in
-`summarize`, at ~230 s per `generate()` call, and that figure is CONSTANT
-across a threefold range of batch width (8.5 -> 2.92). Constant per call
-means the cost is neither per-token nor per-sequence, and falling VRAM
-with no speedup rules out allocator pressure. What is left is a fixed
-per-call cost that the wall-clock total cannot distinguish between:
-prefill of a very long padded prompt, a decode loop running far more
-steps than the 100-token cap implies, or CPU-side tokenise/decode work
-outside generation entirely.
-
-One number cannot separate those. Three timed phases plus the shapes can:
-`s_per_decode_step` against the healthy 66 ms baseline (6.6 s / 100 steps,
-one ~2,000-token prompt, fp16 resident on an L4) says whether generation
-itself is slow, and `new_tokens` says whether the loop is even running the
-number of steps it claims.
-
-SCOPE, stated as `test_generate_batch.py` states it: the torch path
-cannot run on a host without torch, so what is tested here is the record
-structure, the accumulation, and the anti-enumeration property. The
-timings themselves are first exercised on Colab.
-"""
+"""Per-call `generate()` records in `src.models`: record shape, derived
+figures, accumulation, and the summary that carries the whole store."""
 
 from __future__ import annotations
 
@@ -39,6 +18,7 @@ class TestRecordGenerateCall(unittest.TestCase):
         reset_generate_calls()
 
     def test_record_carries_every_phase_and_shape(self):
+        """A record keeps all three timed phases and every shape passed in."""
         record_generate_call(
             width=8,
             prompt_tokens_padded=3500,
@@ -59,8 +39,7 @@ class TestRecordGenerateCall(unittest.TestCase):
         self.assertEqual(call["decode_s"], 0.6)
 
     def test_derived_figures_are_the_whole_point(self):
-        """`s_per_decode_step` is what gets compared to the 66 ms
-        baseline; `padded_input_cells` is what the cap actually bounds."""
+        """Per-step time, total time and padded cells come from the record."""
         record_generate_call(
             width=8, prompt_tokens_padded=1000, new_tokens=100,
             max_new_tokens=100, tokenise_s=0.5, generate_s=230.0,
@@ -72,7 +51,7 @@ class TestRecordGenerateCall(unittest.TestCase):
         self.assertEqual(call["padded_input_cells"], 8000)
 
     def test_zero_new_tokens_does_not_divide_by_zero(self):
-        """A call that emitted nothing is a real outcome, not a crash."""
+        """A call that emits no tokens records None for the per-step time."""
         record_generate_call(
             width=2, prompt_tokens_padded=100, new_tokens=0,
             max_new_tokens=100, tokenise_s=0.1, generate_s=1.0, decode_s=0.1,
@@ -81,6 +60,7 @@ class TestRecordGenerateCall(unittest.TestCase):
         self.assertIsNone(call["s_per_decode_step"])
 
     def test_calls_accumulate_in_order(self):
+        """Records keep call order and number calls from 1."""
         for w in (4, 8, 2):
             record_generate_call(
                 width=w, prompt_tokens_padded=10, new_tokens=1,
@@ -93,8 +73,7 @@ class TestRecordGenerateCall(unittest.TestCase):
                          [1, 2, 3])
 
     def test_legacy_counters_still_move(self):
-        """`n_calls` and `widths` are read by existing consumers; the
-        richer record is additive, not a replacement."""
+        """`n_calls` and `widths` move alongside the per-call records."""
         record_generate_call(
             width=5, prompt_tokens_padded=10, new_tokens=1,
             max_new_tokens=100, tokenise_s=0.0, generate_s=1.0, decode_s=0.0,
@@ -103,6 +82,7 @@ class TestRecordGenerateCall(unittest.TestCase):
         self.assertEqual(GENERATE_CALLS["widths"], [5])
 
     def test_reset_clears_the_records(self):
+        """`reset_generate_calls` empties the whole store."""
         record_generate_call(
             width=1, prompt_tokens_padded=1, new_tokens=1, max_new_tokens=1,
             tokenise_s=0.0, generate_s=0.0, decode_s=0.0,
@@ -112,18 +92,13 @@ class TestRecordGenerateCall(unittest.TestCase):
 
 
 class TestSummaryCarriesWholeStructures(unittest.TestCase):
-    """The bug this guards has already cost two cold builds.
-
-    `phase_seconds` and `generate_calls` were written correctly, surfaced
-    correctly, and dropped by a hand-picked field list three lines before
-    the JSON. The tree-stats block enumerated four keys of GENERATE_CALLS
-    by name, so anything added to it later would vanish the same way.
-    """
+    """The summary carries GENERATE_CALLS whole, never by listed keys."""
 
     def setUp(self):
         reset_generate_calls()
 
     def test_summary_reports_the_aggregates_consumers_already_read(self):
+        """The summary reports call count and mean/max/min width."""
         for w in (4, 8):
             record_generate_call(
                 width=w, prompt_tokens_padded=10, new_tokens=1,
@@ -137,6 +112,7 @@ class TestSummaryCarriesWholeStructures(unittest.TestCase):
         self.assertEqual(s["min_width"], 4)
 
     def test_summary_carries_the_per_call_records(self):
+        """The summary includes the per-call records themselves."""
         record_generate_call(
             width=3, prompt_tokens_padded=99, new_tokens=7,
             max_new_tokens=100, tokenise_s=0.1, generate_s=2.0, decode_s=0.3,
@@ -146,8 +122,7 @@ class TestSummaryCarriesWholeStructures(unittest.TestCase):
         self.assertEqual(s["calls"][0]["prompt_tokens_padded"], 99)
 
     def test_a_field_added_later_survives_into_the_summary(self):
-        """THE ANTI-ENUMERATION PROPERTY, asserted rather than trusted.
-        A key nothing knows about must still arrive at the consumer."""
+        """A key the summary does not know about still reaches the consumer."""
         record_generate_call(
             width=1, prompt_tokens_padded=1, new_tokens=1, max_new_tokens=1,
             tokenise_s=0.0, generate_s=0.0, decode_s=0.0,
@@ -158,6 +133,7 @@ class TestSummaryCarriesWholeStructures(unittest.TestCase):
         )
 
     def test_empty_summary_is_reported_not_faked(self):
+        """An empty store summarises to zero calls and a None mean."""
         s = generate_calls_summary()
         self.assertEqual(s["n_calls"], 0)
         self.assertIsNone(s["mean_width"])

@@ -1,17 +1,7 @@
-"""replay_cell driven end to end through fakes built from REAL types.
+"""End-to-end tests for replay_cell: gates, sidecars and per-system keys.
 
-The registries are patched but every object crossing replay_cell's
-boundary is the production dataclass (EvalUnit, EvalQuery,
-PreparedQuery, RetrievalScore, RetrievedChunk, Chunk) — the GoldAnswer
-standard. Covers the evidence the pre-flight audit demanded — a
-single-row mismatch refuses the WHOLE cell and writes no sidecar; a
-missing warm substrate refuses before anything indexes; the pass path
-writes glob-safe sidecars — plus the corrected per-system key logic:
-M2/M3 carry no topology component and ignore tree_build_env entirely;
-M4 asserts host COMPATIBILITY (component versions + python
-major.minor) and injects the RECORDED env string verbatim through the
-replay-only override, so a pre-e907d68 token-less record resolves the
-old key.
+The registries are patched, but every object crossing replay_cell's
+boundary is the production dataclass.
 """
 
 from __future__ import annotations
@@ -33,9 +23,8 @@ from scripts.replay_retrieval import _parse_env, replay_cell
 
 ATOM = ("docA", "<whole>")
 
-# host env, MEASURED from the real constant (the
-# fixture-parameters-from-real-data discipline): the compatible cases
-# are compatible on ANY host running these tests.
+# Host env read from the real constant, so the compatible cases are
+# compatible on any host that runs these tests.
 HOST = _parse_env(PAPER_TREE_BUILD_ENV)
 TOKENLESS_ENV = ";".join(
     f"{k}={v}" for k, v in HOST.items() if k != "python")
@@ -43,12 +32,14 @@ HOST_PY_FULL = HOST.get("python", "3.12") + ".13"
 
 
 def _chunk_hit():
+    """Build one retrieved chunk carrying the gold atom."""
     c = Chunk(chunk_id="c0", doc_id="d", text="t", n_words=1, position=0,
               gold_provenance=(ATOM,))
     return RetrievedChunk(chunk=c, score=1.0, rank=0)
 
 
 def _prepared(query):
+    """Build a PreparedQuery whose every ranking is the one gold hit."""
     hit = [_chunk_hit()]
     return PreparedQuery(query=query, retrieved=hit, packed=hit,
                          scoring_ranking=hit, system_prompt="s",
@@ -63,6 +54,8 @@ REPLAYED = RetrievalScore(
 
 
 class FakeSystem:
+    """Stand-in retriever that returns the fixed prepared query."""
+
     def __init__(self, config=None):
         self.config = config
         self.tree_cache_hit = True
@@ -76,9 +69,7 @@ class FakeSystem:
 
 
 def _fake_resolution(bank_holder, warm=True):
-    """Patch resolve_substrate: a real temp warm dir with a manifest
-    whose corpus_hash matches the derived one -- so replay_cell's
-    key-identity assertion runs against real files."""
+    """Fake resolve_substrate backed by a real temp dir and manifest."""
     def fake(system, system_id, items):
         d = bank_holder["dir"] / "cachekey0000"
         if warm:
@@ -91,6 +82,8 @@ def _fake_resolution(bank_holder, warm=True):
 
 
 class FakeBenchmark:
+    """Stand-in benchmark with one unit, one query and a fixed score."""
+
     def iter_eval_units(self, split):
         q = EvalQuery(query_id="q0", question_text="who?",
                       parent_scope=None, gold_answers=(),
@@ -104,6 +97,7 @@ class FakeBenchmark:
 
 def _write_bank(bank: Path, banked_retr: dict, system="M2",
                 tree_build_env=None, env_python=None):
+    """Write a one-row banked cell (summary + jsonl) into bank."""
     stem = f"multihop_rag_{system}_validation"
     summary = {"system": system, "benchmark": "multihop_rag",
                "generator": QWEN, "partial_run": False,
@@ -124,17 +118,19 @@ BANKED_MATCH = {"skipped": False, "f1": 1.0, "recall": 1.0,
                 "hit_at_k": {"1": 1.0, "5": 1.0, "10": 1.0},
                 "map_at_k": {"1": 1.0, "5": 1.0, "10": 1.0}}
 
-# every discovery pattern found in the glob audit (pre-flight item C8)
+# Every glob the bank readers use to discover cell files; a sidecar
+# must match none of them.
 BANK_DISCOVERY_PATTERNS = (
-    "*.summary.json",                       # bank gates + aggregate rglob
-    "multihop_rag_M2_validation_*.jsonl",   # significance stamped glob
-    "multihop_rag_M2_*.jsonl",              # significance loose glob
+    "*.summary.json",
+    "multihop_rag_M2_validation_*.jsonl",
+    "multihop_rag_M2_*.jsonl",
     "multihop_rag_M4_validation_*.jsonl",
     "multihop_rag_M4_*.jsonl",
 )
 
 
 def _patched(fn):
+    """Run fn with the fake system and benchmark in the registries."""
     import src.eval.runner as runner
     return mock.patch.dict(
         runner.SYSTEM_REGISTRY, {"M2": FakeSystem, "M4": FakeSystem})(
@@ -144,8 +140,11 @@ def _patched(fn):
 
 
 class TestReplayCellEndToEnd(unittest.TestCase):
+    """Gates and sidecar handling of replay_cell on a one-row cell."""
+
     @_patched
     def test_pass_path_writes_glob_safe_sidecars(self):
+        """A matching cell writes sidecars no bank reader can discover."""
         with TemporaryDirectory() as td:
             bank = Path(td)
             _write_bank(bank, dict(BANKED_MATCH))
@@ -168,10 +167,11 @@ class TestReplayCellEndToEnd(unittest.TestCase):
 
     @_patched
     def test_single_row_mismatch_refuses_cell_and_writes_nothing(self):
+        """One mismatched field refuses the whole cell by row id."""
         with TemporaryDirectory() as td:
             bank = Path(td)
             banked = dict(BANKED_MATCH)
-            banked["f1"] = 0.9        # one field, one row
+            banked["f1"] = 0.9
             _write_bank(bank, banked)
             holder = {"dir": bank}
             with mock.patch("scripts.replay_retrieval.resolve_substrate",
@@ -180,12 +180,13 @@ class TestReplayCellEndToEnd(unittest.TestCase):
                     replay_cell(bank, QWEN, "multihop_rag", "M2")
             msg = str(cm.exception)
             self.assertIn("GATE FAILED", msg)
-            self.assertIn("q0", msg)              # the refusal names the row
+            self.assertIn("q0", msg)
             self.assertEqual(
-                list(bank.glob("rankings.*")), [])  # nothing written
+                list(bank.glob("rankings.*")), [])
 
     @_patched
     def test_missing_warm_substrate_refuses(self):
+        """No warm substrate refuses before anything indexes or writes."""
         with TemporaryDirectory() as td:
             bank = Path(td)
             _write_bank(bank, dict(BANKED_MATCH))
@@ -200,8 +201,7 @@ class TestReplayCellEndToEnd(unittest.TestCase):
 
     @_patched
     def test_manifest_hash_disagreement_refuses(self):
-        # key identity SEEN, not inferred: a resolved dir whose manifest
-        # records a different corpus_hash refuses by name
+        """A manifest with another corpus_hash refuses and names it."""
         with TemporaryDirectory() as td:
             bank = Path(td)
             _write_bank(bank, dict(BANKED_MATCH))
@@ -221,6 +221,7 @@ class TestReplayCellEndToEnd(unittest.TestCase):
 
     @_patched
     def test_existing_sidecar_is_verified_and_skipped_until_deleted_by_hand(self):
+        """A present sidecar is checksum-verified and skipped."""
         with TemporaryDirectory() as td:
             bank = Path(td)
             _write_bank(bank, dict(BANKED_MATCH))
@@ -232,11 +233,11 @@ class TestReplayCellEndToEnd(unittest.TestCase):
                 side = bank / "rankings.multihop_rag_M2_validation.jsonl"
                 meta_path = bank / "rankings.multihop_rag_M2_validation.json"
                 before = side.read_bytes()
-                # the embedded checksum IS the rows file's hash
+                # The embedded checksum is the rows file's sha256.
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
                 self.assertEqual(meta["rows_sha256"],
                                  hashlib.sha256(before).hexdigest())
-                # present = done: verified, skipped, not rewritten
+                # A second call verifies the sidecar and leaves it alone.
                 self.assertIsNone(replay_cell(bank, QWEN, "multihop_rag", "M2"))
                 self.assertEqual(side.read_bytes(), before)
                 side.unlink()
@@ -245,6 +246,7 @@ class TestReplayCellEndToEnd(unittest.TestCase):
 
     @_patched
     def test_present_sidecar_written_before_the_checksum_is_verified_by_identity_and_count(self):
+        """A sidecar without rows_sha256 is checked by identity and count."""
         with TemporaryDirectory() as td:
             bank = Path(td)
             _write_bank(bank, dict(BANKED_MATCH))
@@ -254,10 +256,11 @@ class TestReplayCellEndToEnd(unittest.TestCase):
                 replay_cell(bank, QWEN, "multihop_rag", "M2")
                 meta_path = bank / "rankings.multihop_rag_M2_validation.json"
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
-                del meta["rows_sha256"]  # a Drive sidecar from the tag era
+                # Without a checksum the count check is the only guard.
+                del meta["rows_sha256"]
                 meta_path.write_text(json.dumps(meta), encoding="utf-8")
                 self.assertIsNone(replay_cell(bank, QWEN, "multihop_rag", "M2"))
-                meta["n_rows"] = meta["n_rows"] + 1  # count disagrees
+                meta["n_rows"] = meta["n_rows"] + 1
                 meta_path.write_text(json.dumps(meta), encoding="utf-8")
                 with self.assertRaises(SystemExit) as cm:
                     replay_cell(bank, QWEN, "multihop_rag", "M2")
@@ -265,6 +268,7 @@ class TestReplayCellEndToEnd(unittest.TestCase):
 
     @_patched
     def test_present_sidecar_whose_rows_were_altered_refuses(self):
+        """Altered rows under a present sidecar fail the checksum check."""
         with TemporaryDirectory() as td:
             bank = Path(td)
             _write_bank(bank, dict(BANKED_MATCH))
@@ -274,7 +278,7 @@ class TestReplayCellEndToEnd(unittest.TestCase):
                 replay_cell(bank, QWEN, "multihop_rag", "M2")
                 side = bank / "rankings.multihop_rag_M2_validation.jsonl"
                 row = json.loads(side.read_text(encoding="utf-8").splitlines()[0])
-                row["recall_at_k"]["5"] = 0.0  # same shape, different bytes
+                row["recall_at_k"]["5"] = 0.0
                 side.write_text(json.dumps(row) + "\n", encoding="utf-8")
                 with self.assertRaises(SystemExit) as cm:
                     replay_cell(bank, QWEN, "multihop_rag", "M2")
@@ -282,6 +286,7 @@ class TestReplayCellEndToEnd(unittest.TestCase):
 
     @_patched
     def test_present_sidecar_naming_another_cell_refuses(self):
+        """A sidecar naming another system is refused as foreign."""
         with TemporaryDirectory() as td:
             bank = Path(td)
             _write_bank(bank, dict(BANKED_MATCH))
@@ -299,13 +304,11 @@ class TestReplayCellEndToEnd(unittest.TestCase):
 
 
 class TestPerSystemKeyLogic(unittest.TestCase):
-    """The corrected item-4 logic, after the first-run refusal."""
+    """How replay_cell resolves the substrate key per system."""
 
     @_patched
     def test_m2_ignores_tree_build_env_entirely(self):
-        # the defect that refused cell 1: an M2 summary whose recorded
-        # env disagrees with the host in every component must PASS --
-        # M2's key carries no topology component
+        """M2 passes with any recorded env: its key has no topology part."""
         with TemporaryDirectory() as td:
             bank = Path(td)
             _write_bank(bank, dict(BANKED_MATCH), system="M2",
@@ -320,9 +323,7 @@ class TestPerSystemKeyLogic(unittest.TestCase):
 
     @_patched
     def test_m4_pre_token_record_resolves_old_key(self):
-        # a pre-e907d68 cell: recorded env is TOKEN-LESS, host has the
-        # token -> compatible -> the override receives the recorded
-        # string VERBATIM (token-less), reconstructing the old key
+        """M4 injects a token-less recorded env verbatim into the override."""
         captured = {}
         with TemporaryDirectory() as td:
             bank = Path(td)
@@ -343,6 +344,7 @@ class TestPerSystemKeyLogic(unittest.TestCase):
 
     @_patched
     def test_m4_tokened_record_passes_and_injects_verbatim(self):
+        """M4 injects a python-tokened recorded env verbatim."""
         captured = {}
         with TemporaryDirectory() as td:
             bank = Path(td)
@@ -361,6 +363,7 @@ class TestPerSystemKeyLogic(unittest.TestCase):
 
     @_patched
     def test_m4_component_mismatch_refuses(self):
+        """M4 refuses a recorded env whose component version differs."""
         bad_env = TOKENLESS_ENV.replace(
             "scikit-learn=" + HOST["scikit-learn"], "scikit-learn=0.0.0")
         with TemporaryDirectory() as td:
@@ -374,6 +377,7 @@ class TestPerSystemKeyLogic(unittest.TestCase):
 
     @_patched
     def test_m4_python_major_minor_mismatch_refuses(self):
+        """M4 refuses when python major.minor differs from the host."""
         with TemporaryDirectory() as td:
             bank = Path(td)
             _write_bank(bank, dict(BANKED_MATCH), system="M4",
@@ -385,6 +389,7 @@ class TestPerSystemKeyLogic(unittest.TestCase):
 
     @_patched
     def test_m4_missing_record_refuses(self):
+        """M4 refuses a summary with no tree_build_env record."""
         with TemporaryDirectory() as td:
             bank = Path(td)
             _write_bank(bank, dict(BANKED_MATCH), system="M4",
@@ -395,12 +400,10 @@ class TestPerSystemKeyLogic(unittest.TestCase):
 
 
 class TestOverrideLever(unittest.TestCase):
-    """The replay-only injection cannot affect the runner."""
+    """The replay-only override never reaches the runner's key."""
 
     def test_runner_construction_leaves_override_none(self):
-        # the runner builds systems as system_cls(config=cfg) -- the
-        # same construction leaves the lever at None, and None is
-        # byte-identical to the pre-lever key (proven on the extra dict)
+        """Runner-style construction leaves the override None, key unmoved."""
         from src.config import DEFAULT_CONFIG
         from src.raptor_paper import paper_substrate_extra
         from src.retrievers.m4_raptor import RaptorSystem

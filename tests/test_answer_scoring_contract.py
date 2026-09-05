@@ -1,22 +1,6 @@
-"""The unified answer-scoring contract (P1), pinned across all three benchmarks.
-
-WHAT THIS EXISTS TO PREVENT. Both MultiHop and NarrativeQA used to return
-0.0 the moment a prediction contained a hedging phrase, BEFORE computing
-token-F1. A prediction carrying the exact gold string scored 0.0000 where
-its real F1 was 0.3333, and the identical prediction scored 0.3333 on
-HotpotQA, which never had the gate — so the same answer was worth
-different amounts depending on which benchmark it was scored under.
-Measured in docs/EVAL_AUDIT.md ISSUE-1.
-
-THE CONTRACT:
-  1. The score for an answerable query is token-F1 against gold, max over
-     references, ALWAYS COMPUTED.
-  2. Abstention detection is metadata.abstained and reaches nothing else.
-  3. metadata.token_f1 holds the real F1, never a post-gate value.
-  4. answer.method names the RULE, not the OUTCOME.
-
-The equality test below is the load-bearing one: it fails if any single
-benchmark reintroduces a gate, because the three would stop agreeing.
+"""Pins the shared answer-scoring contract across all three benchmarks:
+token-F1 is always computed, abstention is metadata only, and the method
+names the scoring rule (METHODS §C.1, §C.9).
 """
 
 from __future__ import annotations
@@ -36,25 +20,19 @@ from src.eval.types import (
 )
 
 
-# The hedged-but-correct prediction from the audit. It carries the exact
-# gold string AND a hedge, which is precisely the case the deleted gate
-# scored as a refusal.
+# A hedged prediction that still contains the exact gold string. After
+# normalisation it has 10 tokens, the gold 2, all 2 shared: P 0.2, R 1.
+# official: hotpot_evaluate_v1.py::f1_score @ 36358534
 HEDGED = "The evidence does not give a date, but the person is Sam Bankman-Fried."
 GOLD = "Sam Bankman-Fried"
-EXPECTED = 1 / 3  # 3 shared tokens; 15 predicted, 3 gold -> F1 = 1/3
+EXPECTED = 1 / 3  # 2PR / (P + R) with P = 0.2, R = 1
 
 ALLOWED_METHODS = {"token_f1", "exact_match", "unanswerable_rule", "no_references"}
 
 
 def _query(gold: str, *, answer_type: str = ANSWER_TYPE_FREE_FORM,
            n_refs: int = 1) -> EvalQuery:
-    """A query carrying `n_refs` references.
-
-    n_refs=1 by design for the equality test: NarrativeQA scores
-    max-over-references, so a two-reference fixture would compare a max
-    against two single-reference scores and the equality would be an
-    artifact of the fixture rather than of the contract.
-    """
+    """Build a query with n_refs identical gold references."""
     return EvalQuery(
         query_id="q1",
         question_text="who?",
@@ -71,6 +49,7 @@ def _query(gold: str, *, answer_type: str = ANSWER_TYPE_FREE_FORM,
 
 
 def _scorers():
+    """Return the score_answer callable of each benchmark by name."""
     return {
         "multihop": MultiHopBenchmark().score_answer,
         "narrativeqa": NarrativeQABenchmark().score_answer,
@@ -79,7 +58,10 @@ def _scorers():
 
 
 class TestThreeBenchmarkEquality(unittest.TestCase):
+    """The three benchmarks score one hedged prediction the same way."""
+
     def test_hedged_correct_answer_scores_identically_everywhere(self):
+        """Every benchmark scores the hedged prediction at its token-F1."""
         q = _query(GOLD, n_refs=1)
         scores = {name: fn(HEDGED, q).value for name, fn in _scorers().items()}
         for name, value in scores.items():
@@ -91,17 +73,19 @@ class TestThreeBenchmarkEquality(unittest.TestCase):
                          f"benchmarks disagree: {scores}")
 
     def test_the_prediction_really_does_read_as_an_abstention(self):
-        """Guards the guard. If the detector stopped firing on this
-        prediction, the equality test above would pass for the wrong
-        reason — it would no longer exercise a gate at all."""
+        """The detector fires on HEDGED, so the equality test is real."""
         self.assertTrue(is_abstention(HEDGED))
 
     def test_the_expected_value_is_the_independently_computed_f1(self):
+        """EXPECTED equals token_f1 of the fixture."""
         self.assertAlmostEqual(token_f1(HEDGED, GOLD), EXPECTED, places=10)
 
 
 class TestAbstentionIsMetadataOnly(unittest.TestCase):
+    """Abstention detection writes metadata and never moves the score."""
+
     def test_abstained_is_recorded_and_the_score_is_unaffected(self):
+        """metadata.abstained is True while the value stays at token-F1."""
         q = _query(GOLD, n_refs=1)
         for name, fn in _scorers().items():
             score = fn(HEDGED, q)
@@ -111,9 +95,7 @@ class TestAbstentionIsMetadataOnly(unittest.TestCase):
                                    msg=f"{name} let abstention move the score")
 
     def test_score_always_equals_the_computed_token_f1(self):
-        """Behavioural proof the gate is gone: across predictions whose
-        hedging and whose overlap vary independently, the value tracks the
-        F1 and nothing else."""
+        """The value tracks token-F1 whether or not the prediction hedges."""
         cases = [
             ("Sam Bankman-Fried", GOLD),
             ("The evidence does not say, but it is Sam Bankman-Fried.", GOLD),
@@ -130,23 +112,29 @@ class TestAbstentionIsMetadataOnly(unittest.TestCase):
             )
 
     def test_metadata_token_f1_is_the_real_value_not_a_post_gate_zero(self):
+        """metadata.token_f1 holds the computed F1."""
         score = MultiHopBenchmark().score_answer(HEDGED, _query(GOLD, n_refs=1))
         self.assertAlmostEqual(score.metadata["token_f1"], EXPECTED, places=10)
 
 
 class TestPureRefusal(unittest.TestCase):
+    """A refusal on an answerable query scores through token-F1."""
+
     def test_a_refusal_with_no_overlap_scores_zero_via_token_f1(self):
+        """A refusal with no gold overlap scores 0.0 under method token_f1."""
         q = _query("Tim Cook", n_refs=1)
         for name, fn in _scorers().items():
             score = fn("No answer available.", q)
             self.assertEqual(score.value, 0.0, f"{name}")
-            # The 0.0 must come from the metric, not from a gate: the
-            # method names the rule that produced it.
+            # The zero comes from the metric; the method says so.
             self.assertEqual(score.method, "token_f1", f"{name}")
 
 
 class TestMethodNamesTheRuleNotTheOutcome(unittest.TestCase):
+    """answer.method names the scoring rule, never the outcome."""
+
     def test_no_method_encodes_an_outcome(self):
+        """No benchmark emits a method containing 'abstain'."""
         predictions = [
             "Sam Bankman-Fried",
             HEDGED,
@@ -162,6 +150,7 @@ class TestMethodNamesTheRuleNotTheOutcome(unittest.TestCase):
                 self.assertIn(method, ALLOWED_METHODS, f"{name}: {method!r}")
 
     def test_null_queries_use_the_unanswerable_rule(self):
+        """A null query scores under unanswerable_rule (METHODS §C.9)."""
         q = _query("", answer_type=ANSWER_TYPE_UNANSWERABLE, n_refs=1)
         score = MultiHopBenchmark().score_answer("No answer available.", q)
         self.assertEqual(score.method, "unanswerable_rule")

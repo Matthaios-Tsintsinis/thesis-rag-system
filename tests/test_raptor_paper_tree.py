@@ -1,10 +1,7 @@
-"""Tests for the paper-faithful bottom-up RAPTOR tree (src/raptor_paper.py).
+"""Tests for the bottom-up RAPTOR tree in src/raptor_paper.py.
 
-Two tiers. The bulk use an injected `cluster_fn` so the deterministic
-bookkeeping — node ids, multi-parent links, leaf-index closure, stop
-condition, batch-shape invariance of the topology, serialisation — is
-tested without paying for UMAP fits. A small number exercise the REAL UMAP+GMM path, since a
-clustering port whose clustering was never run is not verified.
+Most tests inject a cluster_fn to check the bookkeeping without UMAP fits;
+TestRealClustering runs the real UMAP+GMM path on small inputs.
 """
 
 from __future__ import annotations
@@ -38,13 +35,10 @@ EMB_DIM = 8
 
 
 def _fake_embed_dim(texts: list[str], dim: int) -> np.ndarray:
-    """Deterministic unit vectors, one per text. No model, no randomness.
-
-    Uses a stable digest rather than hash() — PYTHONHASHSEED randomises
-    str hashing per process, which would make the determinism tests lie.
-    """
+    """Return one deterministic unit vector per text, from a sha256 digest."""
     import hashlib
 
+    # sha256, not hash(): PYTHONHASHSEED changes str hashing per process.
     out = np.zeros((len(texts), dim), dtype=np.float32)
     for i, t in enumerate(texts):
         digest = hashlib.sha256(t.encode("utf-8")).digest()
@@ -59,11 +53,7 @@ def _fake_embed(texts: list[str]) -> np.ndarray:
 
 
 def _pairwise_cluster_fn(nodes, params, stats):
-    """Consecutive pairs, with node 0 deliberately in TWO clusters.
-
-    The double membership stands in for the paper's soft clustering, so
-    the multi-parent bookkeeping is exercised without a GMM.
-    """
+    """Pair consecutive nodes; node 0 joins two clusters to mimic soft clustering."""
     clusters = [list(nodes[i : i + 2]) for i in range(0, len(nodes), 2)]
     if len(clusters) > 1:
         clusters[1] = [nodes[0]] + clusters[1]
@@ -108,7 +98,7 @@ class TestBottomUpConstruction(unittest.TestCase):
             self.assertLess(hi, lo, f"layer did not shrink: {sizes}")
 
     def test_stop_condition_matches_reference(self):
-        # Reference breaks when a layer holds <= reduction_dimension + 1.
+        # ref: raptor/cluster_tree_builder.py @ 7da1d48a (len(layer) <= reduction_dimension + 1)
         tree = self._build()
         top = max(tree.layer_to_nodes)
         self.assertLessEqual(
@@ -173,7 +163,7 @@ class TestBottomUpConstruction(unittest.TestCase):
             summarize_batch_fn=lambda cs: [""] * len(cs),
             embed_fn=_fake_embed, cluster_fn=_pairwise_cluster_fn,
         )
-        # Layer 1 exists, carries no embeddings, and nothing built above it.
+        # Layer 1 exists, carries no embeddings, and nothing is built above it.
         self.assertIn(1, tree.layer_to_nodes)
         self.assertTrue(tree.layer_to_nodes[1])
         for nid in tree.layer_to_nodes[1]:
@@ -193,7 +183,7 @@ class TestBottomUpConstruction(unittest.TestCase):
 
 
 class TestDeterminism(unittest.TestCase):
-    """The cache-identity contract: same inputs -> byte-identical artifact."""
+    """Same inputs give the same node ids, texts and topology."""
 
     def setUp(self):
         self.params = PaperTreeParams(reduction_dimension=2)
@@ -211,36 +201,13 @@ class TestDeterminism(unittest.TestCase):
         self.assertEqual(self._ids_and_texts(), self._ids_and_texts())
 
     def test_batch_shape_cannot_move_ids_or_topology(self):
-        """What batching IS allowed to change, and what it is not.
-
-        Replaces the old `max_workers` throughput-knob test, whose
-        subject was deleted when the ThreadPoolExecutor went away (it was
-        unsafe against a local model — one lru_cached tokenizer, mutated
-        per call).
-
-        THE PROPERTY, and it is narrower than the old one on purpose:
-        node IDS and TOPOLOGY are a function of member position in the
-        input layer, computed before any summary call is dispatched, so
-        NO batching decision can perturb them. The reference, by
-        contrast, assigns indices inside a Lock-guarded dict while
-        summarising on a thread pool, making its ids a function of
-        completion order.
-
-        WHAT IS DELIBERATELY NOT ASSERTED: that summary TEXT is invariant
-        under batch shape. It may not be — padding and batched-matmul
-        reduction order can flip argmax on near-ties even at temperature
-        0. That is precisely the open question, and the project's answer
-        is to NAME batch_size and max_padded_tokens in M4's substrate key
-        (raptor_paper.paper_substrate_extra) rather than to assume
-        invariance here. Asserting text invariance with a fake
-        summariser would prove nothing about the real one and would read
-        as a guarantee the code does not make.
-        """
+        """Node ids and topology do not depend on how summaries are batched."""
+        # Ids and topology come from member position in the input layer,
+        # fixed before any summary call. Summary text is not asserted
+        # invariant: batch shape can move it, so the cache key names it.
         def ids_and_shape(chunk_size):
-            # A summariser that batches its input differently every time,
-            # while returning position-stable text, isolates SHAPE from
-            # TEXT: any id or topology difference would be caused by the
-            # grouping alone.
+            # Batch the input differently each time, keep the text
+            # position-stable, so only the grouping can move ids or shape.
             def summarize(cs):
                 out = []
                 for s in range(0, len(cs), chunk_size):
@@ -262,8 +229,7 @@ class TestDeterminism(unittest.TestCase):
         self.assertEqual(ids_and_shape(1), ids_and_shape(1000))
 
     def test_misaligned_summary_count_is_refused(self):
-        """A short return would silently attach summaries to the wrong
-        clusters — positional alignment fails quietly, so it must raise."""
+        """A summariser returning too few texts raises instead of misaligning."""
         with self.assertRaises(RuntimeError):
             build_paper_tree(
                 self.texts, self.embs, params=self.params,
@@ -273,7 +239,9 @@ class TestDeterminism(unittest.TestCase):
 
 
 class TestGetText(unittest.TestCase):
-    """Port fidelity of the summariser's input format (utils.get_text)."""
+    """The summariser input format matches the reference's get_text."""
+
+    # ref: raptor/utils.py::get_text @ 7da1d48a
 
     def test_collapses_newlines_and_joins_on_blank_lines(self):
         nodes = [
@@ -304,7 +272,7 @@ class TestCollapsedIndex(unittest.TestCase):
         ]
         self.assertEqual(len(idx.refs), len(embedded))
         self.assertEqual(idx.faiss_index.ntotal, len(embedded))
-        # Paper collapses the ENTIRE tree: leaves AND summaries present.
+        # RAPTOR paper §3: collapsed tree, the paper's main-results strategy
         layers = {r["layer"] for r in idx.refs}
         self.assertIn(0, layers)
         self.assertGreater(max(layers), 0)
@@ -312,7 +280,7 @@ class TestCollapsedIndex(unittest.TestCase):
         self.assertTrue(any(not r["is_leaf"] for r in idx.refs))
 
     def test_no_root_is_excluded(self):
-        """Contrast with src/raptor.py, which drops the synthetic root."""
+        """The top layer's embedded nodes stay in the index; no root is dropped."""
         idx = build_collapsed_index(self.tree)
         top = max(self.tree.layer_to_nodes)
         top_ids = {
@@ -385,7 +353,7 @@ class TestSerialisation(unittest.TestCase):
 
 
 class TestCacheIdentity(unittest.TestCase):
-    """Lever B, strict reading: M4 has its own extras function."""
+    """M4's own extras function names everything that shapes a tree."""
 
     def _extra(self, **kw):
         base = dict(
@@ -398,37 +366,24 @@ class TestCacheIdentity(unittest.TestCase):
 
     def test_carries_the_m4_only_keys_that_close_the_landmine(self):
         mine = self._extra()
-        # The original landmine: the shared extras fold tree PARAMETERS
-        # but never the clustering ALGORITHM, so swapping KMeans for
-        # UMAP+GMM would have changed artifacts without moving the key.
+        # The key names the clustering algorithm and schema, not only
+        # the tree parameters, so an algorithm swap moves it.
         self.assertEqual(mine["clustering"]["algo"], "umap_gmm_bic")
         self.assertEqual(mine["tree_schema"], PAPER_TREE_SCHEMA_VERSION)
         self.assertIn("chunker_impl", mine)
         self.assertIn("summary_max_tokens", mine)
 
     def test_batch_shape_is_named_in_the_key(self):
-        """Summaries are CACHED, so batch composition is not free.
-
-        Batch composition can change generated text at temperature 0.
-        Answers are not cached, so their variance is documented noise;
-        summaries ARE the artifact this key names, so the shape that
-        produced them has to be in it. Both knobs, because
-        token_budget_batches takes batch_size as a count cap and so both
-        participate in composition.
-        """
+        """Both summariser batch knobs are part of the substrate key."""
+        # harness choice: batch shape is in the cache key because it can move text at temperature 0
         PROBE_CAP = 4000
         PROBE_BATCH = 8
         mine = self._extra()
         self.assertIn("summary_batch_size", mine)
         self.assertIn("summary_max_padded_tokens", mine)
 
-        # THE PROBE VALUES MUST DIFFER FROM THE DEFAULTS, asserted rather
-        # than assumed. This test previously probed the cap with 8000 —
-        # which then BECAME the default, turning both sides of the
-        # comparison into the same dict and making the assertion vacuous.
-        # It failed loudly only because assertNotEqual is the direction
-        # that catches a collision; the batch-size probe, being the same
-        # shape, would fail silently if 8 were ever adopted.
+        # The probe values must differ from the defaults, or the
+        # inequality below compares a dict with itself and proves nothing.
         self.assertNotEqual(mine["summary_max_padded_tokens"], PROBE_CAP)
         self.assertNotEqual(mine["summary_batch_size"], PROBE_BATCH)
 
@@ -438,12 +393,7 @@ class TestCacheIdentity(unittest.TestCase):
         )
 
     def test_extras_defaults_match_m4config(self):
-        """The extras defaults and M4Config must not drift apart.
-
-        m4_raptor passes every value explicitly, but the test helpers and
-        any future caller lean on these defaults; a silent divergence
-        would make a test compute a key production never uses.
-        """
+        """The extras defaults equal the M4Config values production passes."""
         m4 = M4Config()
         mine = self._extra()
         self.assertEqual(mine["summary_batch_size"], m4.summary_batch_size)
@@ -466,20 +416,27 @@ class TestCacheIdentity(unittest.TestCase):
 
     def test_reference_defaults_are_the_documented_ones(self):
         p = PaperTreeParams()
+        # ref: raptor/cluster_tree_builder.py::ClusterTreeConfig @ 7da1d48a (reduction_dimension=10)
         self.assertEqual(p.reduction_dimension, 10)
+        # ref: raptor/cluster_utils.py::perform_clustering @ 7da1d48a (threshold=0.1)
         self.assertEqual(p.gmm_threshold, 0.1)
+        # ref: raptor/cluster_utils.py::perform_clustering @ 7da1d48a (max_length_in_cluster=3500)
         self.assertEqual(p.max_length_in_cluster, 3500)
+        # ref: raptor/tree_builder.py::TreeBuilderConfig @ 7da1d48a (num_layers=5)
         self.assertEqual(p.num_layers, 5)
+        # ref: raptor/cluster_utils.py::local_cluster_embeddings @ 7da1d48a (num_neighbors=10)
         self.assertEqual(p.local_n_neighbors, 10)
         self.assertEqual(p.metric, "cosine")
+        # ref: raptor/cluster_utils.py::get_optimal_clusters @ 7da1d48a (max_clusters=50)
         self.assertEqual(p.bic_max_clusters, 50)
-        # Ruling 3: the reference's seed inconsistency, reproduced.
+        # ref: raptor/cluster_utils.py @ 7da1d48a (RANDOM_SEED = 224)
         self.assertEqual(p.bic_random_state, 224)
+        # ref: raptor/cluster_utils.py::GMM_cluster @ 7da1d48a (random_state=0; the ref uses both seeds)
         self.assertEqual(p.gmm_random_state, 0)
 
 
 class TestRealClustering(unittest.TestCase):
-    """The real UMAP+GMM path. Slow; kept deliberately small."""
+    """Runs the real UMAP+GMM path on small inputs."""
 
     @staticmethod
     def _structured(n_per: int = 12, dim: int = 16, groups: int = 3):
@@ -519,8 +476,9 @@ class TestRealClustering(unittest.TestCase):
                       leaf_indices=[i], embedding=X[i])
             for i in range(len(X))
         ]
-        # Every cluster busts a 1-token budget, and depth 0 is already at
-        # the bound -> the guard must fire rather than recursing forever.
+        # Every cluster overflows a 1-token budget at depth 0, so the
+        # depth guard fires instead of recursing forever.
+        # deviation from ref (ref recursion has no base case): see METHODS §A.4.4 (ii)
         params = PaperTreeParams(
             reduction_dimension=3, bic_max_clusters=5,
             max_length_in_cluster=1, max_recluster_depth=0,

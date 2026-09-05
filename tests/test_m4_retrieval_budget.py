@@ -1,13 +1,4 @@
-"""M4's paper retrieval budget (commit 6, professor-approved M4-only).
-
-Paper §3: "we use the collapsed tree with 2000 maximum tokens, which
-approximately equates to retrieving the top-20 nodes", filled by "Keep
-adding nodes to the result set until you reach a predefined maximum
-number of tokens".
-
-Tests drive `retrieve()` against a hand-built tree so the budget
-arithmetic is checked exactly, without paying for a UMAP tree build.
-"""
+"""Tests for M4's token-budget retrieval, driven over a hand-built tree."""
 
 from __future__ import annotations
 
@@ -31,7 +22,7 @@ DIM = 8
 
 
 def _unit(i: int) -> np.ndarray:
-    """Distinct unit vectors whose cosine to `_query()` decreases with i."""
+    """Return a unit vector whose cosine to `_query()` falls as i grows."""
     v = np.zeros(DIM, dtype=np.float32)
     v[0] = 1.0
     v[1 + (i % (DIM - 1))] = 0.15 * (i + 1)
@@ -39,17 +30,18 @@ def _unit(i: int) -> np.ndarray:
 
 
 def _query() -> np.ndarray:
+    """Return the fixed query vector every node is scored against."""
     v = np.zeros((1, DIM), dtype=np.float32)
     v[0, 0] = 1.0
     return v
 
 
 def _build_system(budget, n_leaves=10, words_per_node=40):
-    """A system with its internals populated directly. White-box, but it
-    isolates the budget logic from tree construction entirely."""
+    """Build an M4 system over a hand-made two-layer tree with the given budget."""
     text = " ".join(["token"] * words_per_node) + "."
     nodes: dict[str, PaperNode] = {}
     layer0: list[str] = []
+    # Leaves of equal length, ranked by their index; one summary over all.
     for i in range(n_leaves):
         nid = f"L0_{i:06d}"
         nodes[nid] = PaperNode(node_id=nid, layer=0, text=text,
@@ -69,6 +61,7 @@ def _build_system(budget, n_leaves=10, words_per_node=40):
         params=DEFAULT_CONFIG.m4.paper,
     )
 
+    # Populate the system's internals directly, skipping the tree build.
     cfg = replace(
         DEFAULT_CONFIG,
         m4=replace(DEFAULT_CONFIG.m4, retrieval_budget_tokens=budget),
@@ -87,7 +80,10 @@ def _build_system(budget, n_leaves=10, words_per_node=40):
 
 
 class TestBudgetFill(unittest.TestCase):
+    """Pins how the token budget governs the number of nodes returned."""
+
     def setUp(self):
+        # Stub the embedder so the query is the fixed vector.
         self._orig = M.embed_texts
         M.embed_texts = lambda texts, model_name=None: _query()
 
@@ -95,55 +91,57 @@ class TestBudgetFill(unittest.TestCase):
         M.embed_texts = self._orig
 
     def test_fills_up_to_but_not_over_the_budget(self):
+        """Packing stops at the first node that overflows the budget."""
         sysm, per_node = _build_system(budget=5 * 50)
         out = sysm.retrieve("q")
         used = sysm.last_trace["budget_tokens_used"]
         self.assertLessEqual(used, 5 * 50)
         self.assertEqual(used, len(out) * per_node)
-        # Adding one more node would have overflowed.
+        # One more node would overflow.
         self.assertGreater(used + per_node, 5 * 50)
 
     def test_budget_governs_instead_of_top_k_final(self):
-        """A budget that admits fewer nodes than top_k_final must win."""
+        """A budget that admits fewer nodes than top_k_final wins."""
         sysm, per_node = _build_system(budget=2 * 60)
         out = sysm.retrieve("q")
         self.assertLess(len(out), DEFAULT_CONFIG.m4.top_k_final)
 
     def test_budget_can_exceed_top_k_final(self):
-        """The paper's ~top-20 is MORE than our natural top-15, so the
-        budget must be able to return more nodes, not only fewer."""
+        """A large budget returns more nodes than top_k_final."""
         sysm, per_node = _build_system(budget=10_000, n_leaves=30)
         out = sysm.retrieve("q")
         self.assertGreater(len(out), DEFAULT_CONFIG.m4.top_k_final)
 
     def test_explicit_k_overrides_the_budget(self):
-        """CK-2 harness paths and the smoke test pass an explicit k and
-        mean it."""
+        """An explicit k returns exactly k nodes and leaves the budget unused."""
         sysm, _ = _build_system(budget=100)
         out = sysm.retrieve("q", k=7)
         self.assertEqual(len(out), 7)
         self.assertIsNone(sysm.last_trace["budget_tokens_used"])
 
     def test_budget_none_restores_count_mode(self):
-        # Needs more nodes than top_k_final, or the fixture caps the
-        # result before the count rule does.
+        """With no budget, retrieval returns top_k_final nodes."""
+        # More leaves than top_k_final, so the count rule is what caps.
         sysm, _ = _build_system(budget=None, n_leaves=25)
         out = sysm.retrieve("q")
         self.assertEqual(len(out), DEFAULT_CONFIG.m4.top_k_final)
         self.assertIsNone(sysm.last_trace["budget_tokens_limit"])
 
     def test_first_node_is_kept_even_if_it_alone_overflows(self):
-        """Otherwise the generator gets zero evidence, which is strictly
-        worse than one over-budget node."""
+        """The first node is admitted even when it alone overflows the budget."""
+        # harness choice: unreachable at ~110-token nodes
         sysm, per_node = _build_system(budget=1)
         out = sysm.retrieve("q")
         self.assertEqual(len(out), 1)
         self.assertGreater(sysm.last_trace["budget_tokens_used"], 1)
 
     def test_default_config_carries_the_paper_budget(self):
+        """The default M4 budget is the paper's 2,000 tokens."""
+        # RAPTOR paper §3: "2000 maximum tokens ... top-20 nodes" (paper over repo): see METHODS §A.4.3
         self.assertEqual(DEFAULT_CONFIG.m4.retrieval_budget_tokens, 2000)
 
     def test_trace_reports_both_used_and_limit(self):
+        """The trace records both the budget limit and the tokens used."""
         sysm, _ = _build_system(budget=300)
         sysm.retrieve("q")
         self.assertEqual(sysm.last_trace["budget_tokens_limit"], 300)

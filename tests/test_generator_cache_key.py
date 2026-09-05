@@ -1,31 +1,5 @@
-"""One generator, one cache key, one load — and a load that checks itself.
-
-THE DEFECT THIS PINS, measured 2026-08-16 and worth stating exactly.
-`load_generator` is `functools.lru_cache`d, which keys on the ARGUMENT
-TUPLE. The prewarm path called `load_generator(model)`; `generate_batch`
-called `load_generator(cfg.model, cfg.load_in_4bit)`. Passing the default
-explicitly makes `("Qwen/...",)` and `("Qwen/...", False)` two different
-keys, so the second call was a cache MISS and loaded a SECOND ~15 GB copy
-of the same model. `maxsize=2` was exactly large enough to hold both, so
-nothing was ever evicted and nothing complained.
-
-Load #2 landed in VRAM that already held load #1 plus the embedder, so
-`device_map="auto"` did what it is designed to do and spilled: 218 of 339
-tensors to `meta`/CPU, `fraction_params_off_gpu: 0.6224`, free VRAM down
-to 0.13–1.84 GB. Every decode step then streamed 4.74 B parameters over
-PCIe — the flat ~230 s per call, independent of batch width and prompt
-length, a 33x tax on a 20-hour build.
-
-No release was involved. The earlier code read was right that
-`release_generator` is never called in the indexing path; a cache MISS on
-a different argument tuple needs no cache clear.
-
-THE OTHER HALF OF THE LESSON. `placement_at_load` already captured
-`fraction_params_off_gpu: 0.6224` on load #2. It was recorded correctly,
-surfaced correctly, and NOTHING CONSUMED IT — the project's recurring
-defect class, for the fifth time. A value that is measured and not
-asserted is not a check.
-"""
+"""Tests that one model name maps to one generator load, and that the
+load asserts its own GPU placement."""
 
 from __future__ import annotations
 
@@ -40,10 +14,13 @@ from src.models import (
 
 
 def _stub_impl(model_name):  # noqa: ANN001
+    """Stand-in loader that returns cheap placeholders instead of a model."""
     return (f"tok:{model_name}", f"model:{model_name}")
 
 
 class TestOneKeyPerGenerator(unittest.TestCase):
+    """Pins that load_generator caches on the model name alone."""
+
     def setUp(self):
         load_generator.cache_clear()
         GENERATOR_LOADS.clear()
@@ -53,9 +30,7 @@ class TestOneKeyPerGenerator(unittest.TestCase):
         GENERATOR_LOADS.clear()
 
     def test_positional_and_keyword_forms_are_the_same_load(self):
-        """THE BUG, in its surviving form: one model, one load, however
-        the call spells it. The second (4-bit) argument that made two
-        keys left with the reduction."""
+        """Positional and keyword spellings of one model share one load."""
         with mock.patch("src.models._load_generator_impl",
                         side_effect=_stub_impl) as impl:
             a = load_generator("some/model")
@@ -65,8 +40,7 @@ class TestOneKeyPerGenerator(unittest.TestCase):
         self.assertEqual(len(GENERATOR_LOADS), 1)
 
     def test_the_real_call_sites_agree(self):
-        """Drives the form the pipeline actually uses (`generate` and
-        `generate_batch` both pass cfg.model) twice: one load."""
+        """The call form generate and generate_batch use loads only once."""
         from src.config import DEFAULT_CONFIG
 
         with mock.patch("src.models._load_generator_impl",
@@ -77,7 +51,7 @@ class TestOneKeyPerGenerator(unittest.TestCase):
         self.assertEqual(len(GENERATOR_LOADS), 1)
 
     def test_a_genuinely_different_model_still_loads_separately(self):
-        """Normalisation must not collapse distinct requests."""
+        """Two different model names load twice."""
         with mock.patch("src.models._load_generator_impl",
                         side_effect=_stub_impl) as impl:
             load_generator("model/a")
@@ -85,8 +59,7 @@ class TestOneKeyPerGenerator(unittest.TestCase):
         self.assertEqual(impl.call_count, 2)
 
     def test_cache_clear_is_still_exposed(self):
-        """`release_generator` calls it; losing the attribute would break
-        the probes rather than the run, which is worse than obvious."""
+        """load_generator.cache_clear exists and forces a reload."""
         with mock.patch("src.models._load_generator_impl",
                         side_effect=_stub_impl) as impl:
             load_generator("some/model")
@@ -96,7 +69,7 @@ class TestOneKeyPerGenerator(unittest.TestCase):
 
 
 class TestResidencyAssertion(unittest.TestCase):
-    """The assertion that would have caught this on load #2."""
+    """Pins how assert_generator_fully_resident reads a placement snapshot."""
 
     CLEAN = {"fraction_params_off_gpu": 0.0,
              "param_tensors_by_device": {"cuda:0": 339}}
@@ -104,11 +77,13 @@ class TestResidencyAssertion(unittest.TestCase):
                "param_tensors_by_device": {"cuda:0": 121, "meta": 218}}
 
     def test_clean_placement_passes(self):
+        """A fully on-GPU placement passes."""
         assert_generator_fully_resident(
             self.CLEAN, model_name="m", cuda_available=True
         )
 
     def test_spilled_placement_raises(self):
+        """A spilled placement raises, naming the share and the device."""
         with self.assertRaises(RuntimeError) as ctx:
             assert_generator_fully_resident(
                 self.SPILLED, model_name="m", cuda_available=True
@@ -118,8 +93,7 @@ class TestResidencyAssertion(unittest.TestCase):
         self.assertIn("meta", msg)
 
     def test_the_error_names_the_cause_not_just_the_symptom(self):
-        """An operator reading this at hour three of a build needs the
-        remedy, not a percentage."""
+        """The error message names the PCIe cause and a prior load."""
         with self.assertRaises(RuntimeError) as ctx:
             assert_generator_fully_resident(
                 self.SPILLED, model_name="m", cuda_available=True
@@ -129,14 +103,14 @@ class TestResidencyAssertion(unittest.TestCase):
         self.assertTrue("already" in msg or "second" in msg)
 
     def test_offload_is_permitted_when_explicitly_requested(self):
+        """allow_offload=True accepts a spilled placement."""
         assert_generator_fully_resident(
             self.SPILLED, model_name="m", cuda_available=True,
             allow_offload=True,
         )
 
     def test_cpu_only_host_is_not_a_failure(self):
-        """The agent host has no GPU and legitimately holds everything on
-        CPU; raising there would break every CPU smoke path."""
+        """Without CUDA, an all-CPU placement passes."""
         assert_generator_fully_resident(
             {"fraction_params_off_gpu": 1.0,
              "param_tensors_by_device": {"cpu": 339}},
@@ -144,6 +118,7 @@ class TestResidencyAssertion(unittest.TestCase):
         )
 
     def test_unmeasured_placement_does_not_raise(self):
+        """A snapshot with no measured share passes."""
         assert_generator_fully_resident(
             {"fraction_params_off_gpu": None, "param_tensors_by_device": {}},
             model_name="m", cuda_available=True,

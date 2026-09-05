@@ -1,20 +1,6 @@
-"""End-to-end smoke for the runner CLI. No GPU, no model.
-
-WHY THIS FILE EXISTS. `b3d3df3` shipped with `runner.main()` raising
-`NameError: name 'system_cls' is not defined` on its very first use — the
-registry lookup was dropped while CLI flags were added around it. The
-full suite was 215/215 green, because NOTHING under tests/ called
-`main()`. A broken runner costs a Colab session and a 15GB model download
-to discover.
-
-These tests exercise the WIRING — argument parsing, registry lookup,
-config construction, output paths and summary shape. They deliberately
-stub the system so no model loads: the failure being guarded against
-lives in the plumbing, and a test that needed a GPU would not run often
-enough to catch it.
-
-Any commit touching runner.py has to pass this.
-"""
+"""End-to-end tests of the runner CLI: flags, registry lookup, the lockfile
+gate, output paths and summary shape. The system is a stub, so no model
+loads and no GPU is needed."""
 
 from __future__ import annotations
 
@@ -44,15 +30,14 @@ from src.chunking import Chunk
 
 
 class _TinyBenchmark:
+    """One document and two queries, enough to drive the whole runner."""
+
     name = "tiny"
 
     def __init__(self) -> None:
-        # `n_queries` is part of the loader contract, not decoration:
-        # the runner asserts an uncapped cell carries a loader-derived
-        # count, because a null there disarms P8's short-cell guard
-        # without removing the appearance of it. A stub that omitted it
-        # was a stub that could not have caught the HotpotQA null.
-        self.stats = {"n_units": 1, "n_queries": 2}  # the two below
+        # The runner checks the scored count against the loader's n_queries,
+        # so the stub carries one that matches its two queries.
+        self.stats = {"n_units": 1, "n_queries": 2}
 
     def iter_eval_units(self, split, max_units=None):
         corpus = (
@@ -80,10 +65,8 @@ class _TinyBenchmark:
         yield EvalUnit(corpus_id="tiny", corpus=corpus, queries=queries)
 
     def score_retrieval(self, retrieved, query, scoring_ranking=None):
-        # P6: the Benchmark protocol takes the fixed-depth scoring
-        # ranking alongside the reader context. A stub that did not
-        # accept it would let the runner pass a protocol it does not
-        # implement, which is what this end-to-end test exists to catch.
+        # Record whether the runner passed the depth-50 scoring ranking
+        # beside the reader context.
         self.saw_scoring_ranking = scoring_ranking is not None
         return RetrievalScore(skipped=False, recall=1.0, precision=1.0, f1=1.0,
                               n_gold=1, n_covered=1, n_retrieved_atoms=1)
@@ -96,7 +79,7 @@ class _TinyBenchmark:
 
 
 class _StubSystem(BaseSystem):
-    """Answers without generating. The plumbing is the subject here."""
+    """Answers "Paris" without a model so only the runner plumbing runs."""
 
     system_id = "STUB"
     seen_max_new_tokens: list[int] = []
@@ -119,8 +102,7 @@ class _StubSystem(BaseSystem):
                 for n, c in enumerate(self.chunks)]
 
     def answer(self, query, k=None):
-        # Record what the CLI actually handed us — the assertion that
-        # the configured cap reaches the object generation consumes.
+        # Record the cap the CLI handed this system.
         type(self).seen_max_new_tokens.append(
             self.config.generation.max_new_tokens
         )
@@ -133,6 +115,8 @@ class _StubSystem(BaseSystem):
 
 
 class _CliCase(unittest.TestCase):
+    """Base case: patches the stub system and benchmark into the registries."""
+
     def setUp(self):
         self.td = tempfile.TemporaryDirectory()
         self.dir = Path(self.td.name)
@@ -151,11 +135,10 @@ class _CliCase(unittest.TestCase):
         self.td.cleanup()
 
     def _run(self, *extra, out=None):
+        """Drive main() end to end with a lockfile and a stubbed pin check."""
         out = out or self.dir / "tiny_STUB.jsonl"
-        # The pin gate has no escape (the reduction removed it), so the
-        # CLI drive carries a lockfile and stubs the version check green;
-        # `test_the_lockfile_gate_is_wired_into_main` below drives main()
-        # WITHOUT one and proves the gate fires first.
+        # The pin gate always runs, so every drive carries a lockfile and
+        # stubs the version check green.
         lock = self.dir / "requirements.lock"
         lock.write_text("# lock\nnumpy==0.0.0\n", encoding="utf-8")
         argv = ["runner", "--system", "STUB", "--benchmark", "tiny",
@@ -168,14 +151,7 @@ class _CliCase(unittest.TestCase):
         return out
 
     def test_the_lockfile_gate_is_wired_into_main(self):
-        """END TO END, not a unit test of the gate function.
-
-        With no lockfile present, main() must abort BEFORE it writes any
-        output. This is the difference between
-        "the gate exists" and "the runner calls the gate" — the exact
-        distinction that made MATRIX_BATCH_SIZE inert through a whole
-        release.
-        """
+        """main() aborts on a missing lockfile before writing any output."""
         out = self.dir / "gated.jsonl"
         argv = ["runner", "--system", "STUB", "--benchmark", "tiny",
                 "--split", "validation", "--output", str(out),
@@ -187,15 +163,10 @@ class _CliCase(unittest.TestCase):
 
 
 class TestHelpRenders(unittest.TestCase):
-    """`--help` is the reduced CLI surface a stranger reads first.
-
-    It CRASHED at the tag: the --benchmark help text carried bare percent
-    signs ("91.7%"), which argparse expands as format specifiers, and
-    nothing ever called --help. Driven end to end here, and the kept
-    flags are asserted so a re-added flag or a lost one is visible.
-    """
+    """--help renders and lists exactly the seven runner flags."""
 
     def test_help_exits_zero_and_names_exactly_the_kept_flags(self):
+        """--help exits 0 and names the seven flags, no more, no fewer."""
         import contextlib
         import io
 
@@ -213,9 +184,10 @@ class TestHelpRenders(unittest.TestCase):
 
 
 class TestRunnerMain(_CliCase):
+    """main() produces the artifacts the rest of the pipeline reads."""
+
     def test_main_runs_and_writes_both_artifacts(self):
-        """The regression: main() raised NameError on the registry lookup
-        for every system, with and without the new flags."""
+        """main() writes the JSONL and the summary with one row per query."""
         out = self._run()
         self.assertTrue(out.exists(), "no JSONL written")
         summary = out.with_suffix(".summary.json")
@@ -226,6 +198,7 @@ class TestRunnerMain(_CliCase):
         self.assertEqual({r["query_id"] for r in rows}, {"q1", "q2"})
 
     def test_summary_carries_run_provenance(self):
+        """The summary carries the provenance fields and the scored count."""
         out = self._run()
         s = json.loads(out.with_suffix(".summary.json").read_text(encoding="utf-8"))
         for key in ("system", "benchmark", "split", "n_queries_scored",
@@ -234,16 +207,12 @@ class TestRunnerMain(_CliCase):
         self.assertEqual(s["n_queries_scored"], 2)
 
     def test_the_summary_main_writes_is_the_one_the_exporter_reads(self):
-        """One test binds the two ends: the runner's summary and JSONL go
-        through scripts.export_comparison.read_cell, which hard-indexes
-        the keys the tables are built from. A key dropped from the
-        summary fails HERE, not on the first real bank."""
+        """The exporter's read_cell reads the summary and JSONL of main()."""
         from scripts.export_comparison import read_cell
 
         out = self._run(out=self.dir / "tiny_STUB_validation.jsonl")
         generator = DEFAULT_CONFIG.generation.model
-        # the stub answers "Paris" twice: no abstention, so the recorded
-        # credited-refusal battery for this cell is (0, 0.0)
+        # The stub never abstains, so the credited-refusal entry is (0, 0.0).
         row = read_cell(self.dir, generator, "tiny", "STUB",
                         {(generator, "tiny", "STUB"): (0, 0.0)})
         self.assertEqual(row["n_queries"], 2)
@@ -255,9 +224,7 @@ class TestRunnerMain(_CliCase):
                                ["mean_answer_score_answerable"]))
 
     def test_summary_provenance_hashes_the_lockfile_the_gate_checked(self):
-        """--lockfile names the gate's lock; the provenance block must hash
-        THAT file, not a hardcoded ./requirements.lock (which banked
-        lockfile_hash=null whenever the two differed)."""
+        """The provenance block hashes the --lockfile the gate checked."""
         from scripts.pin_environment import lockfile_hash
 
         out = self._run()
@@ -266,6 +233,7 @@ class TestRunnerMain(_CliCase):
         self.assertEqual(s["environment"]["lockfile_hash"], lockfile_hash(lock_text))
 
     def test_default_leaves_the_configured_cap_alone(self):
+        """The system sees the configured max_new_tokens unchanged."""
         self._run()
         self.assertEqual(
             set(_StubSystem.seen_max_new_tokens),
@@ -273,6 +241,7 @@ class TestRunnerMain(_CliCase):
         )
 
     def test_a_failing_preflight_aborts_before_anything_expensive(self):
+        """A preflight error propagates out of main() before indexing."""
         class _Doomed(_TinyBenchmark):
             def preflight(self):
                 raise RuntimeError("dataset id unresolvable")
@@ -282,8 +251,7 @@ class TestRunnerMain(_CliCase):
                 self._run()
 
     def test_a_benchmark_without_preflight_still_runs(self):
-        """The hook is optional: benchmarks that have not added one are
-        simply not checked, never broken."""
+        """A benchmark with no preflight hook still runs."""
         self.assertFalse(hasattr(_TinyBenchmark, "preflight"))
         self.assertTrue(self._run().exists())
 

@@ -1,25 +1,5 @@
-"""M4 cells must build cold, and the runner must enforce it.
-
-WHY A GATE AND NOT A RUNBOOK STEP. The cold-tree rule has existed since
-the substrate lever landed: P10 fails on any `tree_cache_hit=True` for an
-M4 cell, because a warm tree may have been built under a different
-topology stack and nothing in the output says which. It was enforced by
-an operator remembering to delete a directory.
-
-This session measured the same worst-case story THREE times. Twice the
-run silently served a cache read and reported a build time for it — once
-through the pooled shard, once through `--only-unit`. `probe_cell_costs`
-aborts on exactly this condition; the runner did not, which is why it
-happened twice rather than once.
-
-FAILS ON THE FIRST WARM UNIT, not after the pass. A 40-story NarrativeQA
-cell that ran to completion before reporting a warm tree would have spent
-the session it was meant to protect.
-
-There is no escape flag since the repo reduction: an M4 cell either
-builds cold or refuses. A deliberate re-derivation runs against a
-throwaway THESIS_CACHE_DIR instead.
-"""
+"""Pins the cold-tree gate: an M4 cell aborts on the first warm tree and
+names a fresh THESIS_CACHE_DIR as the remedy."""
 
 from __future__ import annotations
 
@@ -44,6 +24,8 @@ from src.retrievers.base import AnswerResult, BaseSystem, RetrievedChunk
 
 
 class _TreeSystem(BaseSystem):
+    """Stub M4 that reports a warm or cold tree and counts index calls."""
+
     system_id = "M4"
 
     def __init__(self, *, warm: bool, **kw):
@@ -78,6 +60,8 @@ class _TreeSystem(BaseSystem):
 
 
 class _TwoUnitBenchmark:
+    """Two one-query units with fixed scores."""
+
     name = "two"
     cell_units = 2
 
@@ -106,6 +90,7 @@ class _TwoUnitBenchmark:
 
 
 def _run(*, warm: bool, require_cold: bool):
+    """Runs the two-unit benchmark through BenchmarkRunner in a temp dir."""
     with tempfile.TemporaryDirectory() as td:
         system = _TreeSystem(warm=warm, config=DEFAULT_CONFIG)
         runner = BenchmarkRunner(
@@ -118,20 +103,21 @@ def _run(*, warm: bool, require_cold: bool):
 
 
 class TestColdTreeGate(unittest.TestCase):
+    """Pins the gate's behaviour inside BenchmarkRunner.run."""
+
     def test_a_warm_tree_aborts_when_cold_is_required(self):
+        """A warm tree under require_cold_tree raises SystemExit."""
         with self.assertRaises(SystemExit):
             _run(warm=True, require_cold=True)
 
     def test_it_aborts_on_the_FIRST_unit_not_after_the_pass(self):
-        """A 40-story cell that ran to completion before reporting a warm
-        tree would have spent the session it exists to protect."""
+        """The abort lands on the first warm unit, before a second index."""
         system = None
         try:
             system, _ = _run(warm=True, require_cold=True)
         except SystemExit:
             pass
-        # The abort happens inside run(); nothing indexed a second unit.
-        # Re-drive with a captured system to inspect the count.
+        # Drive again holding the system so the index count is readable.
         with tempfile.TemporaryDirectory() as td:
             s = _TreeSystem(warm=True, config=DEFAULT_CONFIG)
             r = BenchmarkRunner(output_path=Path(td) / "o.jsonl",
@@ -141,16 +127,18 @@ class TestColdTreeGate(unittest.TestCase):
             self.assertEqual(s.n_indexed, 1)
 
     def test_a_cold_tree_passes(self):
+        """A cold tree under require_cold_tree indexes and scores two units."""
         system, rows = _run(warm=False, require_cold=True)
         self.assertEqual(len(rows), 2)
         self.assertEqual(system.n_indexed, 2)
 
     def test_warm_is_allowed_when_not_required(self):
-        """The default for systems that build no tree (M1/M2/M3)."""
+        """Without require_cold_tree a warm tree runs; M1/M2/M3 build none."""
         system, rows = _run(warm=True, require_cold=False)
         self.assertEqual(len(rows), 2)
 
     def test_the_message_names_the_rule_and_the_remedy(self):
+        """The abort message names tree_cache_hit and the cache dir remedy."""
         with self.assertRaises(SystemExit) as ctx:
             _run(warm=True, require_cold=True)
         msg = str(ctx.exception).lower()
@@ -160,14 +148,7 @@ class TestColdTreeGate(unittest.TestCase):
 
 
 class TestWiring(unittest.TestCase):
-    """END TO END through main(), not a grep of its source.
-
-    These asserted that the strings "require_cold_tree" and
-    "allow_warm_trees" appeared in `runner.main`. That proves the words
-    are present, never that the gate governs a run — the same shape as
-    the eleven instances this project had already found, written while
-    documenting them.
-    """
+    """Pins that runner.main turns the gate on for M4 end to end."""
 
     def setUp(self):
         self.td = tempfile.TemporaryDirectory()
@@ -176,6 +157,7 @@ class TestWiring(unittest.TestCase):
         self.td.cleanup()
 
     def _drive(self, *extra, warm: bool):
+        """Runs runner.main with a stub M4 and returns the summary JSON."""
         import json
         import sys
 
@@ -186,9 +168,8 @@ class TestWiring(unittest.TestCase):
                 super().__init__(warm=warm, **kw)
 
         out = Path(self.td.name) / "two_M4.jsonl"
-        # The pin gate has no escape, so the CLI drive carries a lockfile
-        # and stubs the version check green: what is under test here is
-        # the cold-tree gate, not the pin.
+        # The pin gate always runs, so pass a lockfile and stub its check
+        # green; only the cold-tree gate is under test here.
         lock = Path(self.td.name) / "requirements.lock"
         lock.write_text("# lock\nnumpy==0.0.0\n", encoding="utf-8")
         argv = ["runner", "--system", "M4", "--benchmark", "two",
@@ -205,12 +186,12 @@ class TestWiring(unittest.TestCase):
             out.with_suffix(".summary.json").read_text(encoding="utf-8"))
 
     def test_an_M4_cell_aborts_on_a_warm_tree_by_default(self):
-        """No flag needed: the gate is on for M4 because the code says
-        so, not because an operator remembered."""
+        """The gate is on for M4 with no flag: a warm tree exits."""
         with self.assertRaises(SystemExit):
             self._drive(warm=True)
 
     def test_a_cold_M4_cell_runs_and_records_no_cache_hit(self):
+        """A cold M4 cell completes and the summary records no cache hit."""
         summary = self._drive(warm=False)
         self.assertFalse(summary["tree_cache_hit"])
         self.assertEqual(summary["n_queries_scored"], 2)

@@ -1,13 +1,5 @@
-"""The cold-tree gate enumerates ALL warm units before indexing anything.
-
-WHAT THIS FORBIDS. The per-unit gate aborted on the FIRST warm unit, so
-discovering N warm substrates cost N session starts. On M4/hotpotqa —
-1,000 units, ~50 warm from the query slice — that is up to fifty aborts.
-
-THE TEST THAT MATTERS is `test_BOTH_warm_units_are_named_in_ONE_abort`:
-naming only the first is exactly the old behaviour passing under a new
-name, so a test that merely asserts "it aborted" would not distinguish
-them.
+"""Pins the cold-tree preflight: every unit is scanned, every warm
+substrate is named in one abort, and nothing is indexed on abort.
 """
 
 from __future__ import annotations
@@ -21,6 +13,7 @@ from src.eval.types import CorpusItem, EvalQuery, EvalUnit, GoldAnswer
 
 
 def _unit(cid, qids):
+    """Builds a one-item unit with one query per id."""
     return EvalUnit(
         corpus_id=cid,
         corpus=(CorpusItem(item_id=f"{cid}::i0", parent_id=cid,
@@ -36,7 +29,7 @@ def _unit(cid, qids):
 
 
 class _StubSystem:
-    """Reports a warm substrate for the corpus_ids it was told about."""
+    """Reports a warm substrate for the given corpus_ids and records calls."""
 
     system_id = "M4"
     has_cacheable_substrate = True
@@ -56,18 +49,21 @@ class _StubSystem:
 
 
 def _runner(**kw):
+    """Builds a runner that requires a cold tree, writing to a temp dir."""
     out = Path(tempfile.mkdtemp()) / "cell.jsonl"
     return BenchmarkRunner(output_path=out, require_cold_tree=True,
                            verbose=False, **kw)
 
 
 class TestPreflightEnumeratesEverything(unittest.TestCase):
+    """Pins that the scan covers every unit and aborts once, naming all."""
+
     def setUp(self):
         self.units = [_unit("u1", ["a"]), _unit("u2", ["b"]),
                       _unit("u3", ["c"]), _unit("u4", ["d"])]
 
     def test_BOTH_warm_units_are_named_in_ONE_abort(self):
-        """The whole point. Naming only the first is the old behaviour."""
+        """One abort names every warm unit, its path and the warm count."""
         sys_ = _StubSystem({"u2", "u4"})
         with self.assertRaises(SystemExit) as ctx:
             _runner()._cold_tree_preflight(sys_, self.units, set())
@@ -79,34 +75,38 @@ class TestPreflightEnumeratesEverything(unittest.TestCase):
         self.assertIn("2 of 4", msg)
 
     def test_every_unit_is_checked_before_the_abort(self):
-        """It does not stop scanning at the first warm one."""
+        """The scan visits every unit, not just up to the first warm one."""
         sys_ = _StubSystem({"u2", "u4"})
         with self.assertRaises(SystemExit):
             _runner()._cold_tree_preflight(sys_, self.units, set())
         self.assertEqual(sys_.checked, ["u1", "u2", "u3", "u4"])
 
     def test_nothing_is_indexed_when_it_aborts(self):
+        """An abort happens before any unit is indexed."""
         sys_ = _StubSystem({"u2"})
         with self.assertRaises(SystemExit):
             _runner()._cold_tree_preflight(sys_, self.units, set())
         self.assertEqual(sys_.indexed, [])
 
     def test_all_cold_passes_silently(self):
+        """All-cold units pass the scan without raising."""
         sys_ = _StubSystem(set())
         _runner()._cold_tree_preflight(sys_, self.units, set())
         self.assertEqual(sys_.checked, ["u1", "u2", "u3", "u4"])
 
 
 class TestPreflightScope(unittest.TestCase):
+    """Pins which units and systems the preflight leaves out."""
+
     def test_units_already_banked_are_not_checked(self):
-        """A resumed pass does not index them, so a warm substrate there
-        is not a finding."""
+        """Units whose queries are all banked are outside the scan."""
         units = [_unit("u1", ["a"]), _unit("u2", ["b"])]
         sys_ = _StubSystem({"u1"})
         _runner()._cold_tree_preflight(sys_, units, {"a"})
         self.assertEqual(sys_.checked, ["u2"])
 
     def test_systems_without_a_substrate_are_skipped_entirely(self):
+        """A system with no cacheable substrate is never checked."""
         class _NoSubstrate(_StubSystem):
             has_cacheable_substrate = False
 
@@ -115,8 +115,7 @@ class TestPreflightScope(unittest.TestCase):
         self.assertEqual(sys_.checked, [])
 
     def test_the_gate_is_inert_when_no_cold_tree_is_required(self):
-        """M1/M2/M3 build no tree; the runner constructs them with
-        require_cold_tree=False. There is no such setting for M4."""
+        """With require_cold_tree=False the preflight checks nothing."""
         sys_ = _StubSystem({"u1"})
         r = BenchmarkRunner(
             output_path=Path(tempfile.mkdtemp()) / "c.jsonl",

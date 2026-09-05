@@ -1,28 +1,5 @@
-"""The allocator config must be set before CUDA initialises, not after.
-
-INSTANCE ELEVEN. `configure_cuda_allocator()` sets
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True, and its own docstring
-says the variable is read once at allocator setup so changing it later
-does nothing. It was called from exactly two places, both on the
-GENERATION path: `_load_generator_impl` and `generate_batch`.
-
-In a real cell the embedder loads first — `load_embedder` constructs a
-SentenceTransformer, which moves weights to CUDA and initialises the
-allocator — and the generator loads afterwards. So the call ran AFTER the
-thing it configures, and the setting was inert for every cell that would
-ever run.
-
-Meanwhile every probe in this investigation sets it at MODULE TOP, before
-any torch import. The entire measurement history was therefore taken with
-expandable_segments ON while the matrix would have run without it. The
-observed OOM reported 1.16 GiB reserved-but-unallocated — precisely the
-fragmentation the setting exists to prevent.
-
-The fix sets it at import time of `src.models`, which every CUDA-touching
-path in this harness goes through (embedder, reranker and generator all
-load from there), and records the effective value in run provenance so a
-regression is visible in the artifact rather than only in a traceback.
-"""
+"""Pins that importing src.models sets PYTORCH_CUDA_ALLOC_CONF before any
+model can initialise CUDA, and that run provenance records the value."""
 
 from __future__ import annotations
 
@@ -36,9 +13,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _in_fresh_process(code: str, env: dict | None = None) -> str:
-    """Run `code` in a clean interpreter. Import-time behaviour cannot be
-    tested in-process: another test may already have imported the module,
-    and the assertion would pass on leakage rather than on the import."""
+    """Run code in a fresh interpreter so import-time effects are visible."""
+    # Clear the allocator variable, then apply the test's own env.
     full = {**os.environ, **(env or {})}
     full.pop("PYTORCH_CUDA_ALLOC_CONF", None)
     if env:
@@ -53,9 +29,10 @@ def _in_fresh_process(code: str, env: dict | None = None) -> str:
 
 
 class TestSetAtImportTime(unittest.TestCase):
+    """Pins that the allocator variable is set at import time."""
+
     def test_importing_models_sets_it(self):
-        """The property that was missing: set by the IMPORT, so it lands
-        before anything constructs a CUDA tensor."""
+        """Importing src.models sets the allocator variable."""
         got = _in_fresh_process("""
             import os
             import src.models  # noqa: F401
@@ -64,7 +41,7 @@ class TestSetAtImportTime(unittest.TestCase):
         self.assertEqual(got, "expandable_segments:True")
 
     def test_importing_the_runner_sets_it(self):
-        """The entry point a cell actually uses."""
+        """Importing the runner, the cell entry point, sets it too."""
         got = _in_fresh_process("""
             import os
             import src.eval.runner  # noqa: F401
@@ -73,9 +50,7 @@ class TestSetAtImportTime(unittest.TestCase):
         self.assertEqual(got, "expandable_segments:True")
 
     def test_it_is_set_before_the_embedder_could_initialise_cuda(self):
-        """THE ORDERING THAT BROKE. `load_embedder` builds a
-        SentenceTransformer, which initialises the allocator. The config
-        must already be in place when that module is merely importable."""
+        """The variable is in place before load_embedder can touch CUDA."""
         got = _in_fresh_process("""
             import os
             import src.models as m
@@ -86,7 +61,7 @@ class TestSetAtImportTime(unittest.TestCase):
         self.assertEqual(got, "expandable_segments:True")
 
     def test_an_operator_override_is_respected(self):
-        """setdefault, not assignment: a deliberate value must survive."""
+        """A value already in the environment survives the import."""
         got = _in_fresh_process(
             """
             import os
@@ -99,10 +74,10 @@ class TestSetAtImportTime(unittest.TestCase):
 
 
 class TestProvenanceRecordsIt(unittest.TestCase):
-    """A value that is set and never asserted is not a check — the
-    corollary this project has earned five times over."""
+    """Pins that run provenance records the allocator setting."""
 
     def test_environment_provenance_carries_the_effective_value(self):
+        """Provenance carries cuda_alloc_conf equal to the live variable."""
         from scripts.pin_environment import environment_provenance
 
         prov = environment_provenance(None)
