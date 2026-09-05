@@ -1,20 +1,6 @@
-"""Chunking.
+"""Chunking: parsed documents to Chunk objects.
 
-Two strategies share the Chunk dataclass and `chunk_corpus` entrypoint:
-
-  * "word_window" — fixed-size word window with overlap (200 / 50):
-                    M2 and M3's chunker, the harness default.
-  * "raptor_100tok" — M4 ONLY. Paper-faithful RAPTOR leaves: contiguous,
-                    sentence-preserving, ~100 tiktoken tokens, no overlap.
-                    Segmentation lives in `src/raptor_paper.py`; this
-                    module only adapts it to the Chunk dataclass.
-
-Strategy is selected by HarnessConfig.chunking.strategy, or per-system
-via the `chunker` override on a system config (M4 uses that route so
-its chunker change cannot move any other system's cache key). The
-embedding-similarity "semantic" strategy left in the repo reduction; its
-six ChunkingConfig fields stay because they sit inside every substrate
-key.
+Two strategies: the M2/M3 word window and M4's RAPTOR leaf (raptor_100tok).
 """
 
 from __future__ import annotations
@@ -32,6 +18,7 @@ from .parsing import ParsedDocument
 
 @dataclass
 class Chunk:
+    """One retrieval unit of a document with its position and metadata."""
     chunk_id: str
     doc_id: str
     text: str
@@ -39,61 +26,42 @@ class Chunk:
     position: int                              # ordinal within doc
     metadata: dict = field(default_factory=dict)
 
-    # CK-2 retrieval-recall provenance for benchmark eval. Each pair is
-    # (parent_id, span_id) identifying a gold-passage atom this chunk
-    # touches — e.g. ("https://example.com/article", "<whole>") for
-    # MultiHop-RAG or ("story_id", "<whole>") for NarrativeQA. A chunk
-    # produced from one paragraph carries one pair; a chunk spanning two
-    # paragraphs carries two. Empty tuple for non-eval indexing (default;
-    # preserves existing chunk behaviour byte-for-byte).
-    #
-    # CACHE DISCIPLINE: this field is eval-time metadata, NOT retrieval
-    # content. It is intentionally excluded from every cache key — the
-    # cache key (compute_cache_key) hashes chunking_config + embedder +
-    # parsing_identity + corpus_hash + extra, none of which read the
-    # Chunk dataclass itself. Adding this field therefore does NOT
-    # invalidate any existing substrate (RAPTOR 78fb239..., M4 mpnet
-    # bfc50c2..., M6 graph, etc.). save_chunks/load_chunks survives
-    # back-compat because the field has a default factory: old cached
-    # chunks lack the key in their on-disk JSON and Chunk(**d) falls
-    # back to the empty tuple.
+    # Gold-passage atoms this chunk touches, as (parent_id, span_id) pairs,
+    # e.g. ("https://example.com/article", "<whole>") for MultiHop-RAG or
+    # ("story_id", "<whole>") for NarrativeQA. A chunk spanning two
+    # paragraphs carries two pairs. Empty outside evaluation.
+    # Eval-time metadata only: the cache key hashes the chunking config,
+    # embedder, parser identity, corpus hash and extra, never a Chunk.
+    # harness choice: content-addressed substrates (METHODS §D)
     gold_provenance: tuple = field(default_factory=tuple)
 
 
-# --- Word-window (cheap, embedder-free) -----------------------------------
+# --- Word window (M2/M3) ---------------------------------------------------
 
 
+# Window 200 words, overlap 50, from ChunkingConfig.
+# harness choice: shared default for M2/M3 (METHODS §A.2)
 def _chunk_doc_word_window(
     doc: ParsedDocument,
     chunk_words: int,
     overlap_words: int,
 ) -> list[Chunk]:
-    """Fixed-size word window with overlap.
-
-    `start_char` / `end_char` land in `Chunk.metadata` — offsets into
-    `doc.text`, spanning from the first character of the window's first
-    word to the last character of its last word. `index_items` consumes
-    them to derive gold_provenance by span intersection when a parent
-    holds several CorpusItems; without them that path raises rather than
-    stamping empty provenance.
-
-    The chunk TEXT is unchanged by their addition, and deliberately so:
-    `re.finditer(r"\\S+")` yields exactly the sequence `str.split()`
-    yields (both split on whitespace runs and drop them), so the joined
-    window is byte-identical to what this function produced before, and
-    cached chunk sets stay valid. `Chunk.metadata` is not a cache-key
-    input, so nothing here moves a substrate hash.
-    """
+    """Slide a constant-size word window with overlap across the document."""
     if chunk_words <= 0:
         raise ValueError("chunk_words must be positive")
     if overlap_words < 0 or overlap_words >= chunk_words:
         raise ValueError("overlap_words must be in [0, chunk_words)")
 
+    # Words are maximal non-whitespace runs, the same split str.split()
+    # gives, with char offsets kept for the metadata below.
     spans = [(m.start(), m.end()) for m in re.finditer(r"\S+", doc.text)]
     words = [doc.text[a:b] for a, b in spans]
     if not words:
         return []
 
+    # One chunk per stride. start_char/end_char span the window's first
+    # and last word; index_items uses them to derive gold_provenance when
+    # a parent holds several items, and raises without them.
     stride = chunk_words - overlap_words
     chunks: list[Chunk] = []
     for position, start in enumerate(range(0, len(words), stride)):
@@ -117,41 +85,30 @@ def _chunk_doc_word_window(
     return chunks
 
 
-# --- RAPTOR paper-faithful (M4 only) ---------------------------------------
+# --- RAPTOR leaves (M4 only) -----------------------------------------------
 
 
 def _chunk_doc_raptor_100tok(
     doc: ParsedDocument,
     cfg: ChunkingConfig,
 ) -> list[Chunk]:
-    """Paper-faithful RAPTOR leaves: ~100 tokens, sentence-preserving, no overlap.
-
-    Delegates the actual segmentation to `src.raptor_paper.
-    split_text_raptor` (which carries the fidelity notes and the one
-    documented divergence from the reference implementation). This
-    wrapper only maps TextSpans onto the shared Chunk dataclass.
-
-    `cfg.chunk_words` is read as a TOKEN budget here, not a word count —
-    see the strategy note in config.py. `cfg.overlap_words` must be 0;
-    the reference never overlaps and a non-zero value would silently
-    misrepresent the strategy.
-
-    The span offsets land in `Chunk.metadata` (start_char / end_char /
-    n_tokens). Chunk.metadata is NOT part of any cache key, so carrying
-    them is free. M4's per-parent `index_items` override consumes them
-    to derive gold_provenance by offset intersection.
-    """
+    """Map RAPTOR sentence-preserving ~100-token leaves onto Chunk objects."""
+    # cfg.chunk_words is a tiktoken token budget here, not a word count.
+    # RAPTOR paper §3: "short, contiguous texts of length 100"
+    # Leaves never overlap, so overlap_words must be 0.
+    # ref: raptor/utils.py::split_text @ 7da1d48a (overlap never passed, 0)
     if cfg.overlap_words != 0:
         raise ValueError(
             "raptor_100tok is a non-overlapping strategy "
             f"(reference overlap=0); got overlap_words={cfg.overlap_words}"
         )
 
-    # Local import: raptor_paper pulls tiktoken lazily, and chunking.py
-    # is imported by cache.py on every path including ones with no
-    # tokenizer available.
+    # Import here: raptor_paper needs tiktoken, and cache.py imports this
+    # module on paths that have no tokenizer.
     from .raptor_paper import split_text_raptor
 
+    # Segmentation lives in split_text_raptor. Carry its offsets and token
+    # count in metadata; M4's index_items derives gold_provenance from them.
     spans = split_text_raptor(doc.text, max_tokens=cfg.chunk_words)
     return [
         Chunk(
@@ -173,10 +130,13 @@ def _chunk_doc_raptor_100tok(
 # --- Public entrypoints ----------------------------------------------------
 
 
+# The strategy comes from HarnessConfig.chunking or a system's chunker
+# override; M4 uses the override so its leaf shape moves only its own key.
 def chunk_document(
     doc: ParsedDocument,
     cfg: ChunkingConfig,
 ) -> list[Chunk]:
+    """Chunk one document with the strategy named in cfg."""
     if cfg.strategy == "word_window":
         return _chunk_doc_word_window(doc, cfg.chunk_words, cfg.overlap_words)
     if cfg.strategy == "raptor_100tok":
@@ -188,7 +148,7 @@ def chunk_corpus(
     docs: Iterable[ParsedDocument],
     cfg: ChunkingConfig,
 ) -> list[Chunk]:
-    """Chunk every doc using the configured strategy."""
+    """Chunk every document with the strategy named in cfg."""
     out: list[Chunk] = []
     for doc in docs:
         out.extend(chunk_document(doc, cfg))

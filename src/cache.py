@@ -1,29 +1,6 @@
-"""Cache-key computation and a small save/load helper for retriever indexes.
-
-Key design:
-
-    cache_key = sha256(
-        chunking_config_json
-      + embedder_model
-      + corpus_content_hash
-      + extra_json
-    )
-
-Switching chunking strategy, embedding model, or corpus content
-invalidates the cache automatically — same pattern as the existing
-notebook's `embeddings_{strategy}.npy` keying, but content-addressed.
-
-Cache layout on disk:
-
-    <cache_dir>/<system_id>/<cache_key>/
-        manifest.json         # bookkeeping (chunking cfg, model, n_chunks, ...)
-        chunks.jsonl          # one Chunk per line, json-serialised
-        embeddings.npy        # float32 matrix, L2-normalised
-        faiss.index           # FAISS native serialisation (optional)
-        bm25.pkl              # pickled BM25Okapi (optional)
-
-Each retriever picks which optional files it writes.
-"""
+"""Content-addressed cache keys and the on-disk substrate layout:
+<cache_dir>/<system_id>/<cache_key>/ holds the manifest, chunks,
+embeddings and any index files the retriever writes."""
 
 from __future__ import annotations
 
@@ -44,9 +21,10 @@ from .chunking import Chunk
 
 
 def corpus_content_hash(corpus_path: Path) -> str:
-    """SHA-256 over sorted (rel_path, bytes) tuples for every file in dir."""
+    """SHA-256 over every file under the corpus dir, in sorted path order."""
     h = hashlib.sha256()
     root = Path(corpus_path).resolve()
+    # Feed each file as its relative path, then its bytes, with separators.
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
@@ -59,6 +37,7 @@ def corpus_content_hash(corpus_path: Path) -> str:
 
 
 def _json_repr(obj: Any) -> str:
+    """Sorted-key JSON for a dataclass or any JSON-able object."""
     if is_dataclass(obj):
         return json.dumps(asdict(obj), sort_keys=True)
     return json.dumps(obj, sort_keys=True, default=str)
@@ -72,23 +51,15 @@ def compute_cache_key(
     extra: dict[str, Any] | None = None,
     parsing_identity: dict[str, Any] | None = None,
 ) -> str:
-    """Stable hex key from chunking + embedder + parser + corpus + extras.
-
-    Parser identity is folded in automatically (default-loaded from
-    parsing.parsing_identity()) so that swapping PDF backends — e.g.
-    PyMuPDF → Docling — invalidates every cached index across systems.
-    Pass `parsing_identity={}` explicitly to opt out (tests only).
-
-    CACHE DISCIPLINE: this function reads only the four explicit inputs
-    plus parsing_identity. It does NOT read the Chunk dataclass shape.
-    Adding fields to Chunk (e.g. `gold_provenance` for CK-2 retrieval-
-    recall) therefore does NOT invalidate any existing substrate hash.
-    """
+    """32-hex key over chunking, embedder, parser, corpus hash and extras."""
+    # harness choice: content-addressed substrates (METHODS §D)
+    # Default to the live parser identity; pass {} to leave it out.
     if parsing_identity is None:
-        # Late import to avoid a chunking → parsing → cache cycle at module load.
+        # Import here to avoid a chunking -> parsing -> cache import cycle.
         from .parsing import parsing_identity as _parsing_identity
         parsing_identity = _parsing_identity()
 
+    # Hash the five inputs as one sorted-key payload; keep 32 hex chars.
     payload = "\n".join([
         f"chunking={_json_repr(chunking_config)}",
         f"embedder={embedder_model}",
@@ -104,6 +75,7 @@ def compute_cache_key(
 
 @dataclass
 class CacheDir:
+    """Paths of one substrate under <root>/<system_id>/<cache_key>/."""
     root: Path
     system_id: str
     cache_key: str
@@ -133,6 +105,9 @@ class CacheDir:
         return self.path / "bm25.pkl"
 
     def is_complete(self, required: Iterable[str]) -> bool:
+        """True when the manifest and every required file are on disk."""
+        # The manifest is written last, so its presence means a finished
+        # build; then check each file the retriever needs.
         if not self.manifest_path.exists():
             return False
         for name in required:
@@ -145,6 +120,7 @@ class CacheDir:
 
 
 def save_chunks(chunks: list[Chunk], path: Path) -> None:
+    """Write chunks as JSONL, one Chunk per line."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         for c in chunks:
@@ -152,6 +128,7 @@ def save_chunks(chunks: list[Chunk], path: Path) -> None:
 
 
 def load_chunks(path: Path) -> list[Chunk]:
+    """Read a JSONL file back into Chunk objects."""
     chunks: list[Chunk] = []
     with path.open("r", encoding="utf-8") as f:
         for line in f:
@@ -165,6 +142,7 @@ def load_chunks(path: Path) -> list[Chunk]:
 
 @dataclass
 class Manifest:
+    """Bookkeeping for one substrate: what built it and which files exist."""
     system_id: str
     cache_key: str
     chunking_config: dict
@@ -178,11 +156,13 @@ class Manifest:
     extra: dict = field(default_factory=dict)
 
     def save(self, path: Path) -> None:
+        """Write the manifest as sorted, indented JSON."""
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(asdict(self), indent=2, sort_keys=True))
 
     @classmethod
     def load(cls, path: Path) -> "Manifest":
+        """Read a manifest back from its JSON file."""
         return cls(**json.loads(path.read_text()))
 
 
@@ -190,20 +170,24 @@ class Manifest:
 
 
 def save_embeddings(emb: np.ndarray, path: Path) -> None:
+    """Save an embedding matrix as .npy."""
     path.parent.mkdir(parents=True, exist_ok=True)
     np.save(path, emb)
 
 
 def load_embeddings(path: Path) -> np.ndarray:
+    """Load an embedding matrix from .npy."""
     return np.load(path)
 
 
 def save_pickle(obj: Any, path: Path) -> None:
+    """Pickle an object (the BM25 index) to disk."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("wb") as f:
         pickle.dump(obj, f)
 
 
 def load_pickle(path: Path) -> Any:
+    """Load a pickled object from disk."""
     with path.open("rb") as f:
         return pickle.load(f)

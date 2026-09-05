@@ -1,25 +1,6 @@
-"""Per-system component resolver.
+"""Resolve each system's retrieval-side components over shared defaults.
 
-Each active system can override its retrieval-side components (embedder,
-chunker, reranker, index-time LLM) on its per-system Config dataclass.
-Any field left None falls back to a shared default. Today no system
-overrides anything — this module is pure capability, defaults are
-preserved everywhere — but the plumbing is in place so the per-paper
-component audit can flip values without touching call sites.
-
-The FINAL GENERATOR is intentionally NOT a per-system field. It lives at
-the harness level (HarnessConfig.generation) and is held constant across
-all systems, so per-paper generator choices cannot leak in and confound
-the retrieval comparison. ResolvedComponents therefore carries no
-generator slot — the invariant is enforced structurally.
-
-Index-time LLM names differ per paper (RAPTOR calls it the summariser
-and stores it as M4Config.summary_model). The resolver normalises the
-paper-side name to a single index_llm_id for the per-system audit log.
-
-The resolver also produces the structured log line that smoke + harness
-emit per system at index time, which feeds the per-paper audit table
-mechanically.
+The reader is never a per-system field; it lives on HarnessConfig.
 """
 
 from __future__ import annotations
@@ -37,24 +18,13 @@ from .config import (
 
 @dataclass(frozen=True)
 class ResolvedComponents:
-    """Concrete component identities a system uses at index/retrieve time.
+    """Component identities a system uses at index and retrieve time."""
 
-    embedder_id and chunker_config feed compute_cache_key directly (the
-    cache key has always carried embedder_model and chunking_config as
-    top-level fields; the resolver just centralises which value lands
-    there).
-
-    reranker_id is None for systems that do not rerank (M2, M3, M4 today).
-    For systems that do rerank (M7), the value is folded into the
-    system-specific cache key extras, NOT into the shared RAPTOR
-    substrate key — reranking is query-time and the substrate is rerank-
-    independent.
-
-    index_llm_id is None for systems with no index-time LLM (M2, M3).
-    For M4/M7 it normalises to the value of `summary_model`; a future M6
-    will normalise from `openie_llm`. Used today only for the audit log.
-    """
-
+    # embedder_id and chunker_config feed the substrate cache key.
+    # reranker_id is None for every system in the matrix.
+    # index_llm_id is None where a system runs no index-time LLM; M4
+    # resolves it from summary_model. There is no reader slot here.
+    # harness choice: one reader across all systems (METHODS §D)
     embedder_id: str
     chunker_config: ChunkingConfig
     reranker_id: str | None
@@ -62,13 +32,7 @@ class ResolvedComponents:
 
 
 def _resolve_field(cfg: Any | None, name: str, fallback: Any) -> Any:
-    """Read `cfg.name`, falling back when the field is absent OR present-but-None.
-
-    Both branches collapse to the same outcome by design: a system that
-    declares `embedder: str | None = None` to opt in to the override
-    capability while not yet overriding must behave identically to a
-    system that does not declare the field at all.
-    """
+    """Read cfg.name; use the fallback when it is missing or None."""
     val = getattr(cfg, name, None) if cfg is not None else None
     return val if val is not None else fallback
 
@@ -80,27 +44,21 @@ def resolve_components(
     default_reranker: str | None = None,
     default_index_llm: str | None = None,
 ) -> ResolvedComponents:
-    """Fold a per-system config's optional component overrides over shared defaults.
-
-    `system_cfg=None` returns pure shared defaults (the M2/M3 path
-    today — neither has a per-system config namespace yet, and neither
-    overrides anything).
-
-    `default_reranker` and `default_index_llm` are caller-supplied
-    per-system fallbacks. They differ from harness-level defaults
-    because not every system reranks or runs an index-time LLM — M4
-    passes default_reranker=None to keep "M4 does not rerank" visible
-    in the resolved bundle.
-    """
+    """Fold a system config's optional overrides over the shared defaults."""
+    # system_cfg=None gives the shared defaults (the M2/M3 path).
+    # default_reranker and default_index_llm are per-system fallbacks; M4
+    # passes default_reranker=None so "M4 does not rerank" stays visible.
+    # embedder fallback: BAAI/bge-m3
+    # harness choice: per-paper-components rule (METHODS §A.2)
+    # chunker fallback: harness_cfg.chunking
+    # harness choice: shared default for M2/M3 (METHODS §A.2)
     embedder = _resolve_field(system_cfg, "embedder", EMBEDDER_MODEL)
     chunker = _resolve_field(system_cfg, "chunker", harness_cfg.chunking)
     reranker = _resolve_field(system_cfg, "reranker", default_reranker)
 
-    # Index-time LLM normalisation: paper-faithful field names on each
-    # system config, single id at the resolver. RAPTOR-family configs
-    # carry `summary_model` (M4); `openie_llm` was HippoRAG's name and is
-    # read through getattr, so a config without it resolves to None. An
-    # explicit `index_llm` field overrides both if set.
+    # Pick one index-time LLM id from the paper-side field names: an
+    # explicit index_llm wins, then summary_model (M4), then openie_llm,
+    # then the caller's default. A missing field counts as None.
     explicit = (
         getattr(system_cfg, "index_llm", None) if system_cfg is not None else None
     )
@@ -123,14 +81,9 @@ def resolve_components(
 
 
 def format_components_log(system_id: str, r: ResolvedComponents) -> str:
-    """One-line JSON for the per-system audit log.
-
-    Emitted by every active system at index time so the per-paper
-    component audit table can be assembled mechanically from smoke or
-    eval-grid logs (just grep for `[components]` and json.loads each
-    line). The chunker is summarised by its strategy string; the full
-    chunker params are already in the manifest if needed.
-    """
+    """Return the one-line JSON `[components]` record for a system."""
+    # The chunker is named by its strategy string; the full chunker
+    # parameters are in the substrate manifest.
     return json.dumps(
         {
             "system": system_id,

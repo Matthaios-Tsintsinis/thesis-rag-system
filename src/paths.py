@@ -1,28 +1,6 @@
-"""Filesystem layout resolution.
-
-Resolves four roles to concrete paths with environment-variable overrides
-and a multi-tier fallback chain so the same code runs on:
-
-  * Colab with Drive mounted (preferred for persistence)
-  * Colab without Drive   (results lost on session end, but smoke runs)
-  * Local dev (Windows / Linux / Mac)
-
-Resolution order for each role (first match wins):
-
-  1. Explicit env var (THESIS_INPUT_DIR, THESIS_CACHE_DIR,
-     THESIS_OUTPUT_DIR, THESIS_HF_CACHE_DIR)
-  2. Drive subdir at /content/drive/MyDrive/thesis_rag/<role>
-     (only when /content/drive/MyDrive exists)
-  3. Colab local subdir at /content/thesis_rag/<role>
-     (only when /content exists; HF cache uses /content/hf_cache)
-  4. Repo-local fallback at <repo>/local_runs/<role>
-
-HF model cache is kept local by default even when Drive is mounted —
-the Drive sync layer is known to corrupt large .safetensors files
-mid-download. Set THESIS_HF_CACHE_DIR explicitly to opt into Drive.
-
-This module has no side effects at import time. Callers invoke
-ensure_all() (typically once at notebook startup) to create dirs.
+"""Resolve the input, cache, output, HF-cache and staging directories.
+Env vars win, then Drive under /content/drive, then /content, then
+<repo>/local_runs. Nothing runs at import; ensure_all() creates the dirs.
 """
 
 from __future__ import annotations
@@ -40,14 +18,17 @@ _COLAB_MARKER = Path("/content")
 
 
 def _drive_mounted() -> bool:
+    """True when the Colab Drive mount is present."""
     return _DRIVE_MARKER.exists()
 
 
 def _on_colab() -> bool:
+    """True when /content exists, i.e. the code runs on Colab."""
     return _COLAB_MARKER.exists()
 
 
 def _base_root() -> Path:
+    """Pick the root for this host: Drive, Colab local disk, or the repo."""
     if _drive_mounted():
         return _DRIVE_ROOT
     if _on_colab():
@@ -56,6 +37,7 @@ def _base_root() -> Path:
 
 
 def _resolve(env_var: str, subdir: str) -> Path:
+    """Return the env-var override for a role, else <root>/<subdir>."""
     val = os.environ.get(env_var)
     if val:
         return Path(val).expanduser()
@@ -63,52 +45,46 @@ def _resolve(env_var: str, subdir: str) -> Path:
 
 
 def input_dir() -> Path:
+    """Directory holding benchmark inputs."""
     return _resolve("THESIS_INPUT_DIR", "inputs")
 
 
 def cache_dir() -> Path:
+    """Directory holding substrate caches."""
     return _resolve("THESIS_CACHE_DIR", "cache")
 
 
 def output_dir() -> Path:
+    """Directory holding run outputs."""
     return _resolve("THESIS_OUTPUT_DIR", "outputs")
 
 
 def hf_cache_dir() -> Path:
-    """HF model cache. Local by default; opt into Drive with env var."""
+    """HF model cache; local disk unless THESIS_HF_CACHE_DIR says otherwise."""
     val = os.environ.get("THESIS_HF_CACHE_DIR")
     if val:
         return Path(val).expanduser()
+    # Drive's sync layer corrupts large .safetensors mid-download, so the
+    # model cache stays off Drive even when Drive is mounted.
     if _on_colab():
         return Path("/content/hf_cache")
     return _LOCAL_FALLBACK_ROOT / "hf_cache"
 
 
 def staging_dir() -> Path:
-    """Local real-filesystem scratch root — never Drive.
-
-    lancedb (M6 / HippoRAG likely; previously the archived GraphRAG M5)
-    commits a table by an atomic rename, which the Drive FUSE mount
-    forbids (EPERM). Such systems must build on a real local disk and
-    copy the finished artifacts to the Drive cache. On Colab that is
-    /content; off-Colab a repo-local dir. Override with THESIS_STAGING_DIR.
-    """
+    """Scratch root on a real local filesystem, never on Drive."""
     val = os.environ.get("THESIS_STAGING_DIR")
     if val:
         return Path(val).expanduser()
+    # Stores that commit by atomic rename get EPERM on the Drive FUSE
+    # mount, so they build here and copy the result into the cache.
     if _on_colab():
         return Path("/content/thesis_staging")
     return _LOCAL_FALLBACK_ROOT / "staging"
 
 
 def cache_dir_needs_staging() -> bool:
-    """True when the cache dir sits on the Drive FUSE mount.
-
-    Callers writing rename-sensitive stores (lancedb) must then build on
-    staging_dir() and copy the result into the cache. False for a local
-    cache dir (local dev, or Colab without Drive), where the cache dir is
-    itself a real filesystem and can be written in place.
-    """
+    """True when the cache dir sits on the Drive FUSE mount."""
     try:
         cd = cache_dir().resolve()
     except OSError:
@@ -117,6 +93,7 @@ def cache_dir_needs_staging() -> bool:
 
 
 def all_paths() -> dict[str, Path]:
+    """Map each role name to its resolved path."""
     return {
         "INPUT_DIR": input_dir(),
         "CACHE_DIR": cache_dir(),
@@ -127,6 +104,7 @@ def all_paths() -> dict[str, Path]:
 
 
 def ensure_all() -> dict[str, Path]:
+    """Create every role directory and return the map."""
     paths = all_paths()
     for p in paths.values():
         p.mkdir(parents=True, exist_ok=True)
@@ -134,7 +112,7 @@ def ensure_all() -> dict[str, Path]:
 
 
 def describe() -> str:
-    """Human-readable summary for notebook startup banner."""
+    """One line per role, for a startup banner."""
     flags = []
     if _drive_mounted():
         flags.append("drive=mounted")
