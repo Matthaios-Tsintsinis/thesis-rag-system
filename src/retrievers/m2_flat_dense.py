@@ -1,13 +1,4 @@
-"""M2 — Flat dense retrieval baseline.
-
-Leaf-chunk-only FAISS index over bge-m3 embeddings (L2-normalised,
-inner product == cosine). No hierarchy, no sparse retriever. Isolates
-the value of hierarchical organisation when compared against M4/M7.
-
-Index artifacts (chunks, embeddings, FAISS index) are cached on disk
-keyed by hash(chunking_config + embedder_model + corpus_content). A
-hit means index() is essentially free across Colab sessions.
-"""
+"""M2: flat dense retrieval over leaf chunks, exact FAISS search."""
 
 from __future__ import annotations
 
@@ -44,26 +35,37 @@ REQUIRED_FILES = ("chunks.jsonl", "embeddings.npy", "faiss.index")
 
 
 class FlatDenseSystem(BaseSystem):
+    """Embed word-window chunks with bge-m3 and search them by cosine."""
+
     system_id = "M2"
 
     def __init__(self, config: HarnessConfig = DEFAULT_CONFIG) -> None:
+        """Start with no chunks, no index and no resolved components."""
         super().__init__(config)
         self.chunks: list[Chunk] = []
         self._index: Any | None = None  # faiss.IndexFlatIP
-        # Populated at the top of index(); used at query time by retrieve()
-        # so embedder identity is consistent across index and query.
+        # index() fills this; retrieve() reads it so query and index share
+        # one embedder.
         self._resolved: ResolvedComponents | None = None
 
     def index(self, corpus_path: Path) -> None:
+        """Chunk and embed the corpus, or load the cached index for it."""
         import faiss
 
-        # M2 has no per-system Config namespace today (it does not override
-        # any component); the None path returns pure shared defaults.
+        # M2 overrides no component, so the None path gives the shared
+        # defaults.
+        # embedder BAAI/bge-m3, normalised, cosine via inner product
+        # harness choice: per-paper-components rule (METHODS §A.2)
+        # word window 200 words, overlap 50, docs under 200 chars dropped
+        # harness choice: shared default for M2/M3 (METHODS §A.2)
         self._resolved = resolve_components(None, self.config)
         print(f"[components] {format_components_log(self.system_id, self._resolved)}")
         chunker_cfg = self._resolved.chunker_config
         embedder_id = self._resolved.embedder_id
 
+        # Cache key = chunking config + embedder + parser identity + corpus
+        # hash.
+        # harness choice: content-addressed substrates (METHODS §D)
         corpus_path = Path(corpus_path)
         chash = corpus_content_hash(corpus_path)
         ckey = compute_cache_key(
@@ -73,6 +75,8 @@ class FlatDenseSystem(BaseSystem):
         )
         cdir = CacheDir(paths.cache_dir(), self.system_id, ckey)
 
+        # A complete cache dir means chunks and index load straight from
+        # disk.
         if cdir.is_complete(REQUIRED_FILES):
             print(f"[{self.system_id}] cache hit: {cdir.path}")
             self.chunks = load_chunks(cdir.chunks_path)
@@ -80,17 +84,22 @@ class FlatDenseSystem(BaseSystem):
             self._indexed = True
             return
 
+        # Walk the corpus and chunk it.
         print(f"[{self.system_id}] cache miss → building index at {cdir.path}")
         docs = list(walk_corpus(corpus_path, min_chars=chunker_cfg.min_chars_per_doc))
         self.chunks = chunk_corpus(docs, chunker_cfg)
         if not self.chunks:
             raise RuntimeError(f"No chunks produced from {corpus_path}")
 
+        # Embed every chunk and build the exact inner-product index.
+        # exact FAISS IndexFlatIP
+        # harness choice: exact search at this scale
         embeddings = embed_texts([c.text for c in self.chunks], model_name=embedder_id)
         index = faiss.IndexFlatIP(embeddings.shape[1])
         index.add(embeddings)
         self._index = index
 
+        # Write chunks, embeddings and index, then the manifest last.
         save_chunks(self.chunks, cdir.chunks_path)
         save_embeddings(embeddings, cdir.embeddings_path)
         faiss.write_index(index, str(cdir.faiss_path))
@@ -108,18 +117,21 @@ class FlatDenseSystem(BaseSystem):
 
     @property
     def resolved_components(self) -> ResolvedComponents | None:
+        """Return the components index() resolved, or None before index()."""
         return self._resolved
 
     def retrieve(self, query: str, k: int | None = None) -> list[RetrievedChunk]:
+        """Embed the query and return its top-k chunks by cosine score."""
         self._require_indexed()
         assert self._resolved is not None
-        # Natural top-K (FINAL_CONTEXT_CHUNKS=15 default). M2 baseline
-        # feeds the generator what its paper would; the packer at
-        # answer() time is a pass-through. Callers who want a deeper
-        # menu pass an explicit k.
+        # k defaults to the natural top-15 the reader gets; callers who
+        # want a deeper ranking pass an explicit k.
+        # top-15 to the reader
+        # harness choice: baselines at natural strength, no imposed budget (METHODS §A.2)
         k = k or self.config.retrieval.top_k
         q_vec = embed_texts([query], model_name=self._resolved.embedder_id)
         scores, idxs = self._index.search(q_vec, k)
+        # FAISS pads short result lists with -1; skip those slots.
         out: list[RetrievedChunk] = []
         for rank, (i, s) in enumerate(zip(idxs[0].tolist(), scores[0].tolist())):
             if i < 0:
@@ -127,5 +139,5 @@ class FlatDenseSystem(BaseSystem):
             out.append(RetrievedChunk(chunk=self.chunks[i], score=float(s), rank=rank))
         return out
 
-    # answer() inherits BaseSystem default (CK-4 shared packer +
-    # uniform [N] {text} prompt + n_input_tokens instrumentation).
+    # answer() is inherited from BaseSystem: the shared packer and the
+    # [N] text prompt.

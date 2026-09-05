@@ -1,141 +1,6 @@
-"""Paper-faithful RAPTOR substrate (M4 only). Sarthi et al., ICLR 2024, arXiv:2401.18059.
-
-This module is a deliberate SIBLING of `src/raptor.py`, not a
-replacement for it. `src/raptor.py` is consumed by the FROZEN M7 and
-must stay byte-untouched; every paper-fidelity behaviour M4 needs lives
-here instead. The duplication (serialisation helpers, a second node/tree
-model) is the price of making M7's freeze safe BY CONSTRUCTION rather
-than by argument.
-
-Scope of this file, in landing order:
-  * commit 1 (this one) — `split_text_raptor`, the reference chunker.
-  * commit 2 — UMAP+GMM soft clustering, the bottom-up tree builder,
-    the collapsed index over every layer, serialisation.
-Nothing here is wired into a system yet; `M4Config` still resolves to
-the shared harness chunker at this commit, so NO cache key moves.
-
-# === FIDELITY NOTES — chunking ===
-#
-# PAPER (§3): "Construction of the RAPTOR tree begins with segmenting
-# the retrieval corpus into short, contiguous texts of length 100" and
-# "If a sentence exceeds the 100-token limit, we move the entire
-# sentence to the next chunk, rather than cutting it mid-sentence."
-# The paper never names a tokenizer and never states an overlap value;
-# "contiguous" is the only basis for inferring zero overlap.
-#
-# REFERENCE CODE (raptor/utils.py, split_text) supplies what the paper
-# omits, and this module follows it on every point EXCEPT one:
-#   - tokenizer: tiktoken cl100k_base                      -> FOLLOWED
-#   - overlap: the `overlap` parameter defaults to 0 and
-#     tree_builder.py never passes it                      -> FOLLOWED
-#   - sentence boundaries: . ! ? and newline               -> FOLLOWED
-#   - over-long sentence: sub-split on , ; : and, if a
-#     sub-phrase is still over budget, emit it oversized
-#     (the 100-token bound is SOFT, not a hard truncation) -> FOLLOWED
-#   - PLACEMENT of those over-long-sentence pieces         -> DIVERGED, see below
-#   - delimiter handling                                   -> DIVERGED, see below
-#
-# DIVERGENCES FROM REFERENCE CODE, ALIGNMENT WITH PAPER TEXT
-# (ruling 1 dated 2026-07-29; ruling 1b added 2026-08-22 by the final
-# fidelity audit, which found the second one. Both depart from the
-# reference implementation in the SAME direction: toward the paper's
-# stated behaviour and away from an artifact of the reference's regex
-# and control flow.):
-#
-#   The reference does `re.split("|".join(map(re.escape, [".", "!",
-#   "?", "\\n"])), text)`. `re.split` on a pattern with NO capturing
-#   group DISCARDS every separator it matches, and the rejoin is
-#   `" ".join(current_chunk)` — nothing restores them. Reference chunk
-#   text is therefore punctuation-free and newline-free prose.
-#
-#   We keep the terminators. Reasoning, recorded so the judgement is
-#   auditable: (a) the paper is silent on punctuation and describes
-#   only "short, contiguous texts", so nothing in the paper asks for
-#   stripping; (b) the reference has no comment, no test and no
-#   downstream consumer that wants stripped text, which reads as an
-#   artifact of the non-capturing alternation rather than a design
-#   decision; (c) this harness once solved the identical problem
-#   correctly elsewhere with a lookbehind (the former semantic chunker's
-#   sentence splitter, at tag thesis-full-2026-09-03), which is what the
-#   reference would have needed; (d) reproducing it
-#   would feed the generator punctuation-free text, which no reading
-#   of the paper supports.
-#
-#   SUB-RULING on newlines (ruled 2026-07-29, alongside the above).
-#   Ruling 1 restores `. ! ? , ; :` but NOT `\\n`. This is an
-#   application of the ruling, not an exception to it: the ruling
-#   concerns TERMINATORS destroyed by a regex artifact, and a newline is
-#   not a terminator — it is layout. Three reasons it must collapse to a
-#   single space rather than be preserved literally:
-#     (a) the paper is silent on newlines and describes only "short,
-#         contiguous texts", so nothing asks for them;
-#     (b) the reference collapses them anyway at READ time — `get_text`
-#         does `' '.join(node.text.splitlines())` before any node text
-#         reaches an embedder or a prompt — so preserving them would
-#         diverge from reference BEHAVIOUR while claiming to follow
-#         reference code;
-#     (c) preserving them would therefore diverge from BOTH the code and
-#         the paper text, which is the one outcome no reading supports.
-#   So: `. ! ? , ; :` are CONTENT and are restored and attached; `\\n`
-#   runs are consumed as pure boundaries.
-#
-#   CONSEQUENCE, accepted, no action. Token accounting shifts. The
-#   reference counts tokens on STRIPPED sentences; we count on
-#   punctuated ones, so each sentence costs ~1 more token and our
-#   100-token chunks hold roughly 1-3% less prose than the reference's
-#   would. This is a direct and unavoidable consequence of ruling 1 and
-#   is recorded rather than corrected.
-#
-#   RULING 1b — OVER-LONG-SENTENCE PLACEMENT (added 2026-08-22, found by
-#   the final fidelity audit; see docs/FINAL_FIDELITY_AUDIT.md AF-2).
-#
-#   The reference SUB-SPLITS an over-long sentence the way we do, but it
-#   PLACES the resulting pieces differently, and the difference is
-#   structural rather than cosmetic. `split_text` appends them straight
-#   to `chunks` from inside the `token_count > max_tokens` branch, while
-#   `current_chunk` — holding the sentences that PRECEDE the long one —
-#   keeps accumulating and is flushed later. Two consequences follow,
-#   both verified against a verbatim transcription of the reference:
-#     (a) the long sentence's pieces are emitted BEFORE the chunk holding
-#         the text that came before them, so the chunk list is NOT in
-#         document order;
-#     (b) the sentences flanking the long one are packed TOGETHER, across
-#         it, as though the long sentence were not between them.
-#   Ours routes every piece through one packer in document order, so a
-#   sub-phrase may share a chunk with an ordinary neighbouring sentence
-#   and the output stays ordered.
-#
-#   WE FOLLOW THE PAPER. It describes "short, contiguous texts" and says
-#   only that an over-long sentence moves to the next chunk; nothing in
-#   it asks for reordering, and reordered chunks are contiguous in
-#   neither sense. As with ruling 1, the reference behaviour reads as an
-#   artifact of its control flow — an append inside a branch — rather
-#   than a design decision: there is no comment, no test and no consumer
-#   that wants document-order-scrambled chunks.
-#
-#   INCIDENCE, measured on the real corpora (2026-08-22, through the
-#   pipeline's own layout and chunker) — this fires only where a single
-#   sentence exceeds the 100-token budget:
-#     MultiHop-RAG           45 of 70,455 sentences  (0.064%)
-#     HotpotQA-distractor   137 of 46,855 sentences  (0.292%, 107/1000 units)
-#     HotpotQA-pooled       137 of 46,720 sentences  (0.293%)
-#     NarrativeQA             2 of 386,791 sentences (0.0005%) — measured on
-#                           the run host 2026-08-23; 0/40 units degenerate.
-#                           The narrative-prose regime barely produces a
-#                           100-token sentence, so the divergence is close
-#                           to unreachable there.
-#   Uniform across all four M4 cells, and M4 is the only system using this
-#   chunker, so no cross-system asymmetry arises.
-#
-# CACHE DISCIPLINE. The 100-token size is carried on the EXISTING
-# `ChunkingConfig.chunk_words` field (read as TOKENS under
-# strategy="raptor_100tok"), never on a new field. `compute_cache_key`
-# folds `json.dumps(asdict(chunking_config), sort_keys=True)`, so
-# adding any field to ChunkingConfig would move the substrate key of
-# EVERY system — M2, M3, M9 and the frozen M7 included. The dataclass
-# schema must stay byte-identical; tests/test_raptor_chunking.py pins
-# it.
-"""
+"""RAPTOR substrate for M4 (Sarthi et al., ICLR 2024, arXiv 2401.18059):
+reference chunker, bottom-up UMAP+GMM tree, collapsed index, serialisation
+and the substrate cache-key extras."""
 
 from __future__ import annotations
 
@@ -152,73 +17,50 @@ from typing import Any, Callable
 import numpy as np
 
 
-# Reference: `tokenizer=tiktoken.get_encoding("cl100k_base")` as the
-# default argument of both `split_text` and `RAPTOR_Clustering.
-# perform_clustering`. Pinned by NAME (not by model id) so it cannot
-# drift with a generator swap the way `encoding_for_model` would.
+# ref: raptor/utils.py::split_text @ 7da1d48a (tiktoken cl100k_base)
 REFERENCE_ENCODING = "cl100k_base"
 
-# Bumped when the produced chunk text changes for identical input.
-# Folded into M4's cache-key extras from commit 3 onward; inert here.
+# Names the chunker's output; part of M4's cache-key extras.
 RAPTOR_CHUNKER_VERSION = "raptor_split_text_v1"
 
-# Reference sentence delimiters: [".", "!", "?", "\n"]. Split into two
-# classes because they are treated differently — see the DIVERGENCE
-# note above. Runs are matched greedily so "..." / "?!" / "\n\n" each
-# count as ONE boundary rather than producing empty segments.
+# Sentence boundaries. A run of . ! ? stays on the sentence it closes; a
+# run of newlines is a boundary only. Each run counts as one boundary.
+# deviation from ref (ref's re.split drops . ! ? \n): see METHODS §A.4.4 ruling 1
 _TERMINATOR_RUN = r"[.!?]+"
 _NEWLINE_RUN = r"\n+"
 _BOUNDARY_RE = re.compile(f"({_TERMINATOR_RUN})|({_NEWLINE_RUN})")
 
-# Reference over-long-sentence fallback: `re.split(r"[,;:]", sentence)`.
-# Same keep-the-delimiter treatment as the terminators above.
+# Sub-split of a sentence that alone exceeds the chunk size, delimiters
+# kept on the piece they close.
+# ref: raptor/utils.py::split_text @ 7da1d48a
 _SUBPHRASE_RE = re.compile(r"([,;:]+)")
 
 
 @functools.lru_cache(maxsize=2)
 def _encoding(name: str = REFERENCE_ENCODING) -> Any:
+    """Cached tiktoken encoding by name."""
     import tiktoken
 
     return tiktoken.get_encoding(name)
 
 
 def count_tokens_plain(text: str, *, encoding_name: str = REFERENCE_ENCODING) -> int:
-    """Bare cl100k_base token count, no leading space.
-
-    This is the convention the reference uses everywhere OUTSIDE the
-    chunker: `len(tokenizer.encode(node.text))` for the 3500-token
-    cluster cap and for the retrieval token budget. The chunker's
-    leading-space convention (`count_tokens_reference`) is a separate
-    quirk of `split_text` and must not be mixed with this one.
-    """
+    """Bare token count, as the ref counts cluster text and the budget."""
     return len(_encoding(encoding_name).encode(text))
 
 
 def count_tokens_reference(text: str, *, encoding_name: str = REFERENCE_ENCODING) -> int:
-    """Token count under the reference's convention.
-
-    The reference measures every sentence as `len(tokenizer.encode(" " +
-    sentence))` — the leading space stands in for the space the rejoin
-    will insert. Preserved verbatim so our packing decisions land on the
-    same boundaries the reference's would, modulo the punctuation
-    divergence documented in the module docstring.
-    """
+    """Token count with a leading space, the ref chunker's convention."""
     return len(_encoding(encoding_name).encode(" " + text))
 
 
 @dataclass(frozen=True)
 class TextSpan:
-    """One chunk, with its provenance span in the ORIGINAL document text.
+    """One chunk plus the region of the original text it came from."""
 
-    `text` is NOT `original[start_char:end_char]` — inter-sentence
-    whitespace and newlines are normalised to single spaces during the
-    rejoin. The span is a PROVENANCE range, used by M4's per-parent
-    `index_items` override (commit 4) to map a chunk back to the
-    CorpusItems it overlaps and derive `gold_provenance` by offset
-    intersection. Treat it as "this chunk came from this region", never
-    as a slice.
-    """
-
+    # `text` is not `original[start_char:end_char]`: whitespace between
+    # sentences is collapsed on rejoin. The span maps a chunk back to the
+    # source items it overlaps; never use it as a slice.
     text: str
     start_char: int
     end_char: int
@@ -226,15 +68,7 @@ class TextSpan:
 
 
 def _iter_sentences(text: str) -> list[tuple[str, int, int]]:
-    """Split into (sentence, start_char, end_char), terminators attached.
-
-    Boundary semantics, per the module docstring:
-      * a run of `. ! ?` ENDS the current sentence and is KEPT on it;
-      * a run of `\\n` ends the current sentence and is DROPPED;
-      * the trailing remainder after the last boundary is a sentence.
-    Segments that are empty after stripping are discarded (they arise
-    from consecutive boundaries such as ".\\n" or "!?").
-    """
+    """Split text into (sentence, start, end) with terminators attached."""
     out: list[tuple[str, int, int]] = []
     cursor = 0
 
@@ -243,17 +77,17 @@ def _iter_sentences(text: str) -> list[tuple[str, int, int]]:
         stripped = raw.strip()
         if not stripped:
             return
-        # Re-anchor the span onto the stripped content so offsets never
-        # point at leading/trailing whitespace.
+        # Anchor the span on the stripped content so offsets skip
+        # surrounding whitespace.
         lead = len(raw) - len(raw.lstrip())
         out.append((stripped, lo + lead, lo + lead + len(stripped)))
 
+    # A terminator run stays on its sentence; a newline run is dropped;
+    # the remainder after the last boundary is the final sentence.
     for m in _BOUNDARY_RE.finditer(text):
         if m.group(1) is not None:
-            # Terminator run: keep it with the sentence it closes.
             _emit(cursor, m.end())
         else:
-            # Newline run: boundary only, not content.
             _emit(cursor, m.start())
         cursor = m.end()
 
@@ -267,15 +101,10 @@ def _split_long_sentence(
     max_tokens: int,
     encoding_name: str,
 ) -> list[tuple[str, int, int]]:
-    """Reference fallback for a sentence that alone exceeds max_tokens.
-
-    Reference: `sub_sentences = re.split(r"[,;:]", sentence)`, keeping
-    non-empty stripped pieces. We keep the delimiters attached for the
-    same reason we keep terminators. A sub-phrase that is STILL over
-    budget is returned as-is — the reference emits it oversized and so
-    do we, which is why the 100-token bound is soft rather than a hard
-    truncation.
-    """
+    """Sub-split an over-long sentence on , ; : keeping the delimiters."""
+    # ref: raptor/utils.py::split_text @ 7da1d48a
+    # A piece that is still over budget is returned as-is, so the chunk
+    # size is a soft bound.
     pieces: list[tuple[str, int, int]] = []
     cursor = 0
     parts: list[tuple[int, int]] = []
@@ -284,6 +113,7 @@ def _split_long_sentence(
         cursor = m.end()
     parts.append((cursor, len(sentence)))
 
+    # Keep non-empty pieces with spans anchored on their stripped text.
     for lo, hi in parts:
         raw = sentence[lo:hi]
         stripped = raw.strip()
@@ -298,31 +128,22 @@ def _split_long_sentence(
     return pieces
 
 
+# RAPTOR paper §3: "short, contiguous texts of length 100"
+# ref: raptor/utils.py::split_text @ 7da1d48a (overlap never passed, 0)
 def split_text_raptor(
     text: str,
     *,
     max_tokens: int = 100,
     encoding_name: str = REFERENCE_ENCODING,
 ) -> list[TextSpan]:
-    """Port of the reference `utils.split_text`, 100 tokens, no overlap.
-
-    Sentence-preserving: a sentence that would push the current chunk
-    past `max_tokens` starts the next chunk instead of being cut, which
-    is the paper's stated rule. A single sentence longer than
-    `max_tokens` is sub-split on `, ; :`; a sub-phrase still over budget
-    is emitted alone and oversized (soft bound, reference behaviour).
-
-    Returns provenance-carrying spans, oldest-first. Empty / whitespace
-    input returns [].
-    """
+    """Port of the reference split_text: 100-token chunks, no overlap."""
     if max_tokens <= 0:
         raise ValueError("max_tokens must be positive")
     if not text or not text.strip():
         return []
 
-    # Flatten to (piece, start, end, n_tokens), splitting over-long
-    # sentences first so the packer below only ever sees pieces it can
-    # reason about.
+    # Flatten to (piece, start, end, n_tokens). A sentence over the limit
+    # is sub-split first; a piece still over it stays oversized.
     pieces: list[tuple[str, int, int, int]] = []
     for sentence, lo, hi in _iter_sentences(text):
         n_tok = count_tokens_reference(sentence, encoding_name=encoding_name)
@@ -360,9 +181,12 @@ def split_text_raptor(
         cur_hi = 0
         cur_tokens = 0
 
+    # Pack pieces in document order. A piece that would overflow starts
+    # the next chunk, and nothing carries over between chunks.
+    # RAPTOR paper §3: "we move the entire sentence to the next chunk"
+    # ref: raptor/utils.py::split_text @ 7da1d48a (overlap never passed, 0)
+    # deviation from ref (ref emits pieces out of order): see METHODS §A.4.4 ruling 1b
     for piece, lo, hi, n_tok in pieces:
-        # NO OVERLAP: the flushed chunk is not carried into the next one
-        # (reference `overlap=0`, never overridden by tree_builder.py).
         if cur_texts and cur_tokens + n_tok > max_tokens:
             _flush()
         if not cur_texts:
@@ -376,179 +200,65 @@ def split_text_raptor(
 
 
 # =========================================================================
-# Bottom-up tree: UMAP (global + local) -> BIC-selected GMM soft clustering
-# -> per-cluster summary -> re-embed -> repeat.
-#
-# PAPER (§3, and the Abstract's "from the bottom up"): "Once clustered, a
-# Language Model is used to summarize the grouped texts. These summarized
-# texts are then re-embedded, and the cycle of embedding, clustering, and
-# summarization continues until further clustering becomes infeasible,
-# resulting in a structured, multi-layered tree representation."
-#
-# This is NOT what src/raptor.py does. That module partitions ONE
-# all-chunk root top-down with recursive MiniBatchKMeans, which produces a
-# strict single-parent tree of bounded branching. The paper's algorithm
-# agglomerates upward and its soft clustering lets a node belong to
-# several parents, so the result is a DAG. That difference is why this
-# module carries its own node model instead of extending RaptorNode
-# (whose single `parent_id` cannot express it) — and why src/raptor.py,
-# which the frozen M7 consumes, is never opened.
-#
-# Every constant below is the reference implementation's default. The
-# paper states none of them; see the module docstring's UNVERIFIED
-# framing — they are attributable to the code, not the paper.
-#
-# DOCUMENTED MICRO-DIVERGENCES from the reference, all ruled 2026-07-29:
-#
-#  (i) UMAP is SEEDED. The reference passes no `random_state`, so its
-#      trees differ run to run. We seed, because a cache key that does
-#      not determine the artifact it names is not a cache key — the same
-#      infrastructure-contract reasoning that keeps summarisation at
-#      temperature 0. Cost: seeding forces UMAP to n_jobs=1, i.e.
-#      single-threaded, which is the dominant wall-clock term in tree
-#      construction. Accepted.
-#
-# (ii) RE-CLUSTER RECURSION IS DEPTH-GUARDED. The reference's
-#      `perform_clustering` recurses whenever a cluster's combined text
-#      exceeds `max_length_in_cluster`, with no base case beyond
-#      `len(nodes) == 1`; a cluster that keeps re-forming identically
-#      recurses forever. A build that cannot terminate cannot produce an
-#      artifact, so the guard is admissible on impossibility grounds. It
-#      accepts the oversized cluster instead of recursing further and
-#      increments `stats["recluster_guard_trips"]` — a non-zero count is
-#      a FINDING about the clustering, to be reported, not silenced.
-#
-#(iii) The reference's recursive call drops `reduction_dimension` and
-#      `threshold`, silently reverting them to 10 and 0.1 even when the
-#      caller overrode them. We thread the params through instead. At our
-#      configuration the two are identical (our defaults ARE 10 and 0.1),
-#      so this is observable only under a non-default override we do not
-#      use. Recorded for completeness.
-#
-# (iv) Two degenerate cases that CRASH or silently drop nodes in the
-#      reference are guarded, both impossibility-class: an empty BIC
-#      search range (`np.arange(1, 1)` -> argmin on empty), and a label
-#      set where no node cleared the GMM threshold (-> zero clusters, so
-#      every node at that layer vanishes from the tree). Both guards are
-#      counted in `stats`.
-#
-#  (v) GMM FITS THAT RAISE ARE SKIPPED, not fatal. MEASURED at production
-#      params, and the reason this guard exists at all: a layer of 16 or
-#      of 25 nodes killed the build with "ill-defined empirical
-#      covariance", while 20, 30 and 40 survived. The sweep tries k up to
-#      n-1, and UMAP reducing few points into 10 components leaves tight
-#      local clumps that a high-k component collapses onto. NOT monotone
-#      in n and data-dependent, so passing at one corpus size proves
-#      nothing about another — which is why this shipped before any tree
-#      build rather than after one died. The reference crashes here and
-#      loses the entire tree, so this is impossibility class.
-#      `bic_fit_failures` counts skipped k in the sweep;
-#      `gmm_final_fit_failures` counts downward steps in the final fit.
-#      Non-zero is a FINDING to report, not noise: it means the BIC
-#      search was run over a reduced candidate set.
-#
-# (vi) DUPLICATE-EMBEDDING MEMBERSHIP. Added 2026-08-22 by the final
-#      fidelity audit (docs/FINAL_FIDELITY_AUDIT.md AF-3). The reference
-#      recovers local-cluster membership by VALUE matching --
-#      `np.where((embeddings == local_cluster_embeddings_[:, None]).all(-1))`
-#      -- so two nodes whose texts are BYTE-IDENTICAL have identical
-#      embeddings and each receives the UNION of the other's cluster
-#      labels. Ours tracks membership by INDEX, so duplicates keep their
-#      own labels. Observable only where a unit holds byte-identical
-#      chunk texts; measured incidence 2026-08-22: MultiHop 73/16,523
-#      chunks (0.44%), HotpotQA-distractor 21/17,443 (0.12%), pooled
-#      21/17,396 (0.12%), NarrativeQA 0 (run host, 2026-08-23). The reference's form is also O(n^2) in the layer
-#      size. Recorded as a divergence rather than adopted: label-union for
-#      coincidentally identical text is an artifact of the lookup
-#      strategy, not a stated behaviour.
-#
-#(vii) SMALL-n ENTRY GUARD in `_two_stage_labels`. Added to this list
-#      2026-08-22 (AF-6); the guard itself predates it. `n <= dim + 1`
-#      returns a single cluster before any UMAP call. The reference's
-#      MODULE-level `perform_clustering` has no such check and would
-#      raise inside UMAP for tiny n; it is unreachable at the reference's
-#      own defaults only because the builder's stop condition fires
-#      first. Impossibility class, same as (iv) and (v). Reachable here
-#      only via recursion on a tiny oversized cluster.
-#
-# The reference's SEED INCONSISTENCY is reproduced exactly, not fixed:
-# `random_state=224` for the BIC search, `random_state=0` for the final
-# fit. Noted as an observed oddity of the reference; the paper is silent,
-# the code specifies, cost is zero, so the code wins.
+# Bottom-up tree: UMAP (global then local) -> BIC-selected GMM soft
+# clustering -> one summary per cluster -> re-embed -> repeat. Soft
+# membership lets a node join several clusters, so the result is a DAG
+# and a node carries a list of parents.
+# RAPTOR paper §3: "cycle of embedding, clustering, and summarization"
 # =========================================================================
 
 
+# Names the on-disk tree layout; part of M4's cache-key extras.
 PAPER_TREE_SCHEMA_VERSION = "raptor_paper_bottom_up_v1"
 
-# Paper App. I: across its benchmarks, between 18.5% and 57% of the nodes
-# RAPTOR retrieves are non-leaf (summary) nodes. This is the one fidelity
-# gate that is measurable only at QUERY time — the other two (children per
-# parent, mean summary length) are properties of the built tree and live in
-# `tree_stats`. Kept here so all three paper-derived bands sit together and
-# the analyser imports rather than restates them.
+# Share of retrieved nodes that are summaries, measured at query time.
+# RAPTOR paper App. I: 18.5%-57% of retrieved nodes are non-leaf
 PAPER_NON_LEAF_SHARE_BAND = (0.185, 0.57)
 
-# Reference cluster_utils.py module constant: RANDOM_SEED = 224.
+# ref: raptor/cluster_utils.py @ 7da1d48a (RANDOM_SEED = 224)
 REFERENCE_RANDOM_SEED = 224
 
 
 @dataclass(frozen=True)
 class PaperTreeParams:
-    """Reference-implementation defaults for the paper-faithful tree.
+    """Tree-build parameters; asdict() is the "tree" cache-key field."""
 
-    Field-by-field provenance (all from parthsarthi03/raptor@master):
-      reduction_dimension   ClusterTreeConfig(reduction_dimension=10)
-      gmm_threshold         RAPTOR_Clustering.perform_clustering(threshold=0.1)
-                            — the GMM posterior-membership cutoff. NOT the
-                            same quantity as TreeBuilderConfig.threshold=0.5,
-                            which is a retrieval selection threshold in a
-                            different file. Easy to conflate; don't.
-      max_length_in_cluster RAPTOR_Clustering.perform_clustering(3500),
-                            measured in cl100k_base TOKENS summed over the
-                            cluster's node texts.
-      num_layers            TreeBuilderConfig(num_layers=5) — an upper
-                            bound; the realised depth is usually lower.
-      local_n_neighbors     local_cluster_embeddings(num_neighbors=10).
-                            The GLOBAL n_neighbors is not a parameter —
-                            the reference computes int((n-1)**0.5).
-      metric                both UMAP calls use "cosine".
-      bic_max_clusters      get_optimal_clusters(max_clusters=50).
-      bic_random_state      224, the module RANDOM_SEED.
-      gmm_random_state      0, GMM_cluster's own default. The mismatch
-                            with 224 is the reference's, reproduced.
-      umap_random_state     OURS. The reference seeds nothing.
-      max_recluster_depth   OURS. The reference has no bound at all.
-
-    Frozen and asdict-able: this lands in M4's cache-key extras as the
-    "tree" field, replacing RaptorBuildParams. A different schema here is
-    exactly what forks M4's substrate key away from the KMeans-era one.
-    """
-
+    # ref: raptor/cluster_tree_builder.py::ClusterTreeConfig @ 7da1d48a (reduction_dimension=10)
     reduction_dimension: int = 10
+    # GMM posterior cutoff for soft membership, not a retrieval threshold.
+    # ref: raptor/cluster_utils.py::perform_clustering @ 7da1d48a (threshold=0.1)
     gmm_threshold: float = 0.1
+    # cl100k_base tokens summed over a cluster's node texts.
+    # ref: raptor/cluster_utils.py::perform_clustering @ 7da1d48a (max_length_in_cluster=3500)
     max_length_in_cluster: int = 3500
+    # Upper bound; the realised depth is usually lower.
+    # ref: raptor/tree_builder.py::TreeBuilderConfig @ 7da1d48a (num_layers=5)
     num_layers: int = 5
+    # ref: raptor/cluster_utils.py::local_cluster_embeddings @ 7da1d48a (num_neighbors=10)
     local_n_neighbors: int = 10
+    # Both UMAP calls; the global n_neighbors is int(sqrt(n-1)), not a field.
+    # ref: raptor/cluster_utils.py::global_cluster_embeddings @ 7da1d48a
     metric: str = "cosine"
+    # ref: raptor/cluster_utils.py::get_optimal_clusters @ 7da1d48a (max_clusters=50)
     bic_max_clusters: int = 50
+    # ref: raptor/cluster_utils.py @ 7da1d48a (RANDOM_SEED = 224)
     bic_random_state: int = REFERENCE_RANDOM_SEED
+    # ref: raptor/cluster_utils.py::GMM_cluster @ 7da1d48a (random_state=0; the ref uses both seeds)
     gmm_random_state: int = 0
+    # deviation from ref (ref seeds nothing; a cache key must fix its artifact): see METHODS §A.4.4 (i)
     umap_random_state: int = 42
+    # deviation from ref (ref recursion has no base case): see METHODS §A.4.4 (ii)
     max_recluster_depth: int = 8
 
 
 @dataclass
 class PaperNode:
-    """One node of the paper-faithful DAG. Layer 0 nodes are leaf chunks.
+    """One tree node; layer 0 is a leaf chunk and parent_ids may hold many."""
 
-    `parent_ids` is a LIST because the paper's soft clustering puts a node
-    in every cluster whose GMM posterior exceeds the threshold, so a node
-    can be summarised into several parents. `leaf_indices` is the
-    transitive closure down to layer-0 chunk indices, which is what
-    provenance and diagnostics need; it can overlap between siblings, and
-    that is correct rather than a bug.
-    """
-
+    # Soft clustering puts a node in every cluster over the threshold, so
+    # it can be summarised into several parents. `leaf_indices` is the
+    # closure down to layer-0 chunk indices and may overlap between
+    # siblings.
     node_id: str
     layer: int
     text: str
@@ -559,11 +269,14 @@ class PaperNode:
 
     @property
     def is_leaf(self) -> bool:
+        """True for a layer-0 chunk node."""
         return self.layer == 0
 
 
 @dataclass
 class PaperTree:
+    """The built tree: nodes by id, ids per layer, params and build stats."""
+
     nodes: dict[str, PaperNode]
     layer_to_nodes: dict[int, list[str]]
     n_layers: int
@@ -571,65 +284,43 @@ class PaperTree:
     stats: dict = field(default_factory=dict)
 
     def all_node_ids(self) -> list[str]:
-        """Every node, every layer, leaves included — the collapsed set."""
+        """Every node in every layer, leaves first: the collapsed set."""
         out: list[str] = []
         for layer in sorted(self.layer_to_nodes):
             out.extend(self.layer_to_nodes[layer])
         return out
 
     def summary_nodes(self) -> list[PaperNode]:
+        """Every node above layer 0."""
         return [n for n in self.nodes.values() if n.layer > 0]
 
 
-# --- clustering (port of cluster_utils.py) --------------------------------
+# --- clustering (port of raptor/cluster_utils.py) -------------------------
 
 
 class _PhaseClock:
-    """Cumulative wall-time and call counts per build phase.
-
-    PURE INSTRUMENTATION. It records; nothing branches on what it
-    records, so a timed build produces a byte-identical tree to an
-    untimed one. It changes nothing the cache key reads —
-    `paper_substrate_extra` folds PARAMETERS, not code — so this does not
-    invalidate a substrate.
-
-    It exists because a 4,953-leaf story took 20,691 s and the harness
-    could not say WHERE. Summarisation and clustering want opposite
-    fixes: one is a token-cap and batch-width question on the GPU, the
-    other is single-threaded CPU work that no VRAM metric can see.
-    Guessing between them costs a five-hour build per guess.
-    """
+    """Wall time and call counts per build phase; instrumentation only."""
 
     def __init__(self) -> None:
         self.seconds: dict[str, float] = {}
         self.calls: dict[str, int] = {}
-        # One entry per phase currently on the stack, holding the time
-        # its CHILDREN have consumed. See `enter`/`exit_`.
+        # One frame per open phase: [name, seconds its children consumed].
         self._stack: list[list] = []
 
     def reset(self) -> None:
+        """Clear every phase total, call count and open frame."""
         self.seconds.clear()
         self.calls.clear()
         self._stack.clear()
 
     def enter(self, phase: str) -> None:
-        """Open a frame. Its child time accrues here, not to the phase."""
+        """Open a frame; child time accrues here, not to the phase."""
         self._stack.append([phase, 0.0])
 
     def exit_(self, elapsed: float) -> None:
-        """Close the innermost frame, crediting it only its OWN time.
-
-        PHASES MUST PARTITION THE BUILD, NOT OVERLAP IT. `_gmm_cluster`
-        is timed as `gmm_final_fit` and calls `_get_optimal_clusters`,
-        timed as `gmm_bic_sweep`, so a flat accumulator charged the sweep
-        to both and the phases summed to ~19% MORE than the build they
-        described. Wall clock was never wrong; the ATTRIBUTION was, and
-        attribution is what retired UMAP as a suspect and surfaced GMM as
-        the second cost. Decisions are being made on these numbers.
-
-        Subtracting child time makes the invariant structural rather than
-        something a future nesting can quietly break.
-        """
+        """Close the innermost frame and credit it only its own time."""
+        # Phases partition the build: subtract child time so a nested
+        # phase is charged once, then pass the whole span to the parent.
         phase, child_s = self._stack.pop()
         own = elapsed - child_s
         if own < 0:  # clock skew only; never let a phase go negative
@@ -640,17 +331,14 @@ class _PhaseClock:
             self._stack[-1][1] += elapsed
 
     def add(self, phase: str, dt: float) -> None:
-        """Flat accrual, for phases timed without the decorator.
-
-        Still charged to any open parent frame, so an inline `add` inside
-        a decorated function does not re-create the double count.
-        """
+        """Accrue an inline-timed phase; the open parent frame is charged."""
         self.seconds[phase] = self.seconds.get(phase, 0.0) + dt
         self.calls[phase] = self.calls.get(phase, 0) + 1
         if self._stack:
             self._stack[-1][1] += dt
 
     def as_stats(self) -> dict:
+        """Phase seconds, call counts and shares as a stats dict."""
         total = sum(self.seconds.values())
         return {
             "phase_seconds": {k: round(v, 2) for k, v in sorted(
@@ -663,21 +351,17 @@ class _PhaseClock:
         }
 
 
+# One clock per process; build_paper_tree resets it.
 _CLOCK = _PhaseClock()
 
 
 def get_phase_clock() -> _PhaseClock:
-    """The build's phase timings. Read after build_paper_tree returns."""
+    """The build's phase timings; read after build_paper_tree returns."""
     return _CLOCK
 
 
 def _timed(phase: str):
-    """Wrap a phase function so its wall time accrues to `phase`.
-
-    A decorator rather than inline `with` blocks: the timed calls are
-    multi-line constructor expressions, and re-indenting them to insert a
-    context manager would be a behavioural edit dressed as instrumentation.
-    """
+    """Decorator: the wrapped function's wall time accrues to `phase`."""
     import functools
 
     def deco(fn):
@@ -690,9 +374,7 @@ def _timed(phase: str):
             try:
                 return fn(*args, **kwargs)
             finally:
-                # `finally`, so a raising phase still closes its frame —
-                # a dirty stack would mis-attribute every later phase to
-                # whatever was open when the exception passed through.
+                # A raising phase still closes its frame.
                 _CLOCK.exit_(_time.perf_counter() - t0)
 
         return wrapper
@@ -708,6 +390,7 @@ def _umap_reduce(
     metric: str,
     random_state: int,
 ) -> np.ndarray:
+    """Seeded UMAP down to `dim` components."""
     import umap
 
     return umap.UMAP(
@@ -721,7 +404,8 @@ def _umap_reduce(
 def _global_cluster_embeddings(
     embeddings: np.ndarray, dim: int, params: PaperTreeParams
 ) -> np.ndarray:
-    """Reference: n_neighbors defaults to int((len(embeddings) - 1) ** 0.5)."""
+    """Global UMAP; n_neighbors is int(sqrt(n - 1)), floored at 2."""
+    # ref: raptor/cluster_utils.py::global_cluster_embeddings @ 7da1d48a
     n_neighbors = int((len(embeddings) - 1) ** 0.5)
     return _umap_reduce(
         embeddings, dim, max(2, n_neighbors), params.metric, params.umap_random_state
@@ -731,14 +415,10 @@ def _global_cluster_embeddings(
 def _local_cluster_embeddings(
     embeddings: np.ndarray, dim: int, params: PaperTreeParams
 ) -> np.ndarray:
-    """Reference: fixed num_neighbors=10.
-
-    Note the reference clamps `dim` for the GLOBAL call
-    (`min(dim, len(embeddings) - 2)`) but passes the raw `dim` here. We
-    clamp both, because an unclamped local call raises on a small
-    cluster — impossibility-class, and unreachable at the reference's own
-    defaults only because the `len <= dim + 1` escape hatch fires first.
-    """
+    """Local UMAP with num_neighbors=10; dim and neighbours clamped to n."""
+    # ref: raptor/cluster_utils.py::local_cluster_embeddings @ 7da1d48a (num_neighbors=10)
+    # The ref clamps dim only on the global call; an unclamped local call
+    # raises on a small cluster, so both are clamped here.
     return _umap_reduce(
         embeddings,
         min(dim, max(2, len(embeddings) - 2)),
@@ -752,35 +432,20 @@ def _local_cluster_embeddings(
 def _get_optimal_clusters(
     embeddings: np.ndarray, params: PaperTreeParams, stats: dict
 ) -> int:
-    """BIC sweep. Reference: arange(1, min(max_clusters, n)), seed 224.
-
-    `np.arange` excludes its stop, so the reference searches
-    1..min(50, n)-1 and never evaluates n itself. Reproduced verbatim.
-    """
+    """BIC sweep over k in arange(1, min(50, n)); the stop is excluded."""
     from sklearn.mixture import GaussianMixture
 
+    # ref: raptor/cluster_utils.py::get_optimal_clusters @ 7da1d48a (max_clusters=50)
     max_clusters = min(params.bic_max_clusters, len(embeddings))
     candidates = np.arange(1, max_clusters)
     if len(candidates) == 0:
-        # GUARD (iv): the reference would call argmin on an empty list.
-        # Reachable only for n <= 1, which the escape hatches upstream
-        # normally prevent.
+        # Empty range (n <= 1): one cluster, counted.
+        # deviation from ref (ref drops the layer silently): see METHODS §A.4.4 (iv)
         stats["empty_bic_range_trips"] = stats.get("empty_bic_range_trips", 0) + 1
         return 1
-    # GUARD (v): a component that collapses onto a single point has an
-    # ill-defined covariance and `fit` RAISES. Measured, not anticipated:
-    # at production params a layer of 16 or 25 nodes died this way, while
-    # 20/30/40 survived — the sweep runs k up to n-1, and UMAP's
-    # reduction of few points into 10 components leaves tight local
-    # clumps for the high-k fits to collapse onto. The reference has the
-    # same hole and simply crashes, losing the whole build.
-    #
-    # Impossibility class, so a guard is admissible; SKIPPING the failing
-    # k is the most conservative shape available. It leaves every k that
-    # CAN be fitted in contention, so the selected k is exactly the one
-    # the reference would have chosen had it not crashed — unless the
-    # reference's own argmin was a k that cannot be fitted, in which case
-    # there is no faithful answer to reproduce.
+    # A k whose fit raises (a component collapses onto one point) is
+    # skipped and counted, so the argmin runs over every k that fits.
+    # deviation from ref (ref crashes): see METHODS §A.4.4 (v)
     bics: list[float] = []
     fitted: list[int] = []
     for n in candidates:
@@ -795,8 +460,7 @@ def _get_optimal_clusters(
         bics.append(float(gm.bic(embeddings)))
         fitted.append(int(n))
     if not fitted:
-        # Every k failed. One cluster is the only assignment left that is
-        # certainly well-defined.
+        # Every k failed: one cluster is the only well-defined assignment.
         stats["bic_all_fits_failed"] = stats.get("bic_all_fits_failed", 0) + 1
         return 1
     return fitted[int(np.argmin(bics))]
@@ -806,22 +470,13 @@ def _get_optimal_clusters(
 def _gmm_cluster(
     embeddings: np.ndarray, params: PaperTreeParams, stats: dict
 ) -> tuple[list[np.ndarray], int]:
-    """Soft assignment: a node joins EVERY component above the threshold.
-
-    Reference seeds the final fit with random_state=0 while the BIC
-    search above uses 224. The inconsistency is the reference's and is
-    reproduced deliberately (ruling 3).
-
-    GUARD (v), second half. The seed mismatch means the final fit can
-    raise at a k the BIC sweep fitted happily under seed 224 — different
-    initialisation, different collapse. Walking k DOWNWARD keeps as much
-    structure as can actually be fitted, where falling straight to k=1
-    would silently turn a splittable layer into one parent. Terminates:
-    k=1 is a single component over every point and cannot be a singleton
-    collapse.
-    """
+    """Final GMM fit; a node joins every component above the threshold."""
     from sklearn.mixture import GaussianMixture
 
+    # Walk k down from the BIC choice until a fit succeeds, so the layer
+    # keeps as much structure as can be fitted. k=1 always fits.
+    # ref: raptor/cluster_utils.py::GMM_cluster @ 7da1d48a (random_state=0; the ref uses both seeds)
+    # deviation from ref (ref crashes): see METHODS §A.4.4 (v)
     n_clusters = _get_optimal_clusters(embeddings, params, stats)
     for k in range(n_clusters, 0, -1):
         gm = GaussianMixture(
@@ -838,8 +493,7 @@ def _gmm_cluster(
         labels = [np.where(p > params.gmm_threshold)[0] for p in probs]
         return labels, k
 
-    # Unreachable in practice (k=1 always fits); the explicit fallback
-    # exists so a future sklearn cannot turn this into an UnboundLocal.
+    # Unreachable while k=1 fits; keeps the return well-defined.
     stats["gmm_all_fits_failed"] = stats.get("gmm_all_fits_failed", 0) + 1
     return [np.array([0]) for _ in range(len(embeddings))], 1
 
@@ -847,18 +501,18 @@ def _gmm_cluster(
 def _two_stage_labels(
     embeddings: np.ndarray, params: PaperTreeParams, stats: dict
 ) -> list[np.ndarray]:
-    """Global-then-local soft clustering, flat global label space.
-
-    Reference `perform_clustering(embeddings, dim, threshold)`: reduce
-    globally, GMM, then for each global cluster reduce locally and GMM
-    again, offsetting local label ids by a running total so the returned
-    label space is flat.
-    """
+    """Global-then-local soft clustering with a flat label space."""
     dim = params.reduction_dimension
     n = len(embeddings)
+    # Too few points to reduce: one cluster, no UMAP call.
+    # deviation from ref (ref raises inside UMAP): see METHODS §A.4.4 (vii)
     if n <= dim + 1:
         return [np.array([0]) for _ in range(n)]
 
+    # Reduce globally and fit a GMM, then reduce and fit again inside
+    # each global cluster; local labels are offset by a running total so
+    # the returned label space is flat.
+    # ref: raptor/cluster_utils.py::perform_clustering @ 7da1d48a
     reduced_global = _global_cluster_embeddings(
         embeddings, min(dim, n - 2), params
     )
@@ -867,12 +521,15 @@ def _two_stage_labels(
     out: list[np.ndarray] = [np.array([], dtype=int) for _ in range(n)]
     total = 0
     for gi in range(n_global):
+        # Members are tracked by index, so identical embeddings keep
+        # their own labels.
+        # deviation from ref (duplicate embeddings share labels in the ref): see METHODS §A.4.4 (vi)
         members = [i for i, lab in enumerate(global_labels) if gi in lab]
         if not members:
             continue
         sub = embeddings[members]
         if len(sub) <= dim + 1:
-            # Reference escape hatch: too small to reduce, one cluster.
+            # Too small to reduce: one local cluster.
             local_labels = [np.array([0]) for _ in members]
             n_local = 1
         else:
@@ -892,13 +549,8 @@ def perform_clustering(
     *,
     _depth: int = 0,
 ) -> list[list[PaperNode]]:
-    """Reference RAPTOR_Clustering.perform_clustering, guarded.
-
-    Returns a list of clusters; a node may appear in several of them
-    (soft membership). A cluster whose combined text exceeds
-    `max_length_in_cluster` tokens is recursively re-clustered, bounded
-    by `max_recluster_depth` — see micro-divergence (ii).
-    """
+    """Soft clusters; a cluster over the token cap is re-clustered."""
+    # ref: raptor/cluster_utils.py::perform_clustering @ 7da1d48a
     stats = stats if stats is not None else {}
     if len(nodes) <= 1:
         return [list(nodes)]
@@ -908,13 +560,15 @@ def perform_clustering(
     ])
     labels = _two_stage_labels(embeddings, params, stats)
 
+    # Nothing cleared the threshold: keep the layer as one cluster.
+    # deviation from ref (ref drops the layer silently): see METHODS §A.4.4 (iv)
     non_empty = [lab for lab in labels if len(lab) > 0]
     if not non_empty:
-        # GUARD (iv): nothing cleared the threshold. The reference would
-        # produce zero clusters and drop every node at this layer.
         stats["empty_label_trips"] = stats.get("empty_label_trips", 0) + 1
         return [list(nodes)]
 
+    # One cluster per label. A cluster within the token cap is kept; an
+    # oversized one is re-clustered unless that cannot make progress.
     clusters: list[list[PaperNode]] = []
     for label in sorted({int(x) for lab in non_empty for x in lab.tolist()}):
         members = [nodes[i] for i, lab in enumerate(labels) if label in lab]
@@ -930,25 +584,22 @@ def perform_clustering(
             clusters.append(members)
             continue
         if len(members) == len(nodes):
-            # NO-PROGRESS STOP. The "cluster" is the entire input, which
-            # happens whenever BIC selects k=1 (low-structure data, or a
-            # layer whose members are near-uniform). Re-clustering an
-            # identical set yields an identical result, so the reference
-            # recurses forever here — this is the concrete shape of the
-            # unbounded recursion, and catching it directly costs one
-            # step instead of unwinding max_recluster_depth levels of
-            # wasted UMAP+GMM. Counted separately from the depth guard
-            # because it means something different: not "too deep" but
-            # "clustering cannot split this at all".
+            # The cluster is the whole input (BIC chose k=1), so another
+            # round cannot split it; accept it and count the stop.
+            # deviation from ref (ref recursion has no base case): see METHODS §A.4.4 (ii)
             stats["no_progress_trips"] = stats.get("no_progress_trips", 0) + 1
             clusters.append(members)
             continue
         if _depth >= params.max_recluster_depth:
+            # Depth bound: accept the oversized cluster and count the trip.
+            # deviation from ref (ref recursion has no base case): see METHODS §A.4.4 (ii)
             stats["recluster_guard_trips"] = (
                 stats.get("recluster_guard_trips", 0) + 1
             )
             clusters.append(members)
             continue
+        # Recurse with the same params.
+        # deviation from ref (ref reverts them to defaults): see METHODS §A.4.4 (iii)
         stats["recluster_calls"] = stats.get("recluster_calls", 0) + 1
         clusters.extend(
             perform_clustering(members, params, stats, _depth=_depth + 1)
@@ -956,17 +607,12 @@ def perform_clustering(
     return clusters
 
 
-# --- summarisation input format (port of utils.get_text) ------------------
+# --- summarisation input format (port of raptor/utils.py::get_text) -------
 
 
 def get_text(nodes: list[PaperNode]) -> str:
-    """Reference utils.get_text: collapse newlines per node, join on blank lines.
-
-    This is the exact string the reference hands the summariser, so it is
-    reproduced verbatim including the trailing "\\n\\n". Note it collapses
-    internal newlines — the same treatment this module's chunker already
-    applies at split time.
-    """
+    """Summariser input; the ref's get_text, trailing blank line included."""
+    # ref: raptor/utils.py::get_text @ 7da1d48a
     out = ""
     for n in nodes:
         out += f"{' '.join(n.text.splitlines())}"
@@ -974,30 +620,22 @@ def get_text(nodes: list[PaperNode]) -> str:
     return out
 
 
-# --- summarisation prompt (paper Appendix D) ------------------------------
-#
-# The paper and the reference code DISAGREE on the system prompt, and the
-# paper wins because it is explicit:
-#   paper App. D : "You are a Summarizing Text Portal"
-#   code         : "You are a helpful assistant."
-# The user prompt is identical in both, trailing colon included.
-#
-# This is M4-LOCAL. Its version id lives on M4Config.summary_prompt_version,
-# never on summarization.SUMMARY_PROMPT_VERSION — that constant is a module
-# global the FROZEN M7 also reads, and bumping it would move M7's substrate
-# key.
-#
-# Deliberately NOT reusing summarization.SUMMARY_PROMPT_TEMPLATE, whose
-# wording ("in the same language they are written in", "3-5 sentences",
-# "Do not invent") is ours, not the paper's.
+# --- summarisation prompt -------------------------------------------------
 
+# The ref's system prompt is "You are a helpful assistant."; the paper's
+# wins. The user prompt is the same in both, trailing colon included.
+# RAPTOR paper App. D Table 11 (paper over repo): see METHODS §A.4.3
 PAPER_SUMMARY_SYSTEM_PROMPT = "You are a Summarizing Text Portal"
+# RAPTOR paper App. D Table 11
 PAPER_SUMMARY_USER_TEMPLATE = (
     "Write a summary of the following, including as many key details as "
     "possible: {context}:"
 )
 
 
+# ref: raptor/tree_builder.py::TreeBuilderConfig @ 7da1d48a (summarization_length=100); the paper's 131 is a measured mean (App. C)
+# deviation from ref (ref leaves it unset; a cached summary must be reproducible): see METHODS §A.4.2
+# harness choice: batch shape is in the cache key because it can move text at temperature 0
 def summarize_paper_style_batch(
     contexts: list[str],
     *,
@@ -1008,59 +646,14 @@ def summarize_paper_style_batch(
     max_padded_tokens: int | None = 16000,
     progress_every: int = 1,
 ) -> list[str]:
-    """A whole layer's cluster summaries in one batched call. M4's path.
-
-    WHY A LAYER IS THE BATCH. Bottom-up construction produces an entire
-    layer's clusters before any of them is summarised, so the layer is a
-    natural batch with no reordering, no queueing and no partial results
-    to reconcile. Passing the WHOLE layer (rather than pre-slicing it)
-    is deliberate: `generate_batch` length-sorts internally, and sorting
-    across the full layer removes far more padding waste than sorting
-    within arbitrary pre-cut groups.
-
-    WHY NOT THREADS, which this replaces. `M4Config.summary_max_workers`
-    dispatched `summarize_fn` through a ThreadPoolExecutor, which was
-    right against an API and is wrong against a local model on three
-    counts: threads contend on the GIL, they serialise onto one CUDA
-    stream anyway, and each concurrent `model.generate` allocates its own
-    KV cache. The decisive one is subtler — `models.load_generator` is
-    `lru_cache`d, so every thread shares ONE tokenizer object, and
-    `generate_batch` MUTATES it (forces `padding_side="left"`, restores
-    in a `finally`). Concurrent callers can therefore observe a
-    right-padded tokenizer mid-call, which does not raise; it produces
-    fluent text continued from PAD. Silent corruption, not a crash.
-
-    WHY SUMMARIES BATCH WELL WHEN 4k ANSWERS DO NOT. A batch runs until
-    its LONGEST member stops, so one non-terminating generation makes
-    every member pay the cap. At answer time that cap is
-    GEN_MAX_NEW_TOKENS=512 and the tail dominates. Here `max_tokens` is
-    the reference's summarization_length=100, so the worst case is 100
-    decode steps for the batch — the uncapped-tail failure cannot occur.
-    This is the one place batching is unambiguously correct.
-
-    BATCH SHAPE IS PART OF THE ARTIFACT'S IDENTITY. Batch composition can
-    change generated text at temperature 0 (padding plus batched-matmul
-    reduction order flipping argmax on near-ties), and unlike answers,
-    summaries are CACHED — they are the artifact a substrate key names.
-    So `batch_size` and `max_padded_tokens` are both folded into
-    `paper_substrate_extra` rather than assumed inert. Naming them beats
-    pretending invariance; the cost is that changing either invalidates
-    every tree built at the old value.
-
-    `max_padded_tokens` is needed rather than optional: cluster contexts
-    run from ~110 tokens up to `PaperTreeParams.max_length_in_cluster`
-    (3500), so a fixed count sized for the short case OOMs on a layer of
-    long ones — the same raggedness argument that produced
-    `models.token_budget_batches`.
-
-    The GenerationConfig names the SAME model as the answer path:
-    `load_generator` is keyed on the model name, so a different spelling
-    would load a second ~15 GB copy of the same weights instead of
-    reusing the resident one.
-    """
+    """Summarise a whole layer's clusters in one batched call."""
     from .config import GenerationConfig
     from .models import generate_batch
 
+    # The layer is the batch: generate_batch length-sorts across it, and
+    # the padded-token cap bounds a batch of long cluster contexts. The
+    # config names the same model id as the reader, so the resident copy
+    # is reused.
     if not contexts:
         return []
     return generate_batch(
@@ -1076,6 +669,8 @@ def summarize_paper_style_batch(
     )
 
 
+# ref: raptor/tree_builder.py::TreeBuilderConfig @ 7da1d48a (summarization_length=100); the paper's 131 is a measured mean (App. C)
+# deviation from ref (ref leaves it unset; a cached summary must be reproducible): see METHODS §A.4.2
 def summarize_paper_style(
     context: str,
     *,
@@ -1083,26 +678,9 @@ def summarize_paper_style(
     max_tokens: int = 100,
     temperature: float = 0.0,
 ) -> str:
-    """One summary call, model-agnostic. Retained for single-call use.
-
-    M4's index path uses `summarize_paper_style_batch`; this stays as the
-    reference-faithful one-context form (and the place the prompt and
-    temperature reasoning below is recorded).
-
-    Routes through `models.generate`, which dispatches on the model id
-    (OpenAI prefixes to the API, anything else to a local causal LM), so
-    the same code path serves an API summariser and a local one. Late
-    import keeps raptor_paper free of src imports at module load — the
-    property that lets config.py import PaperTreeParams from here without
-    a cycle.
-
-    temperature defaults to 0.0, NOT the reference's unset (=1.0). That
-    is a deliberate deviation on infrastructure grounds: a non-zero
-    temperature makes the tree a random function of its inputs, and a
-    cache key that does not determine the artifact it names is not a
-    cache key. Consequence, recorded: the reference implementation's own
-    trees are not reproducible run to run.
-    """
+    """One summary through models.generate; the single-context form."""
+    # Late imports keep this module free of src imports at load time, so
+    # config can import PaperTreeParams without a cycle.
     from .config import GenerationConfig
     from .models import generate
 
@@ -1118,6 +696,7 @@ def summarize_paper_style(
 # --- bottom-up construction (port of cluster_tree_builder.construct_tree) -
 
 
+# Seams: clustering, batched summarisation and embedding are injected.
 ClusterFn = Callable[[list[PaperNode], PaperTreeParams, dict], list[list[PaperNode]]]
 SummarizeBatchFn = Callable[[list[str]], list[str]]
 EmbedFn = Callable[[list[str]], np.ndarray]
@@ -1126,16 +705,7 @@ EmbedFn = Callable[[list[str]], np.ndarray]
 def _cluster_sort_key(
     cluster: list[PaperNode], position: dict[str, int]
 ) -> tuple:
-    """Deterministic cluster ordering, so node ids never depend on timing.
-
-    The reference assigns node indices inside a Lock-guarded dict while
-    summarising on a ThreadPoolExecutor, which makes its ids a function
-    of completion order. Ours are a function of member position in the
-    input layer, so no concurrency or batching decision can perturb the
-    tree's SHAPE or its node IDS — the cache-identity contract again (see
-    micro-divergence (i)). Summary TEXT is a separate matter: batch
-    composition can move it, which is why batch shape is in the key.
-    """
+    """Order clusters by member position, so ids do not depend on timing."""
     positions = sorted(position[n.node_id] for n in cluster)
     return (positions[0], len(positions), tuple(positions))
 
@@ -1151,31 +721,8 @@ def build_paper_tree(
     on_summary: Callable[[PaperNode], None] | None = None,
     verbose: bool = False,
 ) -> PaperTree:
-    """Build the paper's bottom-up tree.
-
-    Layer 0 is the leaf chunks. Each iteration soft-clusters the current
-    layer, summarises every cluster over `get_text(cluster)`, embeds the
-    new summaries, and repeats. Stops at `params.num_layers` iterations
-    or, per the reference, as soon as a layer holds no more than
-    `reduction_dimension + 1` nodes.
-
-    `summarize_batch_fn` takes a WHOLE LAYER's concatenated context
-    strings and returns summaries POSITIONALLY ALIGNED to them. Each
-    context is what the reference passes as `summarize(context=...)`; the
-    batching is ours, and it is the layer-granularity form because a
-    layer is produced all at once (see `summarize_paper_style_batch` for
-    why this replaced a ThreadPoolExecutor, and why the batch shape is
-    part of the substrate cache key).
-
-    `cluster_fn` is a test seam: it defaults to `perform_clustering` and
-    exists so the deterministic bookkeeping (ids, multi-parent links,
-    leaf-index closure) can be tested without paying for UMAP fits.
-
-    Node ids and tree shape are computed before any summary call is
-    dispatched, so they are invariant under every batching decision.
-    Summary TEXT is not promised to be, which is exactly why batch size
-    and the padded-token budget are named in the key.
-    """
+    """Build the tree bottom-up: cluster, summarise, embed, next layer."""
+    # Refuse mismatched or empty input.
     if chunk_embeddings.ndim != 2:
         raise ValueError("chunk_embeddings must be 2D (n_chunks, dim)")
     if len(chunk_texts) != chunk_embeddings.shape[0]:
@@ -1186,6 +733,8 @@ def build_paper_tree(
     if not chunk_texts:
         raise ValueError("chunk_texts must be non-empty")
 
+    # Fresh clock and generate-call counters for this build. `cluster_fn`
+    # is a test seam that defaults to perform_clustering.
     cluster = cluster_fn if cluster_fn is not None else perform_clustering
     _CLOCK.reset()
     try:
@@ -1196,6 +745,7 @@ def build_paper_tree(
         pass
     stats: dict = {"n_summary_calls": 0}
 
+    # Layer 0: one node per chunk.
     nodes: dict[str, PaperNode] = {}
     layer_to_nodes: dict[int, list[str]] = {0: []}
     for i, text in enumerate(chunk_texts):
@@ -1213,9 +763,9 @@ def build_paper_tree(
     realised_layers = 1
 
     for layer in range(params.num_layers):
+        # Stop when the layer is too small to cluster.
+        # ref: raptor/cluster_tree_builder.py @ 7da1d48a (len(layer) <= reduction_dimension + 1)
         if len(current) <= params.reduction_dimension + 1:
-            # Reference stop condition: `len(node_list_current_layer) <=
-            # self.reduction_dimension + 1`.
             if verbose:
                 print(
                     f"[raptor_paper] stop at layer {layer}: "
@@ -1223,6 +773,8 @@ def build_paper_tree(
                 )
             break
 
+        # Cluster the layer and pin the cluster order before any summary
+        # call, so node ids and tree shape do not depend on batching.
         layer_nodes = [nodes[nid] for nid in current]
         position = {nid: i for i, nid in enumerate(current)}
         clusters = cluster(layer_nodes, params, stats)
@@ -1231,14 +783,14 @@ def build_paper_tree(
             break
         clusters.sort(key=lambda c: _cluster_sort_key(c, position))
 
+        # One batched summary call per layer. Alignment is positional, so
+        # a length mismatch is refused rather than attached to the wrong
+        # cluster.
         contexts = [get_text(c) for c in clusters]
         _t0 = _time_mod.perf_counter()
         summaries = list(summarize_batch_fn(contexts))
         _CLOCK.add("summarize", _time_mod.perf_counter() - _t0)
         if len(summaries) != len(contexts):
-            # Alignment is POSITIONAL, so a length mismatch does not
-            # raise on its own — it silently attaches each summary to the
-            # wrong cluster and produces a plausible, wrong tree. Refuse.
             raise RuntimeError(
                 f"summarize_batch_fn returned {len(summaries)} summaries for "
                 f"{len(contexts)} clusters at layer {layer + 1}"
@@ -1246,6 +798,8 @@ def build_paper_tree(
         stats["n_summary_calls"] += len(summaries)
         stats["n_summary_layers"] = stats.get("n_summary_layers", 0) + 1
 
+        # One parent node per cluster: each member gains a parent id and
+        # the parent's leaf set is the union of its members' sets.
         next_layer = layer + 1
         new_ids: list[str] = []
         for rank, (members, summary) in enumerate(zip(clusters, summaries)):
@@ -1267,9 +821,8 @@ def build_paper_tree(
             if on_summary is not None:
                 on_summary(node)
 
-        # Batch-embed the new layer's summaries in one pass. Empty
-        # summaries get no embedding and are excluded from the collapsed
-        # index, mirroring src/raptor.py's handling.
+        # Embed the new summaries in one pass. An empty summary gets no
+        # embedding and stays out of the collapsed index.
         texts = [nodes[nid].text for nid in new_ids]
         keep = [bool(t and t.strip()) for t in texts]
         to_embed = [t for t, k in zip(texts, keep) if k]
@@ -1283,13 +836,10 @@ def build_paper_tree(
                     next(it).astype(np.float32, copy=False) if k else None
                 )
 
+        # A node without an embedding stays in the tree for provenance
+        # but cannot be clustered further.
         layer_to_nodes[next_layer] = new_ids
         realised_layers = next_layer + 1
-        # A node whose summariser returned empty text has no embedding and
-        # cannot be clustered further (np.asarray(None) would raise). It
-        # stays in the tree for provenance but drops out of the next
-        # round, and out of the collapsed index. The reference does not
-        # check this because it never inspects the summariser's output.
         current = [nid for nid in new_ids if nodes[nid].embedding is not None]
         if not current:
             break
@@ -1308,31 +858,19 @@ def build_paper_tree(
     )
     tree.stats.update(tree_stats(tree))
 
-    # DEGENERATE BUILD — no summary layer was ever produced, so this is
-    # not a RAPTOR tree, it is a flat list of chunks. The stop condition
-    # (`len(current) <= reduction_dimension + 1`) fires on the FIRST
-    # iteration for any corpus of <= 11 leaves, and the reference exits
-    # just as quietly.
-    #
-    # This must be loud. A silently flat M4 still retrieves, still
-    # answers, and still produces a plausible row in a results table --
-    # it just is not the system the row claims. It is a structural
-    # property of small corpora (HotpotQA's standard distractor setting
-    # gives ~10 paragraphs per question, i.e. ~8-12 leaves) rather than a
-    # bug, which is exactly why nothing else would ever flag it.
+    # Copy the generate-call summary whole, then the phase timings.
     try:
         from .models import generate_calls_summary
 
-        # WHOLESALE, not a hand-picked list. This block used to name four
-        # keys of GENERATE_CALLS one at a time, which is the same
-        # enumeration bug that dropped phase_seconds and generate_calls
-        # from the probe row and cost two cold builds. The per-call
-        # breakdown added for the 230 s/call investigation arrives here
-        # because the summary is copied whole.
         tree.stats["generate_calls"] = generate_calls_summary()
     except Exception:
         tree.stats["generate_calls"] = None
     tree.stats.update(_CLOCK.as_stats())
+
+    # No summary layer means a flat list of chunks, not a tree. The stop
+    # condition fires on the first iteration for any corpus of at most
+    # reduction_dimension + 1 leaves, and a flat M4 still retrieves and
+    # still scores, so say so loudly.
     tree.stats["degenerate_no_tree"] = not tree.summary_nodes()
     if tree.stats["degenerate_no_tree"]:
         print(
@@ -1349,19 +887,11 @@ def build_paper_tree(
 
 
 def tree_stats(tree: PaperTree) -> dict:
-    """Diagnostics, including the three paper-comparable fidelity gates.
-
-    Paper targets (App. C Table 10 / App. I), to be checked on the FIRST
-    real tree before any further benchmark is built:
-      * children per parent  5.7 - 6.8
-      * mean summary length  ~131 tokens  — but see ruling 4: the
-        reference caps completions at summarization_length=100, so a
-        faithful build should land NEAR 100 with visible truncation. A
-        mean at ~100 rather than ~131 is itself the finding, namely that
-        the paper's reported figure cannot have come from this config.
-      * non-leaf share of RETRIEVED nodes 18.5% - 57% — query-time, so
-        it is measured by the analyser, not here.
-    """
+    """Tree diagnostics, including the paper-comparable fidelity gates."""
+    # Children per parent and mean summary tokens are tree properties;
+    # the non-leaf share of retrieved nodes is measured at query time.
+    # RAPTOR paper App. C: 131 tokens is the measured mean summary length
+    # RAPTOR paper App. I: 18.5%-57% of retrieved nodes are non-leaf
     summaries = tree.summary_nodes()
     n_children = [len(n.children) for n in summaries]
     summary_tokens = [
@@ -1393,21 +923,13 @@ def tree_stats(tree: PaperTree) -> dict:
     }
 
 
-# --- collapsed index (paper: the ENTIRE tree in one layer) ----------------
+# --- collapsed index (the whole tree in one layer) ------------------------
 
 
+# RAPTOR paper §3: collapsed tree, the paper's main-results strategy
 @dataclass
 class PaperCollapsedIndex:
-    """FAISS index over EVERY node of the tree, leaves and summaries alike.
-
-    Paper §3 Querying: "First, collapse the entire RAPTOR tree into a
-    single layer... calculate the cosine similarity between the query
-    embedding and the embeddings of all nodes present in the collapsed
-    set." There is no root exclusion — src/raptor.py's
-    `include_root_in_flat_index=False` has no counterpart here, because
-    the paper's top layer is whatever the clustering produced rather than
-    a synthetic all-corpus root.
-    """
+    """FAISS index over every node of the tree, leaves and summaries alike."""
 
     faiss_index: Any
     refs: list[dict]  # {"node_id": str, "layer": int, "is_leaf": bool}
@@ -1415,8 +937,10 @@ class PaperCollapsedIndex:
 
 
 def build_collapsed_index(tree: PaperTree) -> PaperCollapsedIndex:
+    """Exact inner-product index over every embedded node, in layer order."""
     import faiss
 
+    # Every embedded node, leaves first; no layer is excluded.
     rows: list[np.ndarray] = []
     refs: list[dict] = []
     for nid in tree.all_node_ids():
@@ -1440,12 +964,11 @@ def build_collapsed_index(tree: PaperTree) -> PaperCollapsedIndex:
 
 
 # --- serialisation (JSON topology + .npy embeddings + FAISS binary) -------
-# Same contract as src/raptor.py: no pickle, because these artifacts get
-# re-inspected months later during thesis writing and JSON survives
-# Python upgrades that pickle does not.
+# No pickle: JSON and .npy survive Python upgrades.
 
 
 def save_paper_tree(tree: PaperTree, tree_json_path: Path, emb_path: Path) -> None:
+    """Write the topology as JSON and the embeddings as one .npy matrix."""
     tree_json_path.parent.mkdir(parents=True, exist_ok=True)
     ordered = tree.all_node_ids()
     obj = {
@@ -1471,6 +994,7 @@ def save_paper_tree(tree: PaperTree, tree_json_path: Path, emb_path: Path) -> No
     }
     tree_json_path.write_text(json.dumps(obj, indent=2, ensure_ascii=False))
 
+    # Embeddings in node order, skipping nodes that have none.
     embs = [
         tree.nodes[nid].embedding
         for nid in ordered
@@ -1485,6 +1009,7 @@ def save_paper_tree(tree: PaperTree, tree_json_path: Path, emb_path: Path) -> No
 
 
 def load_paper_tree(tree_json_path: Path, emb_path: Path) -> PaperTree:
+    """Read a tree back; refuses a schema string other than the current one."""
     obj = json.loads(tree_json_path.read_text())
     schema = obj.get("schema")
     if schema != PAPER_TREE_SCHEMA_VERSION:
@@ -1497,6 +1022,8 @@ def load_paper_tree(tree_json_path: Path, emb_path: Path) -> PaperTree:
     embs = np.load(emb_path) if Path(emb_path).exists() else None
     emb_iter = iter(embs) if embs is not None and len(embs) > 0 else None
 
+    # Rebuild nodes in file order; embeddings are consumed in the order
+    # save_paper_tree writes them.
     nodes: dict[str, PaperNode] = {}
     for d in obj["nodes"]:
         node = PaperNode(
@@ -1525,6 +1052,7 @@ def load_paper_tree(tree_json_path: Path, emb_path: Path) -> PaperTree:
 def save_collapsed_index(
     idx: PaperCollapsedIndex, faiss_path: Path, meta_path: Path
 ) -> None:
+    """Write the FAISS index and its node refs beside it as JSON."""
     import faiss
 
     faiss_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1537,6 +1065,7 @@ def save_collapsed_index(
 def load_collapsed_index(
     faiss_path: Path, meta_path: Path
 ) -> PaperCollapsedIndex:
+    """Read a collapsed index and its node refs back."""
     import faiss
 
     meta = json.loads(meta_path.read_text())
@@ -1547,48 +1076,19 @@ def load_collapsed_index(
     )
 
 
-# --- cache identity (Lever B, strict reading) -----------------------------
+# --- cache identity -------------------------------------------------------
 
 
 def _topology_env_id() -> str:
-    """Resolved versions of the libraries that DETERMINE tree topology.
-
-    UMAP + GMM output is version-sensitive even when seeded, which is why
-    P9 pins the stack at all. A tree built under an unpinned environment
-    is therefore not reproducible under the pinned one, and serving it
-    from cache would put M4 cells on artifacts the reproducibility
-    control declares unreproducible.
-
-    Folding this into the substrate key is the deliberate lever that
-    makes those old trees unreachable: the key changes with the stack, so
-    a cold build is forced rather than requested.
-
-    ONLY the three libraries that actually move topology are named.
-    Keying on the whole lockfile would rebuild every tree when an
-    unrelated test-only dependency moved, which is invalidation without
-    a reason. A missing package resolves to "absent" rather than raising:
-    this runs at import time on hosts that never build a tree.
-
-    THE INTERPRETER IS NAMED TOO, added 2026-08-19 after it drifted
-    unguarded. Cells 1-5 built under CPython 3.12.13 and cell 6 under
-    3.13.15 with every package version identical, so the lockfile hash
-    was unchanged, the pin reported OK, and both trees shared a cache
-    key. **Identical package versions are not identical package code**:
-    cp312 and cp313 ship different compiled wheels for numpy, numba and
-    llvmlite, and UMAP's JIT paths are where a last-digit float move can
-    flip a GMM argmax on a near-tie.
-
-    Only MAJOR.MINOR is keyed. A patch bump (3.12.13 -> 3.12.14) does
-    not change the ABI or the wheel tag, so keying the patch would force
-    cold rebuilds for a change that cannot move topology — invalidation
-    without a reason, the same argument that keeps this to three
-    packages. The full version including the patch is still CHECKED by
-    `pin_environment` and recorded per cell; it is the KEY that is
-    coarser, deliberately.
-    """
+    """python MAJOR.MINOR plus umap-learn, scikit-learn and numpy versions."""
     import sys
     from importlib.metadata import PackageNotFoundError, version
 
+    # UMAP and GMM output is version-sensitive even when seeded, so the
+    # substrate key names the stack that determines topology. Only these
+    # three packages and python MAJOR.MINOR are keyed: a patch bump does
+    # not change a wheel tag, and an unrelated package cannot move a
+    # tree. A missing package reads "absent" so import never raises.
     parts = [f"python={sys.version_info.major}.{sys.version_info.minor}"]
     for pkg in ("umap-learn", "scikit-learn", "numpy"):
         try:
@@ -1598,8 +1098,7 @@ def _topology_env_id() -> str:
     return ";".join(parts)
 
 
-# Resolved once at import. Recorded in every M4 manifest and run summary
-# so a cell says which stack built its tree.
+# Resolved once at import; recorded in every M4 manifest and run summary.
 PAPER_TREE_BUILD_ENV = _topology_env_id()
 
 
@@ -1618,38 +1117,11 @@ def paper_substrate_extra(
     include_root: bool = True,
     build_env: str | None = None,
 ) -> dict:
-    """M4's substrate-key extras. Deliberately NOT a call into src/raptor.py.
-
-    The approved lever was "an optional kwarg on raptor_substrate_extra,
-    written into the dict only when passed", which is provably safe for
-    the frozen M7 — but it requires editing a file M7 imports. This
-    function is the stricter reading of the same intent: it emits the
-    SAME seven base fields that `raptor.raptor_substrate_extra` emits,
-    plus the M4-only keys, so `src/raptor.py` is never opened at all and
-    M7's key cannot move by construction rather than by argument.
-
-    The M4-only keys exist because of the original landmine: the shared
-    extras fold tree PARAMETERS but never the clustering ALGORITHM, so
-    swapping KMeans for UMAP+GMM would have changed the artifacts without
-    changing the key and every warm cache would have silently served the
-    old tree. `clustering.algo` and `tree_schema` are what make the swap
-    visible to the key.
-
-    `include_root` defaults True: the paper collapses the ENTIRE tree,
-    and there is no synthetic all-corpus root to exclude. The field is
-    kept only so the base schema stays recognisable next to M7's.
-
-    `summary_batch_size` / `summary_max_padded_tokens` name the SHAPE of
-    the batched summariser call. They are here because batch composition
-    can change generated text at temperature 0, and summaries — unlike
-    answers — are cached, so they ARE the artifact this key names.
-    Naming the shape beats assuming invariance; the accepted cost is that
-    retuning either knob (after an OOM, say) invalidates every tree built
-    at the old value. Both are M4-local: they live on M4Config, which
-    nothing on M7's key derivation reads.
-    """
+    """M4's substrate cache-key extras."""
     return {
-        # --- the seven base fields, same names as raptor_substrate_extra ---
+        # Base fields shared with the other substrate keys. M4 collapses
+        # the whole tree, so include_root is True; sparse, fusion and
+        # rrf_k only keep the base schema.
         "tree": asdict(params),
         "summary_model": summary_model,
         "summary_prompt_version": summary_prompt_version,
@@ -1657,16 +1129,18 @@ def paper_substrate_extra(
         "sparse": sparse,
         "fusion": fusion,
         "rrf_k": int(rrf_k),
-        # --- M4-only: what the shared extras could not express ---
+        # M4-only fields: the clustering algorithm, the tree schema, the
+        # chunker, and the summariser's cap and batch shape.
+        # ref: raptor/tree_builder.py::TreeBuilderConfig @ 7da1d48a (summarization_length=100); the paper's 131 is a measured mean (App. C)
+        # harness choice: batch shape is in the cache key because it can move text at temperature 0
         "clustering": {"algo": "umap_gmm_bic"},
         "tree_schema": PAPER_TREE_SCHEMA_VERSION,
         "chunker_impl": chunker_version,
         "summary_max_tokens": int(summary_max_tokens),
         "summary_batch_size": int(summary_batch_size),
         "summary_max_padded_tokens": int(summary_max_padded_tokens),
-        # THE COLD-TREE LEVER. See _topology_env_id: keys the substrate on
-        # the stack that determines UMAP+GMM topology, so a tree built
-        # under a different stack cannot satisfy this key.
+        # The topology stack; a tree built under another stack cannot
+        # satisfy this key.
         "build_env": PAPER_TREE_BUILD_ENV if build_env is None else build_env,
     }
 
