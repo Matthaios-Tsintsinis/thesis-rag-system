@@ -263,8 +263,8 @@ def _verify_present_sidecar(stem: str, generator: str, benchmark_name: str,
                   "it was written; delete both files by hand and re-run")
         how = f"rows_sha256 {embedded[:16]}... verified"
     else:
-        how = ("no rows_sha256 field (written before the reduction); "
-               "identity and row count verified")
+        how = ("no embedded rows_sha256 field; identity and row count "
+               "verified")
     print(f"[replay] {generator.split('/')[-1]} {benchmark_name} "
           f"{system_id}: sidecar present, DONE -- {n} rows, {how}; the "
           f"replay never repeats a cell (delete {side_rows.name} and "

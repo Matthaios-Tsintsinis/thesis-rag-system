@@ -78,10 +78,9 @@ def _is_openai_model(model_name: str) -> bool:
 
 
 _API_PATH_REMOVED = (
-    "generator {model!r} names an OpenAI API model, and the API answer "
-    "path was removed in the repo reduction: every matrix cell runs a "
-    "LOCAL HuggingFace model (tag thesis-full-2026-09-03 keeps the old "
-    "path)."
+    "generator {model!r} names an OpenAI API model, but this harness runs "
+    "local HuggingFace models only. Pass a local model id such as "
+    "Qwen/Qwen2.5-7B-Instruct (--generator, or config.GENERATOR_MODEL)."
 )
 
 
@@ -99,8 +98,9 @@ def assert_loaded_generator_matches(
     if loaded_name and loaded_name != requested_name:
         raise RuntimeError(
             f"generator mismatch: requested {requested_name!r} but loaded "
-            f"{loaded_name!r}. Refusing to run — this is the b6e35c6 "
-            "failure mode (reporting one model while running another)."
+            f"{loaded_name!r}. Refusing to run: the summary would name one "
+            "model while another answered. Check the generator id and the "
+            "checkpoint it resolves to in the HF cache, then reload."
         )
     if is_quantized:
         raise RuntimeError(

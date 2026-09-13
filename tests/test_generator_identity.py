@@ -35,7 +35,10 @@ class TestGeneratorGuard(unittest.TestCase):
             assert_loaded_generator_matches(
                 **{**OK, "loaded_name": "Qwen/Qwen2.5-3B-Instruct"}
             )
-        self.assertIn("b6e35c6", str(cm.exception))
+        msg = str(cm.exception)
+        self.assertIn("generator mismatch", msg)
+        self.assertIn("Qwen/Qwen2.5-7B-Instruct", msg)
+        self.assertIn("Qwen/Qwen2.5-3B-Instruct", msg)
 
     def test_silent_quantization_aborts(self):
         """A 4-bit load under an fp16 request aborts."""
