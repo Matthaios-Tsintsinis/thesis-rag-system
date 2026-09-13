@@ -25,7 +25,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # Embedder for M2 and M3; M4 overrides it in M4Config.embedder.
 # harness choice: per-paper-components rule (METHODS §A.2)
 EMBEDDER_MODEL = "BAAI/bge-m3"
-# Output width of bge-m3.
+# Output width of bge-m3; M4's mpnet is 768-d and set in M4Config.
+# harness choice: follows EMBEDDER_MODEL
 EMBEDDING_DIM = 1024
 # Reader that answers every query for every system. Any id that is not an
 # OpenAI name loads locally through HF transformers in src.models.
@@ -57,11 +58,15 @@ RRF_K = 60
 # harness choice: no shared evidence budget (METHODS §D)
 EVIDENCE_TOKEN_BUDGET: int | None = None
 # Tiktoken table that counts evidence tokens. Not a generator: the name
-# only selects the byte-pair encoding, and every cell counts with it.
+# only selects the byte-pair encoding (encoding_for_model resolves it to
+# o200k_base), and every cell counts with it. M4's chunker and budget
+# fill count with cl100k_base instead (raptor_paper.REFERENCE_ENCODING).
+# harness choice: one model-named tiktoken table for every cell
 EVIDENCE_TOKEN_BUDGET_TOKENIZER = "gpt-4o-mini"
 
 # Candidate pool M4 pulls in budget mode, where the stopping point is not
 # known in advance. The head of the ranking is unchanged.
+# harness choice: 50 holds a 2,000-token fill of ~110-token nodes (~18)
 RETRIEVAL_RANKING_DEPTH = 50
 
 # Depth of the ranking every retriever returns for metrics only. The
@@ -107,6 +112,7 @@ GEN_TOP_P = 1.0
 # that does not fit raises at load instead of running partly offloaded.
 # 20GiB of the L4's 22.03GiB admits the ~14.2GB fp16 weights with
 # headroom for the KV cache and activations.
+# harness choice: sized to the L4, the matrix's GPU class
 GENERATOR_MAX_MEMORY = {0: "20GiB", "cpu": "0GiB"}
 
 
