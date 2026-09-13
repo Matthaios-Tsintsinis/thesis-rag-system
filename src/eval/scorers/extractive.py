@@ -1,6 +1,6 @@
 """Token-F1 and the answer normaliser every answer scorer shares.
 
-Runs the official HotpotQA normaliser with an NFKC fold in front of it.
+Runs the official HotpotQA normaliser after NFKC; drops non-ASCII punctuation.
 """
 
 from __future__ import annotations
@@ -35,7 +35,8 @@ def normalize_qasper_answer(s: str) -> str:
     """Normalise an answer: NFKC, then the official HotpotQA composition."""
     if s is None:
         return ""
-    # NFKC and the punctuation fold run first; the official chain follows.
+    # NFKC runs first; the official chain follows, with the non-ASCII
+    # punctuation fold between the ASCII table and article removal.
     # official: hotpot_evaluate_v1.py::normalize_answer @ 36358534
     # harness extension (inert on ASCII): see METHODS §C.11
     s = unicodedata.normalize("NFKC", s)
@@ -51,7 +52,7 @@ def token_f1(predicted: str, gold: str) -> float:
     """Token-F1 between a prediction and one gold answer, both normalised."""
     pred_tokens = normalize_qasper_answer(predicted).split()
     gold_tokens = normalize_qasper_answer(gold).split()
-    # Both empty scores 1, one empty scores 0.
+    # Both empty scores 1; that is the unreachable case. One empty scores 0.
     # SQuAD 2.0 evaluate-v2.0.py rule; unreachable, loaders refuse empty gold
     if not pred_tokens or not gold_tokens:
         return float(pred_tokens == gold_tokens)
@@ -68,7 +69,7 @@ def token_f1(predicted: str, gold: str) -> float:
 
 def extractive_max_f1(predicted: str, gold_spans: tuple[str, ...]) -> float:
     """Max token-F1 over alternative gold references."""
-    # NarrativeQA paper: max over the two references
+    # harness choice: max over references where a benchmark ships several (METHODS §C.1)
     # An empty reference tuple scores 0; the loaders never produce one.
     if not gold_spans:
         return 0.0

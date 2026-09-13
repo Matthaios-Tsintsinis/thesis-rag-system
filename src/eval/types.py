@@ -63,7 +63,7 @@ class EvalQuery:
     # retrieval scores take the max over them. question_type is the
     # benchmark's own label (MultiHop: comparison, inference, temporal,
     # null) and is used only for slicing.
-    # NarrativeQA paper: two references per question, max over references
+    # dataset: NarrativeQA ships two references per question; scores take the max (METHODS §C.1)
     query_id: str
     question_text: str
     parent_scope: str | None
@@ -154,7 +154,6 @@ class EvalUnit:
 
     # MultiHop is a single unit over the shared corpus; NarrativeQA yields
     # one unit per story, HotpotQA one per question or per pooled shard.
-    # dataset: yixuantt/MultiHopRAG (609 articles, 2,556 queries, 301 null)
     corpus_id: str
     corpus: tuple[CorpusItem, ...]
     queries: tuple[EvalQuery, ...]

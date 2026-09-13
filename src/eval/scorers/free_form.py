@@ -12,7 +12,7 @@ _NORMALISE_RE = re.compile(r"\s+")
 
 
 def _normalise(text: str) -> str:
-    """Lowercase, drop the trailing dot, collapse spaces, keep punctuation."""
+    """Lowercase, drop trailing dots, collapse whitespace, keep punctuation."""
     if not text:
         return ""
     s = text.lower().strip().rstrip(".")
@@ -28,7 +28,9 @@ def _word_boundary_match(haystack: str, needle: str) -> bool:
     return re.search(pattern, haystack) is not None
 
 
-# official: qa_evaluate.py::has_intersection @ cde8e844 (recorded, not scored)
+# Not the official rule, which credits one shared lowercased token; this
+# needs one whole normalised string inside the other, at word boundaries.
+# harness choice: recorded beside token-F1, never scored
 def substring_match(predicted: str, gold: str) -> float:
     """Return 1.0 if either normalised string contains the other, else 0.0."""
     p = _normalise(predicted)

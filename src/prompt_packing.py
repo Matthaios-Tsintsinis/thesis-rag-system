@@ -30,7 +30,6 @@ def count_tokens(text: str, *, tokenizer_name: str = EVIDENCE_TOKEN_BUDGET_TOKEN
     return len(enc.encode(text))
 
 
-# harness choice: no shared evidence budget (METHODS §D)
 _DEFAULT_FORMAT = "[{rank}] {text}"
 _DEFAULT_SEPARATOR = "\n\n"
 
@@ -59,6 +58,7 @@ def pack_context(
 
     # Append every chunk in rank order; nothing is dropped, the token count
     # is the size of the finished block.
+    # harness choice: no shared evidence budget (METHODS §D)
     for r in retrieved:
         chunk_str = _format_chunk(r, format_per_chunk=format_per_chunk)
         candidate = (cumulative_text + separator + chunk_str) if cumulative_text else chunk_str

@@ -115,7 +115,9 @@ class MultiHopBenchmark:
         items = _corpus_to_items(raw_corpus)
         self.stats["n_corpus_articles"] = len(items)
 
-        # Build one EvalQuery per raw query; a null query has empty gold.
+        # Build one EvalQuery per raw query. A null query has no evidence,
+        # so its retrieval gold is empty; its answer string "Insufficient
+        # information." is kept as free_form.
         queries: list[EvalQuery] = []
         for q_idx, q in enumerate(raw_queries):
             evidence_list = q.get("evidence_list") or []
@@ -182,7 +184,8 @@ class MultiHopBenchmark:
     ) -> RetrievalScore:
         """Score retrieval: set-F1 on the reader context, Hit@K, MAP@K, MRR."""
         # Set-level scores use the reader context; rank-aware scores use the
-        # depth-50 scoring ranking. The single gold annotator is index 0.
+        # depth-50 scoring ranking, or the reader context when the system
+        # supplies none. The single gold annotator is index 0.
         # harness choice: chunker-independent recall (METHODS §C.4)
         # harness choice: one scoring depth for every system (METHODS §D)
         # deviation from official (retrieval_evaluate.py adds newly-matched/rank): see METHODS §C.8
@@ -214,8 +217,9 @@ class MultiHopBenchmark:
         gold = query.gold_answers[0]
         # Abstention is metadata only; no branch below reads it for a value.
         abstained = is_abstention(predicted)
-        # Null query: credit only a pure refusal. The lenient figures are
-        # still recorded so fabricated answers to null queries stay visible.
+        # Null query: credit only a pure refusal. Token-F1 and substring
+        # match against the gold string "Insufficient information." are
+        # recorded beside it; the value never reads them.
         # harness addition (official scorer has no null branch): see METHODS §C.9
         if gold.answer_type == ANSWER_TYPE_UNANSWERABLE:
             value = score_unanswerable(predicted)
@@ -237,7 +241,7 @@ class MultiHopBenchmark:
         # max of the two are recorded beside it. pass1_placeholder marks the
         # column as not the benchmark's own metric.
         # deviation from official (qa_evaluate.py::has_intersection is one shared token): see METHODS §B.1
-        # official: qa_evaluate.py::has_intersection @ cde8e844 (recorded, not scored)
+        # substring_match is containment, not the official one-token overlap.
         tf1 = token_f1(predicted, gold.free_form)
         ssm = substring_match(predicted, gold.free_form)
         return AnswerScore(

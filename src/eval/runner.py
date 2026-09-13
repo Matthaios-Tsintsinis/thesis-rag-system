@@ -35,9 +35,10 @@ BENCHMARK_REGISTRY: dict[str, type] = {
     "multihop_rag": MultiHopBenchmark,
     "narrativeqa": NarrativeQABenchmark,
     # HotpotQA is two benchmarks with different corpora and unit counts:
-    # distractor is the comparable headline, pooled is where a tree exists.
-    # harness choice: our construction, not comparable to published HotpotQA (METHODS §B.4)
+    # distractor is the comparable headline, pooled is where a multi-layer
+    # tree exists.
     "hotpotqa": HotpotQABenchmark,
+    # harness choice: our construction, not comparable to published HotpotQA (METHODS §B.4)
     "hotpotqa_pooled": HotpotQAPooledBenchmark,
 }
 
@@ -276,10 +277,11 @@ def assert_environment_pinned(lockfile: Path) -> None:
     """Abort before any model loads unless the environment matches the lock."""
     from scripts.pin_environment import check_lockfile
 
-    # The M4 substrate key folds umap-learn/scikit-learn/numpy, so an
-    # unpinned session rebuilds trees under a different key and nothing
-    # afterwards can tell them apart. A missing lockfile aborts and a
-    # violated one aborts; no flag bypasses either.
+    # The M4 substrate key folds the topology stack (umap-learn,
+    # scikit-learn, numpy, interpreter major.minor), so an unpinned session
+    # builds a second tree population under its own key and no error
+    # reports it. A missing lockfile aborts and a violated one aborts; no
+    # flag bypasses either.
     if not Path(lockfile).exists():
         raise SystemExit(
             f"PREFLIGHT FAILED: no lockfile at {lockfile}.\n"
@@ -329,8 +331,8 @@ def assert_expected_n_queries_usable(expected: int | None) -> None:
 
 def resolve_chunking_strategy(system) -> str | None:  # noqa: ANN001
     """The chunker the system resolved, else the harness default."""
-    # M4 resolves its own chunker through resolved_components; the other
-    # systems use the harness-wide default.
+    # M2, M3 and M4 expose the chunker they resolved at index time; M1
+    # indexes nothing, so it falls back to the harness config's strategy.
     resolved = getattr(system, "resolved_components", None)
     chunker = getattr(resolved, "chunker_config", None) if resolved else None
     strategy = getattr(chunker, "strategy", None)
@@ -348,8 +350,9 @@ def assert_population_as_declared(
     n_units_processed: int,
 ) -> None:
     """Abort if the processed unit count differs from declared cell_units."""
-    # An undeclared population is skipped with a printed note, not silently.
-    # NarrativeQA declares 40 stories.
+    # Every loader declares cell_units: MultiHop 1, NarrativeQA 40 stories,
+    # HotpotQA 1,000 questions, pooled 10 shards. A loader built without a
+    # sample size declares None and is skipped with a printed note.
     # harness choice: preregistered seeded draw of 40 (METHODS §B.2)
     declared = getattr(benchmark, "cell_units", None)
     if declared is None:
@@ -431,8 +434,8 @@ def main() -> None:
     assert_environment_pinned(args.lockfile)
 
     # Resolve the output path. A relative path lands in the current
-    # directory, which a runtime restart deletes; --resume would then find
-    # nothing there and truncate, so warn loudly.
+    # directory, which a runtime restart deletes; --resume then finds no
+    # banked rows and the cell starts over, so warn.
     stamp = time.strftime("%Y%m%d-%H%M%S")
     if args.output is None:
         out_root = paths.output_dir() / "eval"
@@ -456,8 +459,9 @@ def main() -> None:
     print(
         f"[eval] {args.system} x {args.benchmark} x {args.split} -> {args.output}"
     )
-    # Build the config explicitly: module constants are baked into
-    # dataclass defaults at import, so rebinding them does nothing.
+    # Build the config here and override it through replace(): the
+    # dataclass defaults captured the module constants at import, so
+    # rebinding a constant changes nothing.
     harness_cfg = HarnessConfig()
     if args.generator is not None:
         # --generator sets reader and index summariser together: each
@@ -510,8 +514,8 @@ def main() -> None:
     sum_ans = 0.0
     n_null = 0
     sum_ans_null = 0.0
-    # Time the pass alone; the generator loads inside the first answer and
-    # is part of it.
+    # Time the pass alone; the generator loads on its first call inside it
+    # (an M4 summary or the first answer) and is part of the time.
     t_run = time.perf_counter()
     for scored in runner.run(system, benchmark, split=args.split):
         n_scored += 1
@@ -549,7 +553,6 @@ def main() -> None:
         "n_retrieval_skipped": sum_retr_skipped,
         # mean_retrieval_f1 averages only rows with retrieval gold: MultiHop
         # skips its 301 null queries and NarrativeQA skips every row.
-        # dataset: yixuantt/MultiHopRAG (609 articles, 2,556 queries, 301 null)
         "n_retrieval_scored": n_scored - sum_retr_skipped,
         "mean_retrieval_f1": sum_retr_f1 / n_retr_scored,
         "mean_answer_score": sum_ans / max(1, n_scored),
@@ -566,8 +569,8 @@ def main() -> None:
         "benchmark_stats": getattr(benchmark, "stats", {}),
         # Loader-derived, never a literal.
         "expected_n_queries": _expected_n_queries,
-        # Always False: a run is the full cell. The bank gates refuse a
-        # truthy value.
+        # Always False: a run is the full cell. The exporter and the replay
+        # refuse a truthy value.
         "partial_run": False,
         # Run conditions, so every row is self-describing.
         "generator": system.config.generation.model,

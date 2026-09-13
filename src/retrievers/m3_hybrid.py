@@ -81,7 +81,9 @@ class HybridRRFSystem(BaseSystem):
         from rank_bm25 import BM25Okapi
 
         # M3 has no per-system config; None resolves to the shared defaults.
+        # word window 200 words, overlap 50, docs under 200 chars dropped
         # harness choice: shared default for M2/M3 (METHODS §A.2)
+        # embedder BAAI/bge-m3, normalised, cosine via inner product
         # harness choice: per-paper-components rule (METHODS §A.2)
         self._resolved = resolve_components(None, self.config)
         print(f"[components] {format_components_log(self.system_id, self._resolved)}")
@@ -167,14 +169,14 @@ class HybridRRFSystem(BaseSystem):
         _, dense_idx = self._dense_index.search(q_vec, cfg.first_stage_top_k)
         dense_ranking = [i for i in dense_idx[0].tolist() if i >= 0]
 
-        # Sparse leg: top-50 by BM25 score, then drop chunks that share no
-        # query term (score <= 0) so they earn no sparse credit.
+        # Sparse leg: top-50 by BM25 score, then drop chunks scored <= 0 so
+        # a chunk sharing no query term earns no sparse credit.
         # deviation from RRF (no sparse credit without a shared term): see METHODS §A.3
         bm25_scores = self._bm25.get_scores(_tokenize(query))
         order = bm25_scores.argsort()[::-1][: cfg.first_stage_top_k]
         sparse_ranking = [i for i in order.tolist() if bm25_scores[i] > 0]
 
-        # Fuse both legs with k = 60 from config and keep the top-k.
+        # Fuse both legs with rrf_k = 60 and keep the first k fused chunks.
         fused = rrf_fuse([dense_ranking, sparse_ranking], k=cfg.rrf_k)[:k]
         return [
             RetrievedChunk(chunk=self.chunks[i], score=float(s), rank=rank)

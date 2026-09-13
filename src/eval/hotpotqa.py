@@ -48,7 +48,7 @@ SHARD_QUESTIONS = 100
 # A random draw, not the head of the file: dev rows can be grouped by type
 # and level. Seed and sampler come from src/eval/sampling.py, shared with
 # NarrativeQA. max_questions=None loads the full 7,405-question split.
-# harness choice: preregistered seed (METHODS §B)
+# harness choice: preregistered sample size, drawn under the shared seed (METHODS §B.3)
 PREREGISTERED_Q = 1000
 
 # Rank-aware K grid at title level.
@@ -81,7 +81,8 @@ def hotpot_token_f1_prf(predicted: str, gold: str) -> tuple[float, float, float]
     if np_ != ng_ and (np_ in _HOTPOT_SENTINELS or ng_ in _HOTPOT_SENTINELS):
         return 0.0, 0.0, 0.0
 
-    # Empty side: agree only when both are empty.
+    # Empty side: 1.0 only when both are empty; an empty prediction scores 0
+    # here as in the official, which returns zero on no shared token.
     # SQuAD 2.0 evaluate-v2.0.py rule; unreachable, loaders refuse empty gold
     pred_tokens = np_.split()
     gold_tokens = ng_.split()
@@ -148,8 +149,8 @@ def _query(row: Any, variant: str, parent_scope: str | None) -> EvalQuery:
         gold_answers=(GoldAnswer(
             answer_type=ANSWER_TYPE_FREE_FORM, free_form=answer),),
         gold_passage_sets=(atoms,),
-        # bridge | comparison is the benchmark's own split, the one slice
-        # reported separately.
+        # bridge | comparison is the benchmark's own type label, carried for
+        # slicing.
         question_type=str(row.get("type") or "unknown"),
         metadata={
             "level": str(row.get("level") or "unknown"),
@@ -199,7 +200,8 @@ class HotpotQABenchmark:
             "n_units": 0,
             "n_bridge": 0,
             "n_comparison": 0,
-            # Measured on first load; both feed the tree-size arithmetic.
+            # Measured on first load; descriptive only, they land in the run
+            # summary with the rest of stats.
             "mean_paragraph_tokens": None,
             "n_distinct_titles": 0,
         }
@@ -441,7 +443,9 @@ class HotpotQAPooledBenchmark(HotpotQABenchmark):
                 continue
 
             # Dedup by title across the shard, first occurrence wins: one
-            # paragraph is a distractor for many questions.
+            # paragraph is a distractor for many questions. A sentence is
+            # appended only when its id is not below the count already held
+            # for its title, so a repeat of a paragraph adds nothing new.
             by_title: dict[str, list[CorpusItem]] = {}
             for row in rows:
                 for item in _sentence_items(row["context"]):

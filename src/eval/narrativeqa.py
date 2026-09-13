@@ -29,7 +29,7 @@ from .types import (
 # dataset: deepmind/narrativeqa, validation (115 stories), full-story setting
 HF_REPO = "deepmind/narrativeqa"
 # Parquet auto-conversion branch; the loader falls back to the default
-# revision when the branch is absent.
+# revision when a load from it fails.
 HF_REVISION = "refs/convert/parquet"
 
 VALID_SPLITS = ("train", "validation", "test")
@@ -56,7 +56,7 @@ class NarrativeQABenchmark:
     """NarrativeQA benchmark: per-story EvalUnits and the free-form scorer."""
 
     name = "narrativeqa"
-    # Population one cell resolves to; the runner checks the draw against it.
+    # Population one cell resolves to; the runner aborts on any other count.
     cell_units = CELL_UNITS
 
     def __init__(self) -> None:
@@ -224,7 +224,7 @@ class NarrativeQABenchmark:
             return AnswerScore(value=0.0, method="no_references")
         # Score against each reference and keep the max. The abstention
         # flag is recorded and never touches the value.
-        # NarrativeQA paper: two references per question, max over references
+        # dataset: two references per question; token-F1 takes the max (METHODS §C.1)
         per_ref = tuple(token_f1(predicted, r) for r in refs)
         return AnswerScore(
             value=extractive_max_f1(predicted, refs),

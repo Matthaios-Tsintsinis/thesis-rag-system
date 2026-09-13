@@ -230,7 +230,7 @@ def _em_and_hit5(bank: Path, benchmark: str, system: str,
     # references.
     # official: hotpot_evaluate_v1.py::normalize_answer @ 36358534
     # harness extension (inert on ASCII): see METHODS §C.11
-    # NarrativeQA paper: max over the two references
+    # harness choice: max over references where a benchmark ships several (METHODS §C.2)
     with jpath.open(encoding="utf-8") as f:
         for line in f:
             line = line.strip()

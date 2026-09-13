@@ -33,6 +33,7 @@ _BOUNDARY_RE = re.compile(f"({_TERMINATOR_RUN})|({_NEWLINE_RUN})")
 # Sub-split of a sentence that alone exceeds the chunk size, delimiters
 # kept on the piece they close.
 # ref: raptor/utils.py::split_text @ 7da1d48a
+# deviation from ref (ref's re.split drops , ; :): see METHODS §A.4.4 ruling 1
 _SUBPHRASE_RE = re.compile(r"([,;:]+)")
 
 
@@ -247,7 +248,7 @@ class PaperTreeParams:
     gmm_random_state: int = 0
     # deviation from ref (ref seeds nothing; a cache key must fix its artifact): see METHODS §A.4.4 (i)
     umap_random_state: int = 42
-    # deviation from ref (ref recursion has no base case): see METHODS §A.4.4 (ii)
+    # deviation from ref (ref recursion has no base case beyond one node): see METHODS §A.4.4 (ii)
     max_recluster_depth: int = 8
 
 
@@ -440,7 +441,7 @@ def _get_optimal_clusters(
     candidates = np.arange(1, max_clusters)
     if len(candidates) == 0:
         # Empty range (n <= 1): one cluster, counted.
-        # deviation from ref (ref drops the layer silently): see METHODS §A.4.4 (iv)
+        # deviation from ref (ref raises at argmin on an empty range): see METHODS §A.4.4 (iv)
         stats["empty_bic_range_trips"] = stats.get("empty_bic_range_trips", 0) + 1
         return 1
     # A k whose fit raises (a component collapses onto one point) is
@@ -584,15 +585,16 @@ def perform_clustering(
             clusters.append(members)
             continue
         if len(members) == len(nodes):
-            # The cluster is the whole input (BIC chose k=1), so another
-            # round cannot split it; accept it and count the stop.
-            # deviation from ref (ref recursion has no base case): see METHODS §A.4.4 (ii)
+            # The cluster is the whole input, so another round sees the same
+            # input under the same seeds and returns the same cluster; accept
+            # it and count the stop.
+            # deviation from ref (ref recursion has no base case beyond one node): see METHODS §A.4.4 (ii)
             stats["no_progress_trips"] = stats.get("no_progress_trips", 0) + 1
             clusters.append(members)
             continue
         if _depth >= params.max_recluster_depth:
             # Depth bound: accept the oversized cluster and count the trip.
-            # deviation from ref (ref recursion has no base case): see METHODS §A.4.4 (ii)
+            # deviation from ref (ref recursion has no base case beyond one node): see METHODS §A.4.4 (ii)
             stats["recluster_guard_trips"] = (
                 stats.get("recluster_guard_trips", 0) + 1
             )
@@ -650,10 +652,10 @@ def summarize_paper_style_batch(
     from .config import GenerationConfig
     from .models import generate_batch
 
-    # The layer is the batch: generate_batch length-sorts across it, and
-    # the padded-token cap bounds a batch of long cluster contexts. The
-    # config names the same model id as the reader, so the resident copy
-    # is reused.
+    # One call per layer: generate_batch length-sorts the layer's contexts,
+    # splits them into batches of batch_size under the padded-token cap,
+    # and returns summaries in input order. The config names the same
+    # model id as the reader, so the resident copy is reused.
     if not contexts:
         return []
     return generate_batch(
@@ -705,7 +707,7 @@ EmbedFn = Callable[[list[str]], np.ndarray]
 def _cluster_sort_key(
     cluster: list[PaperNode], position: dict[str, int]
 ) -> tuple:
-    """Order clusters by member position, so ids do not depend on timing."""
+    """Order clusters by member position, so ids depend on membership alone."""
     positions = sorted(position[n.node_id] for n in cluster)
     return (positions[0], len(positions), tuple(positions))
 
@@ -773,8 +775,9 @@ def build_paper_tree(
                 )
             break
 
-        # Cluster the layer and pin the cluster order before any summary
-        # call, so node ids and tree shape do not depend on batching.
+        # Cluster the layer and pin the cluster order by member position
+        # before any summary call, so node ids follow membership, not the
+        # order cluster_fn returns.
         layer_nodes = [nodes[nid] for nid in current]
         position = {nid: i for i, nid in enumerate(current)}
         clusters = cluster(layer_nodes, params, stats)
@@ -891,7 +894,6 @@ def tree_stats(tree: PaperTree) -> dict:
     # Children per parent and mean summary tokens are tree properties;
     # the non-leaf share of retrieved nodes is measured at query time.
     # RAPTOR paper App. C: 131 tokens is the measured mean summary length
-    # RAPTOR paper App. I: 18.5%-57% of retrieved nodes are non-leaf
     summaries = tree.summary_nodes()
     n_children = [len(n.children) for n in summaries]
     summary_tokens = [
@@ -1085,10 +1087,10 @@ def _topology_env_id() -> str:
     from importlib.metadata import PackageNotFoundError, version
 
     # UMAP and GMM output is version-sensitive even when seeded, so the
-    # substrate key names the stack that determines topology. Only these
-    # three packages and python MAJOR.MINOR are keyed: a patch bump does
-    # not change a wheel tag, and an unrelated package cannot move a
-    # tree. A missing package reads "absent" so import never raises.
+    # substrate key names the stack that determines topology: these three
+    # packages at their full version and python at MAJOR.MINOR. An
+    # unrelated package cannot move a tree. A missing package reads
+    # "absent" so import never raises.
     parts = [f"python={sys.version_info.major}.{sys.version_info.minor}"]
     for pkg in ("umap-learn", "scikit-learn", "numpy"):
         try:
@@ -1119,9 +1121,10 @@ def paper_substrate_extra(
 ) -> dict:
     """M4's substrate cache-key extras."""
     return {
-        # Base fields shared with the other substrate keys. M4 collapses
-        # the whole tree, so include_root is True; sparse, fusion and
-        # rrf_k only keep the base schema.
+        # The key's fixed schema: the tree params, the summariser identity,
+        # and three names M3's extra also carries. M4 collapses the whole
+        # tree, so include_root is True; sparse, fusion and rrf_k only fill
+        # the schema.
         "tree": asdict(params),
         "summary_model": summary_model,
         "summary_prompt_version": summary_prompt_version,

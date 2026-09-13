@@ -31,8 +31,10 @@ sorry unfortunately apologies please note also well actually really
 currently given provided based unable able possible
 """.split())
 
-# Negative-existence frames. The object runs to the end of the clause
-# because it names what is absent, so it asserts nothing.
+# Consuming frames: a negative-existence frame ("the context does not
+# mention ...") or a first-person inability ("i cannot determine ...").
+# The object runs to the end of the clause because it names what is
+# absent, so it asserts nothing.
 _SUBJECT = (
     r"(?:the\s+|this\s+|that\s+)?"
     r"(?:evidence|context|passage|document|documents|text|article|excerpt|"
@@ -126,7 +128,7 @@ class AbstentionMatch:
 
 
 def _normalise(text: str) -> str:
-    """Lowercase, collapse whitespace and drop a trailing full stop."""
+    """Lowercase, collapse whitespace and drop trailing full stops."""
     return _WHITESPACE_RE.sub(" ", (text or "").strip().lower().rstrip(".")).strip()
 
 

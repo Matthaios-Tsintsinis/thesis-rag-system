@@ -77,8 +77,9 @@ class RaptorSystem(BaseSystem):
     """RAPTOR: build the summary tree once, retrieve over its collapsed nodes."""
 
     system_id = "M4"
-    # index() writes a substrate expensive enough that a warm hit must be
-    # reported rather than served silently.
+    # Opts M4 into the eval loop's cold-tree preflight, which asks
+    # substrate_warm_path about every unit before indexing and refuses
+    # to run when any is warm.
     has_cacheable_substrate = True
 
     def __init__(self, config: HarnessConfig = DEFAULT_CONFIG) -> None:
@@ -89,7 +90,8 @@ class RaptorSystem(BaseSystem):
         self._flat: PaperCollapsedIndex | None = None
         self._index_stats: dict = {}
         # Set by index(): True when the substrate comes from cache. The
-        # runner's cold-tree preflight refuses a True here.
+        # eval loop's cold-tree gate refuses True after index_items; the
+        # replay requires it.
         self.tree_cache_hit: bool | None = None
         self._last_trace: dict = {}
         self._resolved: ResolvedComponents | None = None
@@ -290,9 +292,9 @@ class RaptorSystem(BaseSystem):
             extra={
                 "m4": asdict(m4),
                 "index_stats": self._index_stats,
-                # Summariser runtime and topology stack, recorded beside
-                # the key: a tree reproduces against a pinned runtime, and
-                # a mismatch must be visible.
+                # Summariser runtime and topology stack, recorded so the
+                # manifest says what built this tree; nothing compares
+                # them at load.
                 "summariser_runtime": self._summariser_runtime(),
                 "build_env": PAPER_TREE_BUILD_ENV,
             },
@@ -345,8 +347,9 @@ class RaptorSystem(BaseSystem):
             "phase_share": self._tree.stats.get("phase_share"),
             "phase_measured_total_s": self._tree.stats.get("phase_measured_total_s"),
             "generate_calls": self._tree.stats.get("generate_calls"),
-            # Tree shape and flat-index composition under the key names
-            # the results pipeline reads.
+            # Tree shape and flat-index composition. prepare() reads the
+            # flat_* counts for the per-row pool figures; the whole block
+            # lands in the manifest.
             "tree_n_nodes": stats["n_nodes"],
             "tree_depth_counts": stats["layer_sizes"],
             "flat_n_chunks": int(type_counts.get("chunk", 0)),
@@ -354,23 +357,28 @@ class RaptorSystem(BaseSystem):
                 sum(v for k, v in type_counts.items() if k != "chunk")
             ),
             "flat_node_type_counts": {k: int(v) for k, v in type_counts.items()},
-            # Fidelity gates: children per parent is pass/fail, mean
-            # summary length is informational.
+            # Fidelity gates, read against the paper by hand, not by code:
+            # children per parent against App. C's 5.7-6.8; mean summary
+            # tokens is informational (the cap is 100).
             # ref: raptor/tree_builder.py::TreeBuilderConfig @ 7da1d48a (summarization_length=100); the paper's 131 is a measured mean (App. C)
             "gate_children_per_parent": stats["mean_children_per_parent"],
             "gate_mean_summary_tokens": stats["mean_summary_tokens"],
             # Non-zero on either counter is a finding to report.
-            # no_progress_trips counts layers BIC left unsplit (k = 1);
-            # recluster_guard_trips counts the depth bound firing.
-            # deviation from ref (ref recursion has no base case): see METHODS §A.4.4 (ii)
+            # no_progress_trips counts an oversized cluster that is the
+            # whole input of a clustering call (k = 1), which no further
+            # round can split; recluster_guard_trips counts the depth
+            # bound firing.
+            # deviation from ref (ref recursion has no base case beyond one node): see METHODS §A.4.4 (ii)
             "recluster_guard_trips": int(
                 self._tree.stats.get("recluster_guard_trips", 0)
             ),
             "no_progress_trips": int(
                 self._tree.stats.get("no_progress_trips", 0)
             ),
-            # Non-zero means the BIC search ran over fewer k than the
-            # reference tries; the tree is still valid. Report it.
+            # bic_fit_failures: a k whose fit raised was skipped, so the
+            # BIC search ran over fewer k than the reference tries.
+            # gmm_final_fit_failures: the final fit walked k down from the
+            # BIC choice. The tree is valid either way. Report both.
             # deviation from ref (ref crashes): see METHODS §A.4.4 (v)
             "bic_fit_failures": int(
                 self._tree.stats.get("bic_fit_failures", 0)
@@ -405,7 +413,7 @@ class RaptorSystem(BaseSystem):
         # harness choice: a summary is abstractive text with no gold span
         return Chunk(
             chunk_id=node.node_id,
-            doc_id="",  # a summary spans many source documents
+            doc_id="",  # a summary has no single source document
             text=node.text,
             n_words=len(node.text.split()),
             position=node.layer,
@@ -486,7 +494,8 @@ class RaptorSystem(BaseSystem):
             if budget is None and len(out) >= k:
                 break
 
-        # Per-query trace; non_leaf_share feeds the App. I gate.
+        # Per-query trace; prepare() puts non_leaf_share on the eval row,
+        # where it is read against the paper's band.
         # RAPTOR paper App. I: non-leaf share of retrieved nodes 18.5-57%
         self._last_trace = {
             "collapsed_top_node_types": dict(type_counter),

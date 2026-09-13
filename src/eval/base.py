@@ -214,7 +214,8 @@ class BenchmarkRunner:
 
                 for q, ar, latency_s in self._answer_unit(system, unit_queries):
 
-                    # Score retrieval: set-F1 over the reader context,
+                    # Score retrieval: set-F1 over the retrieved list, which
+                    # is the reader context because the packer drops nothing;
                     # rank-aware metrics over the scoring ranking; then the
                     # answer.
                     # harness choice: one scoring depth for every system (METHODS §D)

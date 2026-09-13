@@ -478,7 +478,7 @@ class TestRealClustering(unittest.TestCase):
         ]
         # Every cluster overflows a 1-token budget at depth 0, so the
         # depth guard fires instead of recursing forever.
-        # deviation from ref (ref recursion has no base case): see METHODS §A.4.4 (ii)
+        # deviation from ref (ref recursion has no base case beyond one node): see METHODS §A.4.4 (ii)
         params = PaperTreeParams(
             reduction_dimension=3, bic_max_clusters=5,
             max_length_in_cluster=1, max_recluster_depth=0,
