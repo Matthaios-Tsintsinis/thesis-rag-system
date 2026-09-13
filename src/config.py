@@ -25,9 +25,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # Embedder for M2 and M3; M4 overrides it in M4Config.embedder.
 # harness choice: per-paper-components rule (METHODS §A.2)
 EMBEDDER_MODEL = "BAAI/bge-m3"
-# Output width of bge-m3; M4's mpnet is 768-d and set in M4Config.
-# harness choice: follows EMBEDDER_MODEL
-EMBEDDING_DIM = 1024
 # Reader that answers every query for every system. Any id that is not an
 # OpenAI name loads locally through HF transformers in src.models.
 # harness choice: one reader across all systems (METHODS §D)

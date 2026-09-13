@@ -77,7 +77,7 @@ def _is_openai_model(model_name: str) -> bool:
     return any(name.startswith(p) for p in _OPENAI_MODEL_PREFIXES)
 
 
-_API_PATH_REMOVED = (
+_OPENAI_MODEL_REFUSAL = (
     "generator {model!r} names an OpenAI API model, but this harness runs "
     "local HuggingFace models only. Pass a local model id such as "
     "Qwen/Qwen2.5-7B-Instruct (--generator, or config.GENERATOR_MODEL)."
@@ -529,7 +529,7 @@ def generate_batch(
 
     # Only the local model serves; an OpenAI id is refused.
     if _is_openai_model(cfg.model):
-        raise ValueError(_API_PATH_REMOVED.format(model=cfg.model))
+        raise ValueError(_OPENAI_MODEL_REFUSAL.format(model=cfg.model))
 
     configure_cuda_allocator()
     import torch
@@ -688,5 +688,5 @@ def generate(
     """Answer one prompt with the shared local reader; OpenAI ids refused."""
     cfg = cfg or GenerationConfig()
     if _is_openai_model(cfg.model):
-        raise ValueError(_API_PATH_REMOVED.format(model=cfg.model))
+        raise ValueError(_OPENAI_MODEL_REFUSAL.format(model=cfg.model))
     return _generate_local(system_prompt, user_prompt, cfg)
