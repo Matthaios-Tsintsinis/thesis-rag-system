@@ -1,542 +1,300 @@
-# Hierarchical RAG System
+# thesis-rag-system
 
-A multilingual (Greek + English) Retrieval-Augmented Generation pipeline. Supports two chunking strategies (fixed-size and semantic), hierarchical document retrieval via a semantic tree, hybrid BM25 + dense search, and RAGAS-based evaluation.
+The benchmark harness behind an undergraduate CS thesis: a comparative
+evaluation of published retrieval-augmented generation architectures
+under one verified harness. Four systems, four benchmarks, two readers.
 
-Runs entirely on Google Colab (tested on T4 GPU).
+| id | system | retrieval | embedder |
+|----|--------|-----------|----------|
+| M1 | closed-book LLM | none | — |
+| M2 | flat dense | FAISS over 200-word chunks, top-15 | bge-m3 |
+| M3 | hybrid | dense + BM25, RRF (k=60), top-15 | bge-m3 |
+| M4 | RAPTOR (paper-faithful, collapsed tree) | 2,000-token evidence budget | multi-qa-mpnet |
 
----
+Benchmarks: MultiHop-RAG, NarrativeQA (seeded 40-story draw), HotpotQA
+distractor (registered 1,000-question sample), HotpotQA pooled (the same
+questions, paragraphs pooled per 100-question shard). Readers:
+`Qwen/Qwen2.5-7B-Instruct` (bank `p10`) and
+`meta-llama/Llama-3.1-8B-Instruct` (bank `p11`), each a full
+independent replication (its own M4 trees and summaries). 32 cells.
 
-## Table of Contents
+**This repository is the reproduction path and nothing else.** It runs
+a cell, replays the retrieval rankings behind the R@5 column, and
+exports the three tables (F1 | EM | R@5 per benchmark and reader). The
+analysis, audit and probe tooling, the withdrawn systems and the
+off-matrix benchmarks were removed in September 2026; the complete tree
+lives at the annotated tag **`thesis-full-2026-09-03`** (`git show
+thesis-full-2026-09-03:<path>` reads any deleted file). The fidelity
+record, the methods document and the results are disk-only working
+documents (`docs/` is gitignored) and cite that tag.
 
-- [Pipeline Overview](#pipeline-overview)
-- [Models](#models)
-- [Notebook Structure](#notebook-structure)
-- [Getting Started](#getting-started)
-- [Supported File Formats](#supported-file-formats)
-- [Configuration Reference](#configuration-reference)
-- [Chunking Strategies](#chunking-strategies)
-- [Query View Generation](#query-view-generation)
-- [Hybrid Retrieval](#hybrid-retrieval)
-- [Reranking](#reranking)
-- [Confidence Threshold](#confidence-threshold)
-- [Generation](#generation)
-- [Corpus Analytics](#corpus-analytics)
-- [Cache System](#cache-system)
-- [Utility Cells](#utility-cells)
-- [RAGAS Evaluation](#ragas-evaluation)
-- [Comparing Chunking Strategies](#comparing-chunking-strategies)
-- [Outputs](#outputs)
+## What you need
 
----
+- **An NVIDIA L4 (24 GB).** Every banked cell ran on an L4; the runner
+  refuses to add a cell to a bank whose summaries record different
+  hardware, so a reproduction runs on an L4 or into its own bank.
+- **CPython 3.12.13, exactly.** The environment gate compares the full
+  interpreter string recorded in the lock.
+- **`requirements.lock`** — the banked environment: the pinned versions
+  of the topology stack, torch and transformers, faiss, rank-bm25,
+  tiktoken, datasets and huggingface-hub, plus the `# python=3.12.13`
+  line (`lockfile_hash 17878bc8740173be`). It is not in this repository;
+  it sits at the root of the Drive folder beside the banks. The runner
+  checks it before any model loads.
+- **The Drive folder** `/content/drive/MyDrive/thesis_rag/`:
 
-## Pipeline Overview
+  ```
+  thesis_rag/
+    requirements.lock                 the environment authority (see above)
+    cache/                            substrate caches: M2/, M3/, M4_RAPTOR/, ...
+    outputs/
+      p10/                            the Qwen bank: <benchmark>_<system>_validation.jsonl
+      p11/                            the Llama bank:   + .summary.json per cell,
+                                      + rankings.<stem>.jsonl / .json sidecars (replay)
+      COMPARISON.csv, COMPARISON.md   the exported tables
+  ```
 
+  `src/paths.py` resolves the cache and output roots to that folder
+  automatically once Drive is mounted; `THESIS_CACHE_DIR` and
+  `THESIS_OUTPUT_DIR` override them (a re-derivation ALWAYS uses a
+  throwaway `THESIS_CACHE_DIR` and a throwaway output directory — the
+  cold-tree gate refuses an M4 cell whose trees already exist, and the
+  bank gates refuse a cell written beside cells from another reader or
+  another GPU).
+
+## The Colab session, block by block
+
+The run host is a Colab notebook whose cells call a **separate CPython
+3.12.13 interpreter as a subprocess** (`/content/py312/bin/python`).
+Nothing is imported into the notebook kernel itself, so the numpy
+splice that bites in-kernel installs cannot occur; if you ever `pip
+install` into the notebook kernel instead, RESTART the runtime before
+importing anything (installing umap-learn upgrades numpy under an
+already-imported copy and the failure is `ImportError: cannot import
+name '_center' from 'numpy._core.umath'`, which takes down faiss, torch
+and sentence-transformers).
+
+Set the runtime accelerator to **L4** before Block 1; Colab assigns a
+CPU or a T4 silently otherwise, and the GPU gate will refuse the bank.
+
+**Block 1 — clone, mount Drive, HF cache local.** The HF cache must be
+local disk: Drive's FUSE layer corrupts large `.safetensors` mid-download.
+The env vars must be exported BEFORE any process imports transformers.
+
+```bash
+git clone -b claude/reverent-chaplygin-42b2c0 https://github.com/Matthaios-Tsintsinis/thesis-rag-system.git /content/thesis-rag-system
+cd /content/thesis-rag-system && git fetch --tags
 ```
-PDFs / DOCX / HTML
-       │
-       ▼
-  1. Parsing & Chunking ──── fixed (220 words) or semantic (bge-m3 similarity)
-       │
-       ▼
-  2. Embedding (BAAI/bge-m3)
-       │
-       ▼
-  3. FAISS index + BM25 index
-       │
-       ▼
-  4. Semantic Tree (hierarchical clustering → tree of centroids)
-       │
-  At query time:
-       │
-       ▼
-  5. Query View Generation (Qwen2.5 paraphrases + template views)
-       │
-       ▼
-  6. Tree Traversal (top-k branches per level → candidate chunks)
-       │
-       ▼
-  7. Hybrid Scoring (dense cosine + BM25, alpha-weighted)
-       │
-       ▼
-  8. Context Expansion (neighbour chunks within document)
-       │
-       ▼
-  9. Reranking (BAAI/bge-reranker-v2-m3)
-       │
-       ▼
- 10. Grounded Answer Generation (Qwen2.5-3B-Instruct, 4-bit NF4)
-       │
-       ▼
- 11. RAGAS Evaluation (gpt-4o-mini as judge)
-```
-
-### How retrieval works
-
-When a query comes in, the pipeline generates several semantic "views" of it (paraphrases and template variations) to increase recall. Each view is used to traverse the semantic tree — a hierarchical clustering of all chunk embeddings — narrowing down candidate chunks efficiently without scanning the entire FAISS index. Candidates are then scored with a hybrid of cosine similarity and BM25, the top documents are selected, and their neighbouring chunks are pulled in for context. Finally the reranker re-orders everything by cross-encoder relevance before the generator produces a grounded, cited answer.
-
----
-
-## Models
-
-| Role | Model | Notes |
-|---|---|---|
-| Embedder | `BAAI/bge-m3` | Multilingual (Greek + English), used for chunking, FAISS, and RAGAS |
-| Reranker | `BAAI/bge-reranker-v2-m3` | Cross-encoder, optional via `use_reranker` flag |
-| Generator | `Qwen/Qwen2.5-3B-Instruct` | 4-bit NF4 quantization via bitsandbytes, fits T4 alongside embedder + reranker |
-| RAGAS judge | `gpt-4o-mini` (OpenAI) | External API, only needed for evaluation cells |
-
-### VRAM footprint (T4, 15 GB)
-
-| Component | ~VRAM |
-|---|---|
-| bge-m3 | 2.3 GB |
-| bge-reranker-v2-m3 | 1.1 GB |
-| Qwen2.5-3B 4-bit | 2.0 GB |
-| **Total** | **~5.4 GB** |
-
----
-
-## Notebook Structure
-
-| Cell | Section | What it does |
-|---|---|---|
-| — | Clear uploads | Optional: wipe `/content/uploads` |
-| — | Clear cache | Optional: delete cached embeddings/index |
-| 1 | Environment setup | `pip install` all dependencies |
-| 2 | Configuration | All tunable parameters in one `CONFIG` dict |
-| 3 | Utilities & parsers | File parsers (PDF, DOCX, HTML, XLSX), `chunk_text_words`, `chunk_text_semantic` |
-| 4 | Load models | bge-m3, reranker, Qwen2.5 (4-bit) |
-| 5 | Ingestion & chunking | Parse files, chunk by strategy, build `documents` and `chunks` lists |
-| 6 | Embeddings & FAISS | Embed chunks, build FAISS index and BM25 index, cache everything |
-| 7 | Semantic tree | Hierarchical agglomerative clustering → tree of centroids |
-| 8 | Retrieval functions | `retrieve()`, tree traversal, hybrid scoring, context expansion, reranking |
-| 9 | Answer generation | `ask()` — grounded generation with citations, confidence scoring |
-| 10 | Corpus analytics | Stats report + JSON saved to `OUTPUT_DIR` |
-| 11 | RAGAS setup | Install RAGAS, configure gpt-4o-mini judge, wrap bge-m3 for embeddings |
-| 11a | Testset generation | Synthetic QA pairs from your corpus via RAGAS knowledge graph |
-| 11b | RAGAS functions | `generate_predictions()`, `run_ragas()`, metric selection |
-| 11c | RAGAS run | Score predictions, print results, save report JSON |
-| 12 | Example usage | Sample queries demonstrating the full pipeline |
-| 13 | Download outputs | Zip and download outputs + cache to local machine |
-
----
-
-## Getting Started
-
-### Requirements
-
-- Google Colab with a T4 GPU runtime (or better)
-- OpenAI API key (only for RAGAS evaluation cells 11–11c)
-- Your documents (PDF, DOCX, HTML, or XLSX)
-
-### Steps
-
-1. Open the notebook in Colab and set the runtime to GPU.
-2. Run **cell 1** (environment setup) — installs all dependencies.
-3. Run **cell 2** (configuration) — you will be prompted to upload your PDF/DOCX files here. They are saved to `/content/uploads`.
-4. Run **cells 3–10** in order. This parses your documents, embeds them, builds the FAISS and BM25 indexes, and constructs the semantic tree. Progress bars show embedding status.
-5. Run **cell 12** to test the pipeline with example queries.
-6. Optionally run **cells 11–11c** to evaluate with RAGAS (requires OpenAI API key).
-
----
-
-## Supported File Formats
-
-The parser handles the following formats automatically based on file extension:
-
-| Format | Extension(s) | Notes |
-|---|---|---|
-| PDF | `.pdf` | Text-based PDFs only; scanned images without OCR will produce poor chunks |
-| Word | `.docx` | Full text extraction including paragraphs and tables |
-| HTML | `.html`, `.htm` | Body text extracted, tags stripped |
-| Plain text | `.txt`, `.md` | Read as-is |
-| CSV | `.csv` | Rows concatenated as text |
-| JSON | `.json` | Serialized to text |
-| Excel | `.xlsx` | Sheet content extracted as text |
-
-Files shorter than `min_chars_per_doc` (default 200 characters) after parsing are skipped and logged in `skipped`.
-
-All parameters live in the `CONFIG` dict in cell 2. Key options:
-
-### Chunking
 
 ```python
-"chunking_strategy": "fixed",        # "fixed" | "semantic"
-
-# Fixed chunking
-"chunk_size_words": 220,
-"chunk_overlap_words": 40,
-
-# Semantic chunking
-"semantic_breakpoint_percentile": 90,    # split at top N% similarity drops
-"semantic_min_words_per_chunk": 80,      # merge chunks smaller than this
-"semantic_max_words_per_chunk": 400,     # force-split chunks larger than this
-"semantic_max_words_if_min_chunk": 500,  # max allowed size when merging a small chunk into previous
-"semantic_buffer_size": 1,               # neighbour sentences used for embedding context
-"semantic_absolute_threshold": 0.5,     # hard cap on breakpoint threshold (prevents over-merging on homogeneous text)
+from google.colab import drive
+drive.mount("/content/drive")
+import os
+os.environ.update({
+    "HF_HOME": "/content/hf_cache",
+    "TRANSFORMERS_CACHE": "/content/hf_cache",
+    "HF_DATASETS_CACHE": "/content/hf_cache/datasets",
+    "SENTENCE_TRANSFORMERS_HOME": "/content/hf_cache/sentence-transformers",
+})
 ```
 
-### Retrieval
+**Block E — the interpreter.** The operator's block, verbatim: CPython
+3.12.13 from conda-forge at `/content/py312`, the interpreter every
+later command runs as a subprocess.
+
+```bash
+cd /content && curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xvj bin/micromamba
+/content/bin/micromamba create -y -p /content/py312 python=3.12.13 -c conda-forge
+/content/py312/bin/python --version                      # Python 3.12.13, exactly
+```
+
+**Block F — the locked environment and the pin gate: the PROVEN
+sequence.** The order is the result of an incident, not a preference:
+torch FIRST from the PyTorch CUDA-12.8 index at the lock's exact
+version (PyPI does not serve the `+cu128` build), then
+`requirements.txt` (the reduced import graph), then the lock's pins
+with the same index as an extra, then `pip check`, then the gate. The
+commented uninstall line is the record of an incident: installing over
+a fresh environment once dragged a `torchvision` wheel in over the
+locked torch and broke `PreTrainedModel` AFTER the pin had printed OK
+(2026-08-24). torchvision, torchaudio and the docling family are in no
+lockfile line, so absence is the clean state. The line was retired on
+2026-09-04 by the ruled proof: the fresh-clone smoke on an L4 ran `pip
+check` BEFORE it and was clean — the reduced `requirements.txt` pulls
+none of them. Re-enable it only if `pip check` names one of those
+packages. The gate must print
+`[pin] lockfile_hash=17878bc8740173be`, `[pin] python=3.12.13 (locked
+3.12.13)`, `[pin] checked N pinned package(s)` and `[pin] OK —
+environment matches the lockfile.`; it screens `pip check` itself and
+FAILS on any conflict naming a locked package.
+
+```bash
+cd /content/thesis-rag-system
+cp /content/drive/MyDrive/thesis_rag/requirements.lock requirements.lock
+/content/py312/bin/python -m pip install $(grep -E "^torch==" requirements.lock) --index-url https://download.pytorch.org/whl/cu128
+/content/py312/bin/python -m pip install -r requirements.txt
+/content/py312/bin/python -m pip install -r requirements.lock --extra-index-url https://download.pytorch.org/whl/cu128
+/content/py312/bin/python -m pip check
+# retired 2026-09-04 (fresh-clone smoke: pip check clean before this line) -- re-enable only if pip check names one of these:
+# /content/py312/bin/python -m pip uninstall -y torchvision torchaudio docling-ibm-models docling docling-core docling-parse docling-slim
+/content/py312/bin/python -m scripts.pin_environment check --lockfile requirements.lock
+```
+
+The stack check, once the gate is green (numba >= 0.66 is load-bearing:
+older numba pins numpy < 2.1; fix by upgrading numba, never by lowering
+numpy):
+
+```bash
+cd /content/thesis-rag-system && /content/py312/bin/python -c "import numpy, numba, umap, faiss, torch, sentence_transformers, tiktoken, sklearn; import importlib.metadata as m; assert tuple(int(x) for x in m.version('numpy').split('.')[:2]) >= (2, 1) and tuple(int(x) for x in m.version('numba').split('.')[:2]) >= (0, 66), (m.version('numpy'), m.version('numba')); print('stack OK')"
+```
+
+**Block F2a — the Hugging Face token (Llama column only).** The Llama
+repo is gated: accept the license on the model page with the SAME
+account as the token, create a READ token at
+`huggingface.co/settings/tokens`, store it in Colab Secrets as
+`HF_TOKEN`, and export it into the environment the subprocess inherits.
+The runner's own preflight message refers to this step as "Block F2".
 
 ```python
-"top_k_flat": 12,                    # candidates from FAISS
-"top_k_final": 6,                    # final fragments returned
-"top_docs_after_tree": 8,            # documents selected after tree traversal
-"top_chunks_per_doc_for_context": 3, # anchor chunks per document for context expansion
-"context_neighbor_radius": 1,        # ±N chunks expanded around each anchor
-"tree_branching_factor": 4,
-"tree_top_branches_per_level": 2,
-"tree_min_cluster_size": 24,
-"tree_max_depth": 4,
-"max_query_views": 5,                # total views including original query
-"rerank_top_n": 24,                  # how many candidates the reranker sees
-"use_reranker": True,                # enable/disable cross-encoder reranking
-"use_bm25_hybrid": True,             # enable/disable BM25 hybrid scoring
-"alpha_dense": 0.75,                 # weight for dense vs BM25 (0.75 = 75% dense)
+from google.colab import userdata
+import os
+os.environ["HF_TOKEN"] = userdata.get("HF_TOKEN")
 ```
 
-### Query augmentation
+**Block F2b — prove the files are served, not just the metadata.** The
+runner does exactly this before any GPU time (repo metadata is public
+on gated repos; only the files are gated, and a metadata probe once
+printed "verified" over a 403-bound run). Two seconds now saves a
+session later.
 
-```python
-"enable_query_view_generation": True,  # LLM-generated paraphrases via Qwen
+```bash
+cd /content/thesis-rag-system && /content/py312/bin/python -c "from huggingface_hub import hf_hub_download; print(hf_hub_download('meta-llama/Llama-3.1-8B-Instruct', 'config.json'))"
 ```
 
-### Generation
+## The two commands
 
-```python
-"enable_local_generation": True,   # load Qwen and generate answers locally
-                                   # set False to retrieve only (no generation)
-"max_new_tokens": 512,
-"temperature": 0.1,
-"do_sample": False,
+**Run one cell** (here M4 x HotpotQA distractor, the Qwen reader).
+This is the command shape that produced every banked cell; the banks
+are complete, so a reproduction runs into a THROWAWAY cache and output
+directory (pointing `--output` at a banked cell answers nothing and is
+refused by the population gate before any summary is written — the
+banked summary is never rewritten). `--output` is always passed (the
+runner's default name carries a timestamp, not the bank stem). Gates
+before any model loads: the pin, the bank's reader, the bank's GPU,
+hub file access, the benchmark preflight, and the cold-tree preflight
+over every unit (an M4 cell refuses to serve a warm substrate; there is
+no flag that allows it).
+
+```bash
+cd /content/thesis-rag-system && THESIS_CACHE_DIR=/content/repro_cache /content/py312/bin/python -m src.eval.runner --system M4 --benchmark hotpotqa --split validation --output /content/drive/MyDrive/thesis_rag/outputs/repro/hotpotqa_M4_validation.jsonl
 ```
 
-### Corpus analytics
+For the Llama reader add `--generator meta-llama/Llama-3.1-8B-Instruct`
+and use a separate output directory (the bank-reader gate refuses two
+readers in one directory). Every cell is the full declared population;
+there is no small-sample mode. `--resume` appends to an interrupted
+cell and skips its banked queries; the summary written at the end
+covers the rows the finishing process scored and the units it indexed,
+so a cell is completed within one process where possible. On M4, a
+unit interrupted after its tree was flushed is warm on resume and the
+cold-tree preflight lists its directory: delete it and re-run (the
+rebuild is deterministic under the pinned stack, up to the measured
+floor of one 16-leaf unit in a thousand).
 
-```python
-"analysis_queries": [              # queries run automatically by the corpus analytics cell
-    "Ποια είναι τα βασικά θέματα που καλύπτουν τα έγγραφα;",
-    "What are the main topics in the document collection?",
-    "Give a summary of the most important entities, concepts, and recurring themes."
-]
+**Export the three tables** against both banks. Refuses on any missing
+or partial cell, on any population mismatch, on a recomputed
+credited-refusal count that disagrees with the recorded battery, on a
+HotpotQA EM that disagrees with the banked per-row value, and on a
+missing rankings sidecar (it never falls back to hit@5).
+
+```bash
+cd /content/thesis-rag-system && /content/py312/bin/python -m scripts.export_comparison --p10 /content/drive/MyDrive/thesis_rag/outputs/p10 --p11 /content/drive/MyDrive/thesis_rag/outputs/p11 --out /content/drive/MyDrive/thesis_rag/outputs
 ```
 
-### Evaluation
+**Re-derive the R@5 sidecars** (only if they are absent — they are on
+Drive). The replay re-runs retrieval over the warm substrates for the 18
+ranked cells and writes `rankings.<stem>.jsonl` beside each; every
+replayed row must reproduce the banked set-F1, hit@K, MAP@K and MRR
+bit-for-bit or the cell refuses. An existing sidecar means done only
+after it is verified (the summary names the cell, the rows file parses
+and holds the summary's row count, and the embedded `rows_sha256`
+matches where present); a verified cell is named on one line and never
+rewritten, so against the Drive banks the command is a no-op that
+prints eighteen verified lines, and a corrupt or foreign sidecar
+refuses the run. Delete a cell's two sidecar files by hand to
+regenerate it deliberately. Same GPU class as the bank, for the gate's
+sake.
 
-```python
-"evaluation_json_path": None,        # path to testset JSON; set after first 11a run
+```bash
+cd /content/thesis-rag-system && /content/py312/bin/python -m scripts.replay_retrieval --p10 /content/drive/MyDrive/thesis_rag/outputs/p10 --p11 /content/drive/MyDrive/thesis_rag/outputs/p11
 ```
 
----
+## Acceptance
 
-## Chunking Strategies
+A fresh clone at the current HEAD, against the existing banks, must
+produce `COMPARISON.csv` with md5 **`ba08898a57f586dfb255e04304ff91d5`**
+— byte-identical to the placed edition. Anything else is a defect in the
+tree, never a finding.
 
-### Fixed-size chunking (default)
-
-Splits documents into windows of `chunk_size_words` words with `chunk_overlap_words` overlap. Fast, deterministic, works well as a baseline. Overlap ensures concepts split at a boundary still appear in two chunks.
-
-### Semantic chunking
-
-Uses the already-loaded `bge-m3` embedder to find natural topic boundaries:
-
-1. **Sentence splitting** — text is split on `.`, `!`, `?`, `;` (the last covers Greek question marks)
-2. **Buffered embedding** — each sentence is embedded together with its ±`buffer_size` neighbours, giving the model local context and smoothing out single-sentence noise
-3. **Cosine distance** — distance between consecutive buffered embeddings is computed (1 − cosine similarity)
-4. **Breakpoints** — distances above the `semantic_breakpoint_percentile` threshold AND above `semantic_absolute_threshold` become split points
-5. **Size enforcement** — chunks above `max_words` are force-split; chunks below `min_words` are merged into the previous chunk, unless that would exceed `max_words_if_min_chunk`
-
-The absolute threshold (default 0.5) prevents the percentile from going too high on homogeneous text — without it, the algorithm would still split even when all sentences are about the same topic.
-
-### Switching strategies
-
-Change one line in CONFIG and re-run from cell 5 downward:
-
-```python
-"chunking_strategy": "semantic",   # or "fixed"
+```bash
+md5sum /content/drive/MyDrive/thesis_rag/outputs/COMPARISON.csv
 ```
 
-The cache system handles the rest automatically — no manual file deletion needed.
+Two further checks a stranger can run without the banks:
 
----
+- **CPU:** `python -m unittest discover -s tests -t .` is green (483
+  tests; no GPU, no model — the suite fakes generation). The three CLIs
+  print their reduced surfaces: `python -m src.eval.runner --help`
+  (`--lockfile --system --benchmark --split --output --generator --resume`),
+  `python -m scripts.replay_retrieval --help` (`--p10 --p11`),
+  `python -m scripts.export_comparison --help` (`--p10 --p11 --out`).
+- **GPU:** one cell, M4 x HotpotQA distractor, into throwaway locations
+  so no gate refuses and nothing banked is touched (1,000 cold trees,
+  1,000 answers, about 2.7 h on an L4); the banked cell's rows and
+  `mean_answer_score` reproduce, up to the measured within-stack floor
+  of one 16-leaf unit in a thousand that may flip its layer-1 count.
 
-## Query View Generation
+  ```bash
+  cd /content/thesis-rag-system && THESIS_CACHE_DIR=/content/smoke_cache /content/py312/bin/python -m src.eval.runner --system M4 --benchmark hotpotqa --split validation --output /content/drive/MyDrive/thesis_rag/outputs/smoke_reduced/hotpotqa_M4_validation.jsonl
+  ```
 
-To improve recall, every query is expanded into multiple "views" before hitting the retrieval pipeline. The pipeline always generates up to `max_query_views` total views (default 5), combining two sources:
-
-**1. Template views (always on)**
-
-Four hardcoded reformulations targeting different semantic angles:
-
-```
-main topic of: {query}
-key entities and concepts in: {query}
-evidence and passages relevant to: {query}
-sections discussing: {query}
-```
-
-These run regardless of any flag.
-
-**2. LLM-generated paraphrases (optional)**
-
-If template views don't fill the `max_query_views` budget, Qwen generates additional retrieval-oriented reformulations. Controlled by two flags that must both be true:
-
-```python
-"enable_query_view_generation": True,   # master switch for LLM paraphrases
-"enable_local_generation": True,        # Qwen must be loaded
-```
-
-If `enable_query_view_generation` is `False`, or if `enable_local_generation` is `False` (so Qwen is never loaded), the LLM step is silently skipped and only template views are used.
-
-All views (original + template + LLM) are deduplicated before retrieval. Each view independently queries the FAISS index, and scores are aggregated by max and mean across views before ranking.
-
----
-
-## Hybrid Retrieval
-
-Candidate chunks are scored by combining dense cosine similarity (bge-m3 embeddings via FAISS) and sparse keyword matching (BM25). The final hybrid score is:
+## Repository layout
 
 ```
-score_hybrid = alpha_dense × score_dense_norm + (1 − alpha_dense) × score_bm25_norm
+src/
+  config.py              every constant and dataclass the path reads (ChunkingConfig is inside every substrate key)
+  models.py              embedder, the local fp16 generator (one load per model name, residency asserted), generate / generate_batch
+  cache.py               compute_cache_key, corpus hash, substrate directories and manifests
+  chunking.py            word_window (M2/M3) and raptor_100tok (M4) chunkers
+  parsing.py             the .txt corpus reader; parsing_identity() is a key input and a literal
+  components.py          per-system embedder / chunker resolution
+  prompt_packing.py      the evidence block and token counting (no budget)
+  raptor_paper.py        M4's chunker, bottom-up UMAP+GMM tree, collapsed index, substrate-key extras
+  paths.py               Drive-aware cache / output roots
+  retrievers/            base.py (index_items layout, prepare, retrieve_for_scoring), m1..m4
+  eval/                  runner.py (CLI + gates), base.py (BenchmarkRunner), the four loaders and their scorers,
+                         alignment.py (set-F1 and the rank-aware metrics), sampling.py (the one dated seed), types.py
+scripts/
+  pin_environment.py     write / check the lock; the pip-check screen; GPU string; provenance block
+  replay_retrieval.py    the R@5 producer (gated retrieval replay -> sidecars)
+  export_comparison.py   the one export: COMPARISON.csv / COMPARISON.md
+  verify_provenance_citations.py   documentation tooling, off the output path: checks the disk-only
+                         fidelity documents' citations against the tag
+tests/                   483 tests; python -m unittest discover -s tests -t .
+requirements.txt         the reduced import graph (the lock on Drive is the version authority)
 ```
 
-Both scores are min-max normalised before combining. Default `alpha_dense = 0.75` weights dense retrieval higher, which works well for semantic queries. Raise it toward 1.0 for purely semantic queries; lower it toward 0.5 if your corpus has a lot of specific terminology or acronyms that BM25 handles better.
-
-BM25 can be disabled entirely:
-
-```python
-"use_bm25_hybrid": False,   # pure dense retrieval
-```
-
----
-
-## Reranking
-
-After hybrid scoring, the top `rerank_top_n` candidates (default 24) are passed to a cross-encoder reranker (`BAAI/bge-reranker-v2-m3`). Unlike the bi-encoder (which embeds query and chunk independently), the cross-encoder sees both together and produces a more accurate relevance score. The final `top_k_final` results are taken from the reranked list.
-
-```python
-"use_reranker": True,      # enable cross-encoder reranking
-"rerank_top_n": 24,        # how many candidates the reranker scores
-```
-
-Disabling the reranker reduces VRAM usage by ~1.1 GB and speeds up retrieval, at the cost of lower precision. Useful if you hit memory limits or want faster iteration during development.
-
----
-
-## Confidence Threshold
-
-After retrieval, the top result's score is checked against a minimum threshold:
-
-```python
-CONFIDENCE_THRESHOLD = 0.35
-```
-
-If the best score (reranker score if available, otherwise hybrid score) falls below this, the pipeline flags the result as `low_confidence` and returns a fallback answer ("I could not find sufficient evidence...") instead of hallucinating. The retrieved fragments are still returned in the output for inspection.
-
-This threshold is hardcoded in cell 9 (answer generation) and can be adjusted there directly.
-
----
-
-## Generation
-
-The generator (`Qwen2.5-3B-Instruct`, 4-bit NF4) receives a structured prompt containing the query and the top retrieved fragments as numbered sources. It is instructed to:
-
-- Answer only from the provided sources
-- Cite sources inline using `[SOURCE N]` notation
-- Reply in the same language as the question (supports Greek and English)
-- Explicitly say so if evidence is insufficient
-
-```python
-"enable_local_generation": True,   # set False to skip generation entirely
-"max_new_tokens": 512,
-"temperature": 0.1,                # low temperature for factual grounding
-"do_sample": False,
-```
-
-Setting `enable_local_generation: False` skips loading Qwen entirely, saving ~2 GB VRAM. The pipeline still retrieves and returns fragments — only the final answer generation step is skipped. Useful for retrieval-only benchmarking or when VRAM is tight.
-
----
-
-## Corpus Analytics
-
-Cell 10 runs automatically at the end of the main pipeline and saves a `corpus_report_<RUN_ID>.json` to `OUTPUT_DIR`. It includes:
-
-- Document and chunk counts, skipped file list
-- Word and character statistics per document (min/max/mean/median)
-- Chunks per document distribution
-- Semantic tree structure (root ID, largest leaves, sample nodes)
-- Full answers to the `analysis_queries` defined in CONFIG
-
-The `analysis_queries` are run through the full `ask()` pipeline and their answers are embedded in the report — useful for a quick sanity check that retrieval and generation are working correctly on your corpus. Edit them in CONFIG to match your domain:
-
-```python
-"analysis_queries": [
-    "Ποια είναι τα βασικά θέματα που καλύπτουν τα έγγραφα;",
-    "What are the main topics in the document collection?",
-]
-```
-
----
-
-## Cache System
-
-Embeddings, the FAISS index, and chunks are cached to `/content/cache/` so re-runs don't re-embed the entire corpus. Cache filenames include the chunking strategy:
-
-```
-cache/
-  embeddings_fixed.npy
-  faiss_fixed.index
-  chunks_fixed.json
-  embeddings_semantic.npy
-  faiss_semantic.index
-  chunks_semantic.json
-```
-
-Switching `chunking_strategy` in CONFIG automatically uses a separate cache. Both strategies can coexist — switching back and forth is instant after the first run of each.
-
----
-
-## Utility Cells
-
-Two optional cells sit at the top of the notebook, above the main pipeline. They are **disabled by default** (flags set to `False`) and do nothing unless you explicitly enable them.
-
-### Clear uploads
-
-```python
-RUN_CLEAR_UPLOADS = True   # set to True to wipe /content/uploads
-```
-
-Deletes all files in `/content/uploads`. Useful when starting a fresh experiment with different documents.
-
-### Clear cache
-
-```python
-RUN_CLEAR_CACHE = True   # set to True to delete cached embeddings and index
-```
-
-Deletes the cached `.npy`, `.index`, and `.json` files in `/content/cache`. Use this if you want to force a full re-embed — for example after changing the embedding model or modifying the chunking logic in a way that isn't reflected in the strategy name.
-
-> Note: switching `chunking_strategy` does **not** require clearing the cache manually. The per-strategy filenames handle this automatically.
-
----
-
-## RAGAS Evaluation
-
-RAGAS scores the full RAG pipeline end-to-end using an LLM as judge. The judge is `gpt-4o-mini` (external API). The embedder is `bge-m3`, reused from the retrieval pipeline — no second model is loaded.
-
-### Metrics
-
-| Metric | Needs `gold_answer`? | What it measures |
-|---|---|---|
-| Faithfulness | No | Is the answer grounded in the retrieved contexts? |
-| Response relevancy | No | Does the answer address the question? |
-| LLM context precision (no ref) | No | Are the retrieved chunks on-topic? |
-| LLM context precision (with ref) | Yes | Same, validated against the gold answer |
-| LLM context recall | Yes | Did retrieval surface enough relevant content? |
-| Factual correctness | Yes | Semantic + factual match against gold answer |
-
-If `gold_answer` is present in the testset JSON, all six metrics run. Otherwise only the top three (reference-free) run.
-
-### Cell 11 — Setup
-
-Installs RAGAS and configures the judge. You will be prompted for your `OPENAI_API_KEY` when this cell runs. The key is stored only in session memory and is never written to disk or notebook output.
-
-```python
-judge_chat = ChatOpenAI(
-    model="gpt-4o-mini",
-    temperature=0,
-    max_tokens=4096,
-    max_retries=10,
-    request_timeout=120,
-)
-```
-
-### Cell 11a — Testset generation
-
-Generates synthetic questions from your own corpus using a RAGAS knowledge graph. Run this **once per corpus** — it produces a JSON file and sets `CONFIG["evaluation_json_path"]` automatically.
-
-```python
-TESTSET_SIZE = 20          # number of questions to generate
-REGEN_TESTSET = False      # set True to regenerate (overwrites existing testset)
-```
-
-**`REGEN_TESTSET`**: defaults to `False`. If `evaluation_json_path` already points to an existing file, the cell skips generation entirely. Set to `True` only when you want to regenerate with a different corpus or size.
-
-The cell also saves a `_raw.csv` alongside the JSON — open this to review and optionally delete low-quality questions before running the eval.
-
-> Testset generation makes many API calls and can take 20–40 minutes for a large corpus. It hits the daily RPD limit on low-tier OpenAI accounts — reduce `TESTSET_SIZE` or corpus size if this is a concern.
-
-### Cell 11b — Functions
-
-Defines `generate_predictions()` and `run_ragas()`. Nothing runs. Also sets RAGAS concurrency:
-
-```python
-run_config.max_workers = 1   # sequential requests, avoids rate limit cascades
-```
-
-### Cell 11c — Run
-
-Generates answers for every question using the local Qwen model, then scores them with RAGAS. Saves two files per run:
-
-- `ragas_predictions_<RUN_ID>.csv` — raw per-question answers and context counts
-- `ragas_evaluation_report_<RUN_ID>.json` — mean scores + per-question breakdown
-
----
-
-## Comparing Chunking Strategies
-
-The workflow for comparing chunking strategies:
-
-**Run 1 — fixed chunking:**
-
-```python
-"chunking_strategy": "fixed",
-"evaluation_json_path": None,   # let 11a generate the testset
-```
-
-Run all cells. Note the testset path printed by cell 11a (e.g. `/content/outputs/20250101_120000/ragas_testset_20250101_120000.json`).
-
-**Run 2 — semantic chunking:**
-
-```python
-"chunking_strategy": "semantic",
-"evaluation_json_path": "/content/outputs/20250101_120000/ragas_testset_20250101_120000.json",
-```
-
-Run all cells. Cell 11a skips (path already set). Cell 11c produces a second report.
-
-**Compare:**
-
-Both `ragas_evaluation_report_*.json` files have the same structure:
-
-```json
-{
-  "run_id": "...",
-  "summary": {
-    "scores": {
-      "faithfulness": 0.74,
-      "response_relevancy": 0.81,
-      "llm_context_precision_without_reference": 0.69
-    }
-  }
-}
-```
-
-Diff the `scores` dicts between the two files. The delta is your result.
-
----
-
-## Outputs
-
-Each run produces a timestamped subfolder at `/content/outputs/<RUN_ID>/`:
-
-```
-outputs/
-  20250101_120000/
-    corpus_report_20250101_120000.json     # document + chunk statistics
-    ragas_testset_20250101_120000.json     # evaluation questions (reuse across runs)
-    ragas_testset_20250101_120000_raw.csv  # raw testset for manual review
-    ragas_predictions_20250101_120000.csv  # per-question answers
-    ragas_evaluation_report_20250101_120000.json  # RAGAS scores
-```
-
-**Cell 13 (Download)** zips both the outputs folder and the cache folder and downloads them to your local machine via the Colab file download API.
+## What is deliberately NOT here
+
+The five audit documents, the living fidelity record, the results and
+the thesis map are working documents under the gitignored `docs/`
+directory and are delivered separately. The withdrawn systems (M6
+HippoRAG, M7 three-axis, M9 CorrectiveRAG), the archived ones (M5, M8),
+the QASPER / QuALITY loaders, ROUGE-L, the analysis and significance
+tooling, every probe and cost script, the smoke corpus and the
+prototype notebook are at `thesis-full-2026-09-03`.
+
+## Author
+
+Matthaios Tsintsinis — undergraduate thesis, computer science. MIT
+licence, see [LICENSE](LICENSE).

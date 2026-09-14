@@ -1,3 +1,63 @@
-ollama
-chromadb
-PyPDF2
+# The reduced import graph: exactly what runs a cell, the replay and the
+# export. Installed in README Block E into the py312 interpreter (a
+# subprocess, never the notebook kernel), with requirements.lock on top;
+# the AUTHORITY for versions is that lock (Drive root, lockfile_hash
+# 17878bc8740173be), checked by `python -m scripts.pin_environment check`
+# before any model loads.
+
+# --- Shared retrieval infra (M2/M3; M4 shares the embedder loader) ---
+numpy>=2.1,<3                    # Floored at 2.1 to stay on the numpy 2.x ABI
+                                # generation that the broader scientific Python
+                                # stack targets in 2025-26 (sklearn, faiss,
+                                # transformers wheels). Upper <3 guards a future
+                                # numpy 3 ABI break entering silently.
+sentence-transformers>=3.0      # bge-m3 (M2/M3) and multi-qa-mpnet (M4) embedders
+faiss-cpu>=1.8                  # swap to faiss-gpu on CUDA hosts
+rank-bm25>=0.2.2                # M3's sparse leg
+tiktoken>=0.7                   # token counting: evidence blocks / prompts and
+                                # M4's ~100-token RAPTOR leaves
+                                # (encoding_for_model("gpt-4o-mini"))
+
+# --- M4 paper-faithful RAPTOR clustering (src/raptor_paper.py) ---
+# The RAPTOR paper reduces node embeddings with UMAP (global then local)
+# and soft-clusters them with a BIC-selected GMM. Neither is substitutable
+# without abandoning paper fidelity, so these are hard requirements for
+# M4, not optional extras.
+scikit-learn>=1.4               # GaussianMixture (BIC sweep + final fit)
+umap-learn>=0.5.12              # verified 0.5.12 on Colab 2026-07-29
+numba>=0.66                     # FLOOR IS LOAD-BEARING, DO NOT LOWER.
+                                # numba 0.60.0 pins numpy<2.1, which collides
+                                # head-on with this file's numpy>=2.1 floor.
+                                # The collision was invisible for weeks because
+                                # nothing imported numba; umap-learn does.
+                                # Resolution is upgrading numba (>=0.66 drops
+                                # the numpy<2.1 pin), NOT lowering numpy —
+                                # numpy<2.1 breaks the faiss / torch /
+                                # sentence-transformers wheels the whole
+                                # harness runs on.
+                                # Pulled transitively: llvmlite, pynndescent.
+#
+# REPRODUCIBILITY NOTE. UMAP output is version-sensitive even under a
+# pinned random_state, so M4's tree topology is reproducible only against
+# a pinned stack, not absolutely. The stack that built every banked tree
+# is the one requirements.lock pins (CPython 3.12.13, NVIDIA L4); the
+# thesis methods section quotes it from there.
+#
+# INSTALL ORDER IS NOT OPTIONAL — see README Block E: install into the
+# py312 interpreter as a subprocess, never into a live kernel. Installing
+# these upgrades numpy inside a kernel that already imported the stock
+# version, which leaves a spliced module tree; the observed failure is
+#   ImportError: cannot import name '_center' from 'numpy._core.umath'
+# and it takes down faiss / torch / sentence-transformers, not just UMAP.
+# Install, RESTART THE RUNTIME, then verify. Never run an eval cell in
+# the same kernel session as the install.
+
+# --- Generator (local Qwen2.5-7B-Instruct / Llama-3.1-8B-Instruct, fp16) ---
+transformers>=4.44
+torch>=2.2
+accelerate>=0.33                # device_map placement (max_memory, no CPU spill)
+
+# --- Benchmark loaders and the hub gates ---
+datasets>=3.0                   # HotpotQA and NarrativeQA loaders
+huggingface-hub>=0.25           # MultiHop-RAG download, the model-revision pin,
+                                # and the gated-file access preflight
