@@ -280,6 +280,8 @@ scripts/
   export_comparison.py   the one export: COMPARISON.csv / COMPARISON.md
   verify_provenance_citations.py   documentation tooling, off the output path: checks the disk-only
                          fidelity documents' citations against the tag
+  verify_walkthrough_excerpts.py   documentation tooling, off the output path: checks that every code
+                         excerpt in the disk-only docs/CODE_WALKTHROUGH.md is verbatim at its pinned revision
 tests/                   483 tests; python -m unittest discover -s tests -t .
 requirements.txt         the reduced import graph (the lock on Drive is the version authority)
 ```
