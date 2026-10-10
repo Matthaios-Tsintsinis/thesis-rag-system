@@ -60,6 +60,20 @@ class BenchmarkRunner:
         # so one cell never mixes trees built under different stacks.
         self.require_cold_tree = require_cold_tree
 
+    def _drop_torn_tail(self) -> None:
+        """Cut a last line that has no newline: a row a dead session left half-written."""
+        if not self.output_path.exists():
+            return
+        data = self.output_path.read_bytes()
+        if not data or data.endswith(b"\n"):
+            return
+        keep = data.rfind(b"\n") + 1
+        with self.output_path.open("r+b") as f:
+            f.truncate(keep)
+        if self.verbose:
+            print(f"[eval] resuming: cut a torn last line of "
+                  f"{len(data) - keep} bytes from {self.output_path.name}")
+
     def _existing_query_ids(self) -> set[str]:
         """Return the query_ids already in the output file when resuming."""
         if not self.resume or not self.output_path.exists():
@@ -145,14 +159,18 @@ class BenchmarkRunner:
         """Index and answer each unit with unbanked queries; yield each row."""
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         # n_units_processed lives on the instance so main() can check the
-        # population after the pass; skipped units are counted apart.
+        # population after the pass; it counts the units indexed now plus
+        # the units an earlier session banked whole.
         self.n_units_processed = 0
         n_units = 0
         n_units_skipped = 0
         n_queries = 0
         t_start = time.perf_counter()
 
-        # Work out what is already banked and open the file accordingly.
+        # Work out what is already banked and open the file accordingly. A
+        # torn last line is cut first, so appended rows start on a new line.
+        if self.resume:
+            self._drop_torn_tail()
         already_done = self._existing_query_ids()
         if already_done and self.verbose:
             print(
@@ -185,6 +203,8 @@ class BenchmarkRunner:
                             f"{unit.corpus_id!r} — NOT indexed"
                         )
                     n_units_skipped += 1
+                    # A unit banked by an earlier session is covered.
+                    self.n_units_processed = n_units + n_units_skipped
                     continue
 
                 t_index = time.perf_counter()
@@ -275,7 +295,7 @@ class BenchmarkRunner:
                     yield scored
 
                 n_units += 1
-                self.n_units_processed = n_units
+                self.n_units_processed = n_units + n_units_skipped
 
         # Final summary line for the log.
         if self.verbose:

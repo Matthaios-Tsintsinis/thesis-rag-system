@@ -379,6 +379,46 @@ def assert_population_as_declared(
     )
 
 
+def summarise_rows(path: Path) -> dict:
+    """Totals over every row in a cell's JSONL, in file order."""
+    # The summary is computed from the file, not from the rows this process
+    # wrote, so a cell resumed across sessions is summarised whole. Rows are
+    # summed in file order, which for an uninterrupted run is the order they
+    # were scored, so the means are bit-identical to running sums.
+    totals = {"n_scored": 0, "n_null": 0, "sum_ans": 0.0, "sum_ans_null": 0.0,
+              "sum_retr_f1": 0.0, "n_retr_skipped": 0}
+    seen: set[str] = set()
+    with Path(path).open("r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                raise SystemExit(
+                    f"SUMMARY REFUSED: line {line_no} of {path} is not a "
+                    "complete row. Nothing was summarised."
+                )
+            qid = str(row["query_id"])
+            if qid in seen:
+                raise SystemExit(
+                    f"SUMMARY REFUSED: query {qid!r} appears more than once "
+                    f"in {path}. Nothing was summarised."
+                )
+            seen.add(qid)
+            totals["n_scored"] += 1
+            answer = row["answer"]
+            if answer["method"] == "unanswerable_rule":
+                totals["n_null"] += 1
+                totals["sum_ans_null"] += answer["value"]
+            if row["retrieval"]["skipped"]:
+                totals["n_retr_skipped"] += 1
+            else:
+                totals["sum_retr_f1"] += row["retrieval"]["f1"]
+            totals["sum_ans"] += answer["value"]
+    return totals
+
+
 def main() -> None:
     """Parse the CLI, run every gate, score one cell, write its summary."""
     parser = argparse.ArgumentParser(
@@ -505,28 +545,13 @@ def main() -> None:
         resume=args.resume,
         require_cold_tree=(args.system == "M4"),
     )
-    # Running sums for the summary. The answer column mixes token-F1 on
-    # answerable queries with the null rule on null ones, so the null part
-    # is counted separately and reported beside the mean.
-    n_scored = 0
-    sum_retr_f1 = 0.0
-    sum_retr_skipped = 0
-    sum_ans = 0.0
-    n_null = 0
-    sum_ans_null = 0.0
+    # Count the rows this process writes; the totals come from the file.
     # Time the pass alone; the generator loads on its first call inside it
     # (an M4 summary or the first answer) and is part of the time.
+    n_this_process = 0
     t_run = time.perf_counter()
-    for scored in runner.run(system, benchmark, split=args.split):
-        n_scored += 1
-        if scored.answer.method == "unanswerable_rule":
-            n_null += 1
-            sum_ans_null += scored.answer.value
-        if scored.retrieval.skipped:
-            sum_retr_skipped += 1
-        else:
-            sum_retr_f1 += scored.retrieval.f1
-        sum_ans += scored.answer.value
+    for _ in runner.run(system, benchmark, split=args.split):
+        n_this_process += 1
 
     elapsed_s = time.perf_counter() - t_run
 
@@ -541,6 +566,18 @@ def main() -> None:
     # pass and check them before the summary is written.
     _expected_n_queries = resolve_expected_n_queries(benchmark)
     assert_expected_n_queries_usable(_expected_n_queries)
+
+    # The totals cover every row in the file, so a cell resumed across
+    # sessions is summarised whole. The answer column mixes token-F1 on
+    # answerable queries with the null rule on null ones, so the null part
+    # is counted separately and reported beside the mean.
+    totals = summarise_rows(args.output)
+    n_scored = totals["n_scored"]
+    sum_retr_skipped = totals["n_retr_skipped"]
+    sum_retr_f1 = totals["sum_retr_f1"]
+    sum_ans = totals["sum_ans"]
+    n_null = totals["n_null"]
+    sum_ans_null = totals["sum_ans_null"]
 
     # Write the summary beside the JSONL.
     summary_path = args.output.with_suffix(".summary.json")
@@ -590,10 +627,10 @@ def main() -> None:
         "summary_max_new_tokens": getattr(
             system.config.m4, "summary_max_tokens", None
         ) if args.system == "M4" else None,
-        # Wall clock of runner.run alone, and the per-query rate.
+        # Wall clock of this process's runner.run, and its per-query rate.
         "elapsed_s": round(elapsed_s, 2),
         "s_per_query": (
-            round(elapsed_s / n_scored, 4) if n_scored else None
+            round(elapsed_s / n_this_process, 4) if n_this_process else None
         ),
         # Provenance per cell: environment, model revisions, tree cache
         # state (None without a tree), topology stack and code revision.
@@ -605,6 +642,13 @@ def main() -> None:
         "output_path": str(args.output),
         "timestamp": stamp,
     }
+    # A resumed cell says how many rows earlier sessions banked; elapsed_s
+    # and s_per_query then describe this process only.
+    if n_this_process != n_scored:
+        summary["resumed"] = {
+            "rows_banked_before": n_scored - n_this_process,
+            "rows_this_process": n_this_process,
+        }
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2))
     print(f"[eval] summary -> {summary_path}")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
