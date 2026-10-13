@@ -18,6 +18,7 @@ from ..retrievers.m1_closedbook import ClosedBookSystem
 from ..retrievers.m2_flat_dense import FlatDenseSystem
 from ..retrievers.m3_hybrid import HybridRRFSystem
 from ..retrievers.m4_raptor import RaptorSystem
+from ours.model import OursSystem
 from .base import BenchmarkRunner
 from .hotpotqa import HotpotQABenchmark, HotpotQAPooledBenchmark
 from .multihop import MultiHopBenchmark
@@ -29,6 +30,7 @@ SYSTEM_REGISTRY: dict[str, type[BaseSystem]] = {
     "M2": FlatDenseSystem,
     "M3": HybridRRFSystem,
     "M4": RaptorSystem,
+    "OURS": OursSystem,
 }
 
 BENCHMARK_REGISTRY: dict[str, type] = {
