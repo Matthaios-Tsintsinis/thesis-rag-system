@@ -21,9 +21,10 @@ RERANK_MAX_LENGTH = 512
 
 # The topology stack the banked Llama trees were built under, as the p11
 # summaries record it (tree_build_env). M4's cache key folds this string, so
-# it must match for the existing trees to be found. Filled in from
-# `python -m scripts.dev_ours census`; the model refuses to run without it.
-TREE_BUILD_ENV: str | None = None
+# it must match for the existing trees to be found. Read from the four p11
+# M4 summaries by `python -m scripts.dev_ours census`, which found all 1,051
+# scored units warm under it.
+TREE_BUILD_ENV: str | None = "python=3.12;umap-learn=0.5.12;scikit-learn=1.6.1;numpy=2.5.2"
 
 # Token counts use the harness's counter (o200k_base), so evidence_tokens
 # compares across cells.

@@ -53,8 +53,9 @@ PUBLISHED_TARGETS = {
     ("hotpotqa", "answer"): 0.0304, ("hotpotqa_pooled", "retrieval"): 0.0024,
     ("hotpotqa_pooled", "answer"): 0.0300,
 }
-# Written in from `bar` before any ours row exists (ADDENDUM 7).
-POOLED_MAP10_BAR: float | None = None
+# From `bar` before any ours row existed (ADDENDUM 7): 0.023978705859676434,
+# rounded to 4 dp like the published targets.
+POOLED_MAP10_BAR: float | None = 0.0240
 
 # Family O: comparator, metric and bar, as declared in ADDENDUM 7.
 FAMILY_O = (("multihop_rag", "retrieval", "M3"),
