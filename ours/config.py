@@ -110,6 +110,12 @@ CHUNK_CONTEXT_TOKEN_RATIO = 0.85
 # --- Step 9: prompt -------------------------------------------------------
 
 ABSTENTION_RETRIEVAL_CONFIDENCE_THRESHOLD = 0.40
+# The design shows each aspect's confidence and marks those below the
+# threshold. Development v0 found the marker drove refusals (60 % of flagged
+# NarrativeQA questions refused) and misfired (correct answers at confidence
+# 0.03-0.22), so v1 shows neither; v2 tests the score alone.
+PASS_RETRIEVAL_CONFIDENCE_TO_LLM = False
+MARK_LOW_CONFIDENCE = False
 
 # The exact refusal the scorers recognise (src/config.ABSTENTION_RESPONSE).
 REFUSAL = "No answer available."
@@ -140,12 +146,18 @@ HYDE_PROMPT = (
     "hypothetical. Output only the passage."
 )
 
+# The answer prompt is the baselines' own (src/config.BASE_ANSWER_SYSTEM_PROMPT),
+# so ours asks for the same answer form as M1-M4, plus one line on reading
+# the orientation. v0's design prompt ("address each aspect", "synthesize")
+# drew paragraph answers: 33.5 words on average against 2.6-word golds.
+ORIENTATION_LINE = (
+    "Orientation lines are context; primary evidence chunks are reliable; if "
+    "they conflict, trust the chunk."
+)
 ANSWER_PROMPT = (
-    "Answer the user question using only the provided evidence. Address each "
-    "aspect. Orientation summaries are context; primary evidence chunks are "
-    "reliable. If a summary and a chunk conflict, trust the chunk. Aspects "
-    "marked LOW CONFIDENCE have weak evidence; do not fabricate for them. "
-    "Synthesize the aspects into one final answer. Be concise and factual. "
+    "Answer the user's question using only the provided evidence. "
     f"If the evidence does not contain the answer, respond with exactly: "
-    f"'{REFUSAL}' and nothing else."
+    f"'{REFUSAL}'. "
+    "Do not fabricate; do not guess. Be concise and factual. "
+    + ORIENTATION_LINE
 )

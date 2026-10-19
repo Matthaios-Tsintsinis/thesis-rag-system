@@ -674,8 +674,11 @@ def build_context(aspects, aspect_chunks, aspect_orientation, global_chunks):
     """The evidence block in the design's layout: each aspect, then the global view."""
     lines, number = [], 0
     for a, chunks, orient in zip(aspects, aspect_chunks, aspect_orientation):
-        header = f"[Aspect: {a.name}] (retrieval_confidence: {a.confidence:.2f})"
-        if a.confidence < settings.ABSTENTION_RETRIEVAL_CONFIDENCE_THRESHOLD:
+        header = f"[Aspect: {a.name}]"
+        if settings.PASS_RETRIEVAL_CONFIDENCE_TO_LLM:
+            header += f" (retrieval_confidence: {a.confidence:.2f})"
+        if (settings.MARK_LOW_CONFIDENCE and a.confidence
+                < settings.ABSTENTION_RETRIEVAL_CONFIDENCE_THRESHOLD):
             header += " [LOW CONFIDENCE]"
         lines.append(header)
         lines += [f"  [Orientation: {text}]" for _, _, text in orient]

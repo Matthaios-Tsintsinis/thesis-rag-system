@@ -5,6 +5,7 @@ views, and the answer prompt's exact refusal."""
 from __future__ import annotations
 
 import unittest
+from unittest import mock
 
 from ours import config as settings
 from ours import model as om
@@ -123,20 +124,40 @@ class TestAnswerPrompt(unittest.TestCase):
         from src.config import ABSTENTION_RESPONSE
         self.assertEqual(settings.REFUSAL, ABSTENTION_RESPONSE)
 
-    def test_prompt_ends_with_the_exact_refusal_clause(self):
-        self.assertTrue(settings.ANSWER_PROMPT.endswith(
-            "respond with exactly: 'No answer available.' and nothing else."))
+    def test_prompt_is_the_baselines_plus_the_orientation_line(self):
+        """Ours asks for the same answer form as M1-M4, plus one line on orientation."""
+        from src.config import BASE_ANSWER_SYSTEM_PROMPT
+        self.assertEqual(settings.ANSWER_PROMPT,
+                         BASE_ANSWER_SYSTEM_PROMPT + " " + settings.ORIENTATION_LINE)
 
-    def test_low_confidence_marks_the_context_not_the_instruction(self):
-        """A low-confidence aspect changes its header, never the prompt."""
+    def _contexts(self, **switches):
         high = om.Aspect(name="main", text=Q, importance=1.0)
         high.confidence = 0.9
         low = om.Aspect(name="main", text=Q, importance=1.0)
         low.confidence = 0.1
-        ctx_high = om.build_context([high], [["Paris."]], [[]], [])
-        ctx_low = om.build_context([low], [["Paris."]], [[]], [])
-        self.assertNotIn("LOW CONFIDENCE", ctx_high)
-        self.assertIn("[LOW CONFIDENCE]", ctx_low)
+        with mock.patch.multiple(settings, **switches):
+            return (om.build_context([high], [["Paris."]], [[]], []),
+                    om.build_context([low], [["Paris."]], [[]], []))
+
+    def test_confidence_signal_is_off_by_default(self):
+        """v1 shows neither the score nor the low-confidence marker."""
+        for ctx in self._contexts(PASS_RETRIEVAL_CONFIDENCE_TO_LLM=False,
+                                  MARK_LOW_CONFIDENCE=False):
+            self.assertEqual(ctx.splitlines()[0], "[Aspect: main]")
+        self.assertFalse(settings.PASS_RETRIEVAL_CONFIDENCE_TO_LLM)
+        self.assertFalse(settings.MARK_LOW_CONFIDENCE)
+
+    def test_score_alone_can_be_shown(self):
+        high, low = self._contexts(PASS_RETRIEVAL_CONFIDENCE_TO_LLM=True,
+                                   MARK_LOW_CONFIDENCE=False)
+        self.assertEqual(low.splitlines()[0],
+                         "[Aspect: main] (retrieval_confidence: 0.10)")
+
+    def test_marker_follows_the_threshold(self):
+        high, low = self._contexts(PASS_RETRIEVAL_CONFIDENCE_TO_LLM=True,
+                                   MARK_LOW_CONFIDENCE=True)
+        self.assertNotIn("LOW CONFIDENCE", high)
+        self.assertIn("[LOW CONFIDENCE]", low)
 
 
 if __name__ == "__main__":
