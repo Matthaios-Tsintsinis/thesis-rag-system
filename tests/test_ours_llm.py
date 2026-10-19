@@ -139,13 +139,10 @@ class TestAnswerPrompt(unittest.TestCase):
             return (om.build_context([high], [["Paris."]], [[]], []),
                     om.build_context([low], [["Paris."]], [[]], []))
 
-    def test_confidence_signal_is_off_by_default(self):
-        """v1 shows neither the score nor the low-confidence marker."""
+    def test_signal_off_shows_neither_score_nor_marker(self):
         for ctx in self._contexts(PASS_RETRIEVAL_CONFIDENCE_TO_LLM=False,
                                   MARK_LOW_CONFIDENCE=False):
             self.assertEqual(ctx.splitlines()[0], "[Aspect: main]")
-        self.assertFalse(settings.PASS_RETRIEVAL_CONFIDENCE_TO_LLM)
-        self.assertFalse(settings.MARK_LOW_CONFIDENCE)
 
     def test_score_alone_can_be_shown(self):
         high, low = self._contexts(PASS_RETRIEVAL_CONFIDENCE_TO_LLM=True,

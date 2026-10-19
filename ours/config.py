@@ -113,8 +113,8 @@ ABSTENTION_RETRIEVAL_CONFIDENCE_THRESHOLD = 0.40
 # The design shows each aspect's confidence and marks those below the
 # threshold. Development v0 found the marker drove refusals (60 % of flagged
 # NarrativeQA questions refused) and misfired (correct answers at confidence
-# 0.03-0.22), so v1 shows neither; v2 tests the score alone.
-PASS_RETRIEVAL_CONFIDENCE_TO_LLM = False
+# 0.03-0.22), so v1 showed neither; v2 shows the score alone.
+PASS_RETRIEVAL_CONFIDENCE_TO_LLM = True
 MARK_LOW_CONFIDENCE = False
 
 # The exact refusal the scorers recognise (src/config.ABSTENTION_RESPONSE).
