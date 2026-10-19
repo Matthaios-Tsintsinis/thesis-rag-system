@@ -64,11 +64,15 @@ class TestHeldOutDraws(unittest.TestCase):
         from datasets import Dataset
 
         rows = _hotpot_rows(1500)
+        printed = io.StringIO()
         with mock.patch("datasets.load_dataset",
-                        return_value=Dataset.from_list(rows)):
+                        return_value=Dataset.from_list(rows)), \
+                contextlib.redirect_stdout(printed):
             units = list(dev_ours.HeldOutHotpotQA().iter_eval_units(split="validation"))
             pooled = list(dev_ours.HeldOutHotpotQAPooled()
                           .iter_eval_units(split="validation"))
+        # The loader's own line names the registered seed; ours says what was drawn.
+        self.assertIn(f"seed {dev_ours.DEV_SEED}", printed.getvalue())
         expected = [f"hotpot::id{i}" for i in dev_ours.held_out_indices(1500)]
         self.assertEqual([u.corpus_id for u in units], expected)
         registered = {f"hotpot::id{i}" for i in subsample_indices(1500, 1000)}

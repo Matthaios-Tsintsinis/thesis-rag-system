@@ -75,6 +75,9 @@ class _HeldOutRows:
             self._measure(ds)
             self.stats["subsample_seed"] = DEV_SEED
             self.stats["held_out"] = True
+            # _measure prints the registered seed; this is what was drawn.
+            print(f"[dev] held-out draw: {len(ds)} questions outside the "
+                  f"registered {PREREGISTERED_Q}, seed {DEV_SEED}")
         return self._rows
 
 
