@@ -174,6 +174,71 @@ def ours_numbers(rows, golds, gold_docs) -> dict:
     }
 
 
+def inspect_rows(rows, golds, gold_docs, n_samples: int = 15) -> tuple[dict, list]:
+    """Where the answers win or lose: refusals, lengths, splits, and sample rows."""
+    from src.eval.scorers.extractive import normalize_qasper_answer
+
+    def mean(values):
+        values = list(values)
+        return sum(values) / len(values) if values else None
+
+    def f1(r):
+        return float(r["answer"]["value"])
+
+    def by(label_of, subset):
+        groups: dict = {}
+        for r in subset:
+            groups.setdefault(label_of(r), []).append(f1(r))
+        return {k: [len(v), mean(v)] for k, v in sorted(groups.items())}
+
+    answerable = [r for r in rows if r["answer"]["method"] != "unanswerable_rule"]
+    abstained = [r for r in answerable if (r["answer"].get("metadata") or {}).get("abstained")]
+    answered = [r for r in answerable if r not in abstained]
+    words = sorted(len((r.get("predicted_answer") or "").split()) for r in answerable)
+    yes_no = [r for r in answerable
+              if any(normalize_qasper_answer(g) in ("yes", "no") for g in golds[str(r["query_id"])])]
+    ranked = [r for r in answerable if gold_docs.get(str(r["query_id"]))]
+    found = [r for r in ranked if recall_at(r["metadata"]["ours_doc_ranking"],
+                                            gold_docs[str(r["query_id"])], 5) == 1.0]
+
+    def any_low(r):
+        return "some aspect low" if any(a["low_confidence"] for a in
+                                        r["metadata"]["ours_aspects"]) else "none low"
+
+    report = {
+        "n_rows": len(answerable),
+        "abstained_share": len(abstained) / len(answerable),
+        "exact_refusal_share": mean(int((r.get("predicted_answer") or "").strip()
+                                        == "No answer available.") for r in answerable),
+        "f1": mean(f1(r) for r in answerable),
+        "f1_answered": mean(f1(r) for r in answered),
+        "answer_words_mean": mean(words),
+        "answer_words_median": words[len(words) // 2] if words else None,
+        "answer_words_p90": words[int(0.9 * (len(words) - 1))] if words else None,
+        "gold_words_mean": mean(min(len(g.split()) for g in golds[str(r["query_id"])])
+                                for r in answerable if golds[str(r["query_id"])]),
+        "f1_by_type": by(lambda r: r.get("question_type") or "?", answerable),
+        "f1_yes_no_gold": [len(yes_no), mean(f1(r) for r in yes_no)],
+        "f1_by_low_confidence": by(any_low, answerable),
+        "abstained_by_low_confidence": {
+            k: mean(int(r in abstained) for r in answerable if any_low(r) == k)
+            for k in ("some aspect low", "none low")},
+        "f1_by_n_aspects": by(lambda r: str(len(r["metadata"]["ours_aspects"])), answerable),
+        "all_gold_in_top5_share": len(found) / len(ranked) if ranked else None,
+        "f1_when_all_gold_in_top5": mean(f1(r) for r in found),
+        "zero_f1_when_all_gold_in_top5": mean(int(f1(r) == 0.0) for r in found),
+    }
+    step = max(1, len(rows) // n_samples)
+    samples = [{"query_id": r["query_id"], "question": r["question_text"],
+                "gold": list(golds.get(str(r["query_id"]), ())),
+                "predicted": (r.get("predicted_answer") or "")[:400],
+                "f1": f1(r),
+                "aspects": [(a["name"], round(a["confidence"], 2))
+                            for a in r["metadata"]["ours_aspects"]]}
+               for r in rows[::step][:n_samples]]
+    return report, samples
+
+
 def golds_of(benchmark) -> tuple[dict, dict]:
     """Gold answers and gold documents per query id, from a loader's units."""
     from scripts.export_comparison import gold_texts
@@ -378,13 +443,34 @@ def main() -> None:
     r.add_argument("--version", required=True, help="Label for this development version.")
     r.add_argument("--lockfile", type=Path, default=Path("requirements.lock"))
     r.add_argument("--resume", action="store_true")
+    i = sub.add_parser("inspect", help="Answer-side breakdown of a development cell.")
+    i.add_argument("--benchmark", required=True, choices=sorted(HELD_OUT))
+    i.add_argument("--version", required=True)
     args = ap.parse_args()
     if args.command == "census":
         census(args.p11)
     elif args.command == "smoke":
         smoke()
+    elif args.command == "inspect":
+        inspect(args.benchmark, args.version)
     else:
         dev_run(args.benchmark, args.version, args.lockfile, args.resume)
+
+
+def inspect(benchmark: str, version: str) -> None:
+    """Print the answer-side breakdown and sample rows of one development cell."""
+    from src import paths
+
+    rows = read_rows(paths.output_dir() / "ours_dev" / version
+                     / f"{benchmark}_OURS_dev.jsonl")
+    golds, docs = golds_of(HELD_OUT[benchmark]())
+    report, samples = inspect_rows(rows, golds, docs)
+    print(json.dumps(report, indent=2))
+    for s in samples:
+        print(f"\n--- {s['query_id']}  f1={s['f1']:.3f}  aspects={s['aspects']}")
+        print(f"Q: {s['question']}")
+        print(f"gold: {s['gold']}")
+        print(f"answer: {s['predicted']}")
 
 
 if __name__ == "__main__":

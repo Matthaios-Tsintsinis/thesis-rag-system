@@ -115,6 +115,25 @@ class TestNumbers(unittest.TestCase):
         self.assertEqual(n["recall_at_5"], expected)
 
 
+class TestInspect(unittest.TestCase):
+    """The answer-side breakdown read from a cell's rows."""
+
+    def test_breakdown_from_smoke_rows(self):
+        with tempfile.TemporaryDirectory() as td:
+            rows = run_cell(Path(td) / "cache", Path(td) / "o.jsonl")
+        golds, docs = dev_ours.golds_of(TwoHotpotUnits())
+        report, samples = dev_ours.inspect_rows(rows, golds, docs, n_samples=2)
+        # Unit 0 answers "the river" (F1 1.0); unit 1 refuses.
+        self.assertEqual(report["abstained_share"], 0.5)
+        self.assertEqual(report["exact_refusal_share"], 0.5)
+        self.assertEqual(report["f1_answered"], 1.0)
+        self.assertEqual(report["answer_words_mean"], 2.5)
+        self.assertEqual(report["f1_by_type"], {"bridge": [2, 0.5]})
+        self.assertEqual(report["f1_by_n_aspects"], {"1": [1, 0.0], "2": [1, 1.0]})
+        self.assertEqual([s["query_id"] for s in samples], ["q0", "q1"])
+        self.assertEqual(samples[1]["predicted"], "No answer available.")
+
+
 class TestCensus(unittest.TestCase):
     """The census counts warm trees under the recorded topology string."""
 
