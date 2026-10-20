@@ -161,6 +161,7 @@ def ours_numbers(rows, golds, gold_docs) -> dict:
         **{f"recall_at_{k}": mean(recall_at(r["metadata"]["ours_doc_ranking"],
                                             gold_docs[str(r["query_id"])], k)
                                   for r in ranked) for k in (1, 5, 10)},
+        "map_at_10": mean(float(r["retrieval"]["map_at_k"]["10"]) for r in ranked),
         "parse_failure_rate": mean(int(m["ours_parse_failed"]) for m in meta),
         "mean_llm_calls": mean(m["ours_n_llm_calls"] for m in meta),
         "mean_aspects": mean(len(m["ours_aspects"]) for m in meta),
@@ -224,6 +225,7 @@ def inspect_rows(rows, golds, gold_docs, n_samples: int = 15) -> tuple[dict, lis
             k: mean(int(r in abstained) for r in answerable if any_low(r) == k)
             for k in ("some aspect low", "none low")},
         "f1_by_n_aspects": by(lambda r: str(len(r["metadata"]["ours_aspects"])), answerable),
+        "map_at_10": mean(float(r["retrieval"]["map_at_k"]["10"]) for r in ranked),
         "all_gold_in_top5_share": len(found) / len(ranked) if ranked else None,
         "f1_when_all_gold_in_top5": mean(f1(r) for r in found),
         "zero_f1_when_all_gold_in_top5": mean(int(f1(r) == 0.0) for r in found),
@@ -237,6 +239,45 @@ def inspect_rows(rows, golds, gold_docs, n_samples: int = 15) -> tuple[dict, lis
                             for a in r["metadata"]["ours_aspects"]]}
                for r in rows[::step][:n_samples]]
     return report, samples
+
+
+def compare_versions(rows_a, rows_b, golds) -> dict:
+    """Version b against version a on the same questions: F1, EM and refusals, paired."""
+    import numpy as np
+
+    from scripts.export_comparison import NULL_METHOD
+    from scripts.report_ours import SEED, bootstrap_ci, permutation_p
+    from src.eval.scorers.extractive import normalize_qasper_answer
+
+    a = {str(r["query_id"]): r for r in rows_a if r["answer"]["method"] != NULL_METHOD}
+    b = {str(r["query_id"]): r for r in rows_b if r["answer"]["method"] != NULL_METHOD}
+    keys = sorted(a.keys() & b.keys())
+
+    def f1(r):
+        return float(r["answer"]["value"])
+
+    def em(r):
+        pred = normalize_qasper_answer(r.get("predicted_answer") or "")
+        return float(max((pred == normalize_qasper_answer(g) for g in golds[str(r["query_id"])]),
+                         default=False))
+
+    def refused(r):
+        return float(bool((r["answer"].get("metadata") or {}).get("abstained")))
+
+    out = {"n": len(keys),
+           "n_answers_changed": sum(a[k].get("predicted_answer") != b[k].get("predicted_answer")
+                                    for k in keys),
+           "refusal_a": sum(refused(a[k]) for k in keys) / len(keys),
+           "refusal_b": sum(refused(b[k]) for k in keys) / len(keys)}
+    # The grid's paired sign-flip test and bootstrap, seeded the same way.
+    rng = np.random.default_rng(SEED)
+    for name, value in (("f1", f1), ("em", em)):
+        d = np.asarray([value(b[k]) - value(a[k]) for k in keys], dtype=float)
+        lo, hi = bootstrap_ci(d, rng)
+        out[name] = {"a": sum(value(a[k]) for k in keys) / len(keys),
+                     "b": sum(value(b[k]) for k in keys) / len(keys),
+                     "delta": float(d.mean()), "ci": [lo, hi], "p": permutation_p(d, rng)}
+    return out
 
 
 def golds_of(benchmark) -> tuple[dict, dict]:
@@ -446,7 +487,20 @@ def main() -> None:
     i = sub.add_parser("inspect", help="Answer-side breakdown of a development cell.")
     i.add_argument("--benchmark", required=True, choices=sorted(HELD_OUT))
     i.add_argument("--version", required=True)
+    v = sub.add_parser("compare", help="Two development versions, paired on the same questions.")
+    v.add_argument("--benchmark", required=True, choices=sorted(HELD_OUT))
+    v.add_argument("--a", required=True, help="The earlier version.")
+    v.add_argument("--b", required=True, help="The later version.")
     args = ap.parse_args()
+    if args.command == "compare":
+        from src import paths
+
+        def rows_of(version):
+            return read_rows(paths.output_dir() / "ours_dev" / version
+                             / f"{args.benchmark}_OURS_dev.jsonl")
+        golds, _ = golds_of(HELD_OUT[args.benchmark]())
+        print(json.dumps(compare_versions(rows_of(args.a), rows_of(args.b), golds), indent=2))
+        return
     if args.command == "census":
         census(args.p11)
     elif args.command == "smoke":

@@ -113,6 +113,41 @@ class TestNumbers(unittest.TestCase):
         expected = sum(dev_ours.recall_at(r["metadata"]["ours_doc_ranking"],
                                           docs[r["query_id"]], 5) for r in rows) / 2
         self.assertEqual(n["recall_at_5"], expected)
+        self.assertEqual(n["map_at_10"],
+                         sum(r["retrieval"]["map_at_k"]["10"] for r in rows) / 2)
+
+
+def _answer_row(qid, value, predicted, abstained=False):
+    """A row reduced to what the version comparison reads."""
+    return {"query_id": qid, "predicted_answer": predicted,
+            "answer": {"value": value, "method": "token_f1",
+                       "metadata": {"abstained": abstained}}}
+
+
+class TestCompareVersions(unittest.TestCase):
+    """Two versions compared question by question."""
+
+    def test_paired_deltas_and_changed_answers(self):
+        golds = {f"q{i}": ("Paris",) for i in range(40)}
+        a = [_answer_row(f"q{i}", 0.0, "No answer available.", True)
+             for i in range(40)]
+        b = [_answer_row(f"q{i}", 1.0, "Paris") if i < 30 else a[i]
+             for i in range(40)]
+        out = dev_ours.compare_versions(a, b, golds)
+        self.assertEqual(out["n"], 40)
+        self.assertEqual(out["n_answers_changed"], 30)
+        self.assertEqual(out["f1"]["delta"], 0.75)
+        self.assertEqual(out["em"]["delta"], 0.75)
+        self.assertEqual((out["refusal_a"], out["refusal_b"]), (1.0, 0.25))
+        self.assertLess(out["f1"]["p"], 0.001)
+        self.assertGreater(out["f1"]["ci"][0], 0.0)
+
+    def test_identical_versions_show_no_difference(self):
+        golds = {"q0": ("Paris",), "q1": ("Rome",)}
+        rows = [_answer_row("q0", 1.0, "Paris"), _answer_row("q1", 0.0, "Oslo")]
+        out = dev_ours.compare_versions(rows, rows, golds)
+        self.assertEqual((out["f1"]["delta"], out["f1"]["p"], out["n_answers_changed"]),
+                         (0.0, 1.0, 0))
 
 
 class TestInspect(unittest.TestCase):
@@ -130,6 +165,8 @@ class TestInspect(unittest.TestCase):
         self.assertEqual(report["answer_words_mean"], 2.5)
         self.assertEqual(report["f1_by_type"], {"bridge": [2, 0.5]})
         self.assertEqual(report["f1_by_n_aspects"], {"1": [1, 0.0], "2": [1, 1.0]})
+        self.assertEqual(report["map_at_10"],
+                         sum(r["retrieval"]["map_at_k"]["10"] for r in rows) / 2)
         self.assertEqual([s["query_id"] for s in samples], ["q0", "q1"])
         self.assertEqual(samples[1]["predicted"], "No answer available.")
 
