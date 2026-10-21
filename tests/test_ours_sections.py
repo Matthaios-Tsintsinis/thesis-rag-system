@@ -13,6 +13,19 @@ from src.parsing import clean_text
 from src.raptor_paper import split_text_raptor
 
 
+# The fixtures are sized for a 30-chunk block; development tunes the real
+# value, so these tests pin their own.
+_BLOCK = mock.patch.object(settings, "SECTION_SIZE_CHUNKS", 30)
+
+
+def setUpModule():
+    _BLOCK.start()
+
+
+def tearDownModule():
+    _BLOCK.stop()
+
+
 def _chunks(text: str) -> list[str]:
     """Chunk a document the way M4 does: cleaned, then 100-token pieces."""
     return [s.text for s in split_text_raptor(clean_text(text), max_tokens=100)]
