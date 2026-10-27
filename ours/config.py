@@ -78,10 +78,8 @@ NEIGHBOR_SCORE_DISCOUNT = 0.9
 # many chunks. Heading families are tried in order and the first with at
 # least MIN_HEADINGS placed headings wins; a heading closer than
 # MIN_SECTION_CHUNKS to the one before is dropped. Tuned only on the
-# held-out NarrativeQA stories. Development v3 tests 60 against the starting
-# value of 30 (decision rule, set before the run: keep 60 only if NarrativeQA
-# F1 rises with a paired CI clear of zero).
-SECTION_SIZE_CHUNKS = 60
+# held-out NarrativeQA stories.
+SECTION_SIZE_CHUNKS = 30
 HEADING_PATTERNS = (
     ("markdown", r"^#{1,6}\s+\S"),
     ("numbered", r"^\d+(\.\d+)*\.?\s+[A-Z][^.!?]*$"),
