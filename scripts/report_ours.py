@@ -66,7 +66,9 @@ FAMILY_O = (("multihop_rag", "retrieval", "M3"),
 # HotpotQA cells credit nothing: the yes/no guard scores a refusal 0.
 RECORDED_OURS: dict = {"hotpotqa": (0, 0.0), "hotpotqa_pooled": (0, 0.0)}
 # Ours' code fingerprint at the freeze; every scored row must carry it.
-FROZEN_CODE: str | None = None
+# Frozen 2026-10-27 at 26a28e3: development v2, the model v2's held-out
+# rows measured.
+FROZEN_CODE: str | None = "d975038e7513cf11"
 
 # The grid's constants (significance_diagnostic at the tag).
 N_PERM = 10_000

@@ -106,6 +106,11 @@ class TestOursCellGates(unittest.TestCase):
         with self.assertRaises(SystemExit):
             ro.check_code({"x": self._rows()}, frozen="c9")
 
+    def test_frozen_code_is_the_model_in_the_tree(self):
+        """The freeze names the model as it stands; a later edit to ours/ fails here."""
+        from ours.model import CODE_FINGERPRINT
+        self.assertEqual(ro.FROZEN_CODE, CODE_FINGERPRINT)
+
     def test_unrecorded_refusal_battery_refuses_and_says_what_to_record(self):
         rows = [{"query_id": "q0", "predicted_answer": "No answer available.",
                  "answer": {"value": 0.5, "method": "token_f1",
