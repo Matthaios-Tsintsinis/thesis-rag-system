@@ -64,7 +64,10 @@ FAMILY_O = (("multihop_rag", "retrieval", "M3"),
 
 # Credited refusals per ours cell: recorded at the first export, then gated.
 # HotpotQA cells credit nothing: the yes/no guard scores a refusal 0.
-RECORDED_OURS: dict = {"hotpotqa": (0, 0.0), "hotpotqa_pooled": (0, 0.0)}
+# MultiHop and NarrativeQA recorded 2026-10-29 from the scored cells at
+# 616abc8; the NarrativeQA mass (1.0357...) is rounded to 2 dp like the bank's.
+RECORDED_OURS: dict = {"hotpotqa": (0, 0.0), "hotpotqa_pooled": (0, 0.0),
+                       "multihop_rag": (418, 209.0), "narrativeqa": (4, 1.04)}
 # Ours' code fingerprint at the freeze; every scored row must carry it.
 # Frozen 2026-10-27 at 26a28e3: development v2, the model v2's held-out
 # rows measured.
