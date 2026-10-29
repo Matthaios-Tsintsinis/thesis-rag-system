@@ -5,6 +5,9 @@
   smoke   two held-out HotpotQA units through the runner loop on a CPU:
           real loader and embedder, reader and cross-encoder faked
   run     one held-out development cell; appends its scores to DEV_LOG.jsonl
+  replay  the decomposition call alone over a scored benchmark's questions,
+          with more room than the scored cap, raw replies saved: why the
+          aspect parse fails (reads questions only, never gold or scores)
 
 Held-out data: HotpotQA validation questions outside the registered 1,000
 (both variants) and NarrativeQA validation stories outside the registered 40.
@@ -15,9 +18,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import tempfile
 import time
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
@@ -471,6 +476,157 @@ def dev_run(benchmark: str, version: str, lockfile: Path, resume: bool) -> dict:
     return line
 
 
+# --- decomposition replay -------------------------------------------------
+
+REPLAY_CAP = 512
+
+
+def reply_failure(raw: str, question: str) -> str | None:
+    """Why parse_aspects refuses a decomposition reply; None when it reads it."""
+    from ours.model import parse_aspects
+
+    if parse_aspects(raw, question) is not None:
+        return None
+    # The same steps as parse_aspects, stopping at the first that fails.
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
+    if "{" not in text:
+        return "no_json"
+    for candidate in (text, text[text.find("{"): text.rfind("}") + 1]):
+        try:
+            obj = json.loads(candidate)
+        except ValueError:
+            continue
+        if not isinstance(obj, dict):
+            return "not_object"
+        if obj.get("type") not in ("simple", "multi_aspect"):
+            return "bad_type"
+        return "bad_aspects"
+    return "bad_json"
+
+
+def replay_row(query, generate_ids, decode, stop, cap: int, banked: dict) -> dict:
+    """One question's decomposition as the scored cell saw it, and with room to finish."""
+    from ours.model import decompose, parse_aspects
+
+    seen = {}
+
+    def ask(system_prompt, user_prompt, max_tokens):
+        # Greedy decoding: the first max_tokens of a longer reply are the
+        # scored reply, so one generation gives both.
+        seen["ids"] = generate_ids(system_prompt, user_prompt, cap)
+        seen["scored_cap"] = max_tokens
+        return decode(seen["ids"][:max_tokens])
+
+    aspects, failed = decompose(query.question_text, ask)
+    ids, scored_cap = seen["ids"], seen["scored_cap"]
+    n_tokens = len(ids) - (1 if ids and ids[-1] in stop else 0)
+    reply, full = decode(ids[:scored_cap]), decode(ids)
+    return {"query_id": query.query_id, "question_type": query.question_type,
+            "question": query.question_text, "n_tokens": n_tokens,
+            "ended": n_tokens < len(ids), "cut": n_tokens > scored_cap,
+            "parse_failed": failed,
+            "failure": reply_failure(reply, query.question_text) if failed else None,
+            "parses_with_room": parse_aspects(full, query.question_text) is not None,
+            "n_aspects": len(aspects), "reply": reply,
+            "reply_full": None if full == reply else full,
+            "banked_parse_failed": banked.get(query.query_id)}
+
+
+def replay_summary(rows) -> dict:
+    """Counts over replayed decompositions: failure causes and the reproduction check."""
+    failed = [r for r in rows if r["parse_failed"]]
+    checked = [r for r in rows if r["banked_parse_failed"] is not None]
+    tokens = sorted(r["n_tokens"] for r in rows)
+    by_type: dict = {}
+    for r in rows:
+        n, k = by_type.get(r["question_type"], (0, 0))
+        by_type[r["question_type"]] = (n + 1, k + int(r["parse_failed"]))
+    return {
+        "n": len(rows), "n_parse_failed": len(failed),
+        "failure": dict(Counter(r["failure"] for r in failed).most_common()),
+        "failed_and_cut": sum(r["cut"] for r in failed),
+        "failed_but_parse_with_room": sum(r["parses_with_room"] for r in failed),
+        "never_ended": sum(not r["ended"] for r in rows),
+        "tokens": {q: tokens[min(len(tokens) - 1, int(f * len(tokens)))]
+                   for q, f in (("p50", 0.5), ("p90", 0.9), ("p99", 0.99), ("max", 1.0))}
+                  if tokens else {},
+        "failure_rate_by_type": {t: round(k / n, 4) for t, (n, k) in sorted(by_type.items())},
+        "reproduction": {"checked": len(checked), "mismatched": sum(
+            r["parse_failed"] != r["banked_parse_failed"] for r in checked)},
+    }
+
+
+def reader_ids():
+    """(generate_ids, decode, stop tokens) for the shared reader, as the runner calls it."""
+    import torch
+
+    from src import models
+
+    cfg = llama_config().generation
+    tokenizer, model = models.load_generator(cfg.model)
+
+    def generate_ids(system_prompt, user_prompt, max_new_tokens):
+        # src/models.py::_generate_local, returning the generated ids.
+        messages = [{"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}]
+        prompt_text = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True)
+        inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
+        with torch.no_grad():
+            out = model.generate(**inputs, max_new_tokens=max_new_tokens,
+                                 do_sample=cfg.temperature > 0,
+                                 temperature=max(cfg.temperature, 1e-5),
+                                 top_p=cfg.top_p, pad_token_id=tokenizer.eos_token_id)
+        return out[0, inputs["input_ids"].shape[1]:].tolist()
+
+    def decode(ids):
+        return tokenizer.decode(ids, skip_special_tokens=True).strip()
+
+    eos = model.generation_config.eos_token_id
+    stop = set(eos if isinstance(eos, (list, tuple)) else [eos]) | {tokenizer.eos_token_id}
+    return generate_ids, decode, stop
+
+
+def replay(benchmark: str, lockfile: Path, banked: Path | None, out: Path | None,
+           resume: bool, cap: int = REPLAY_CAP, reader=reader_ids) -> dict:
+    """Replay every decomposition of a scored benchmark; rows and a summary beside them."""
+    from ours.model import CODE_FINGERPRINT
+    from src import paths
+    from src.eval.runner import BENCHMARK_REGISTRY, _git_commit_short, assert_environment_pinned
+
+    assert_environment_pinned(lockfile)
+    out = out or (paths.output_dir() / "ours_diag"
+                  / f"{benchmark}_decompose_{CODE_FINGERPRINT}.jsonl")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if out.exists() and not resume:
+        raise SystemExit(f"[replay] REFUSED: {out} exists; pass --resume to continue it")
+    if out.exists():
+        # Cut a half-written last line before appending.
+        data = out.read_bytes()
+        if data and not data.endswith(b"\n"):
+            with out.open("r+b") as f:
+                f.truncate(data.rfind(b"\n") + 1)
+    done = {r["query_id"] for r in read_rows(out)} if out.exists() else set()
+    flags = ({str(r["query_id"]): bool(r["metadata"]["ours_parse_failed"])
+              for r in read_rows(banked)} if banked else {})
+    generate_ids, decode, stop = reader()
+    for unit in BENCHMARK_REGISTRY[benchmark]().iter_eval_units(split="validation"):
+        for q in unit.queries:
+            if q.query_id in done:
+                continue
+            row = replay_row(q, generate_ids, decode, stop, cap, flags)
+            # Open and close per row: a mounted Drive uploads a file on close.
+            with out.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    summary = {"benchmark": benchmark, "ours_code": CODE_FINGERPRINT, "cap": cap,
+               "scored_cap": settings.DECOMPOSE_MAX_TOKENS,
+               "git_commit": _git_commit_short(), **replay_summary(read_rows(out))}
+    out.with_suffix(".summary.json").write_text(json.dumps(summary, indent=2),
+                                                encoding="utf-8")
+    print(json.dumps(summary, indent=2))
+    return summary
+
+
 def main() -> None:
     """Parse the subcommand and run it."""
     ap = argparse.ArgumentParser(description=__doc__,
@@ -491,7 +647,19 @@ def main() -> None:
     v.add_argument("--benchmark", required=True, choices=sorted(HELD_OUT))
     v.add_argument("--a", required=True, help="The earlier version.")
     v.add_argument("--b", required=True, help="The later version.")
+    p = sub.add_parser("replay", help="Decomposition replies over a scored benchmark's questions.")
+    p.add_argument("--benchmark", required=True, choices=SCORED_BENCHMARKS)
+    p.add_argument("--banked", type=Path, default=None,
+                   help="The scored ours cell, to check the replay reproduces its parse flags.")
+    p.add_argument("--out", type=Path, default=None,
+                   help="Default: OUTPUT_DIR/ours_diag/<benchmark>_decompose_<code>.jsonl")
+    p.add_argument("--cap", type=int, default=REPLAY_CAP)
+    p.add_argument("--lockfile", type=Path, default=Path("requirements.lock"))
+    p.add_argument("--resume", action="store_true")
     args = ap.parse_args()
+    if args.command == "replay":
+        replay(args.benchmark, args.lockfile, args.banked, args.out, args.resume, args.cap)
+        return
     if args.command == "compare":
         from src import paths
 

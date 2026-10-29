@@ -12,6 +12,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from scripts import dev_ours
@@ -244,6 +245,131 @@ class TestDevRun(unittest.TestCase):
                          ("v0", "hotpotqa", 2))
         from ours.model import CODE_FINGERPRINT
         self.assertEqual(line["ours_code"], CODE_FINGERPRINT)
+
+
+def _query(qid, text="Did A report X before B reported Y?", qtype="temporal_query"):
+    return SimpleNamespace(query_id=qid, question_text=text, question_type=qtype)
+
+
+def _long_reply(n_aspects=3, name_chars=100) -> str:
+    """A well-formed multi-aspect reply longer than the scored cap, one character a token."""
+    return json.dumps({"type": "multi_aspect", "aspects": [
+        {"name": f"{i}" + "x" * name_chars, "importance": 0.3} for i in range(n_aspects)]})
+
+
+class _CharReader:
+    """One token per character, 0 as end of sequence; records each call."""
+
+    def __init__(self, replies):
+        self.replies, self.calls = list(replies), []
+
+    def __call__(self):
+        def generate_ids(system_prompt, user_prompt, max_new_tokens):
+            self.calls.append((system_prompt, user_prompt, max_new_tokens))
+            return ([ord(c) for c in self.replies.pop(0)] + [0])[:max_new_tokens]
+
+        def decode(ids):
+            return "".join(chr(i) for i in ids if i).strip()
+
+        return generate_ids, decode, {0}
+
+
+class _ReplayBench:
+    def iter_eval_units(self, *, split):
+        yield SimpleNamespace(queries=[_query("q1"), _query("q2", qtype="comparison_query")])
+
+
+class TestDecomposeReplay(unittest.TestCase):
+    """The replay names why a decomposition fails and reproduces the scored reply."""
+
+    def test_failure_causes(self):
+        ok = '{"type": "multi_aspect", "aspects": [{"name": "who", "importance": 0.5}]}'
+        cases = {ok: None,
+                 'Here it is: {"type": "simple", "aspects": []} done': None,
+                 "The question asks two things.": "no_json",
+                 ok[:40]: "bad_json",
+                 '[{"name": "who"}]': "not_object",
+                 '{"type": "multi-aspect", "aspects": []}': "bad_type",
+                 '{"type": "multi_aspect", "aspects": [{"name": "who"}]}': "bad_aspects"}
+        for reply, cause in cases.items():
+            self.assertEqual(dev_ours.reply_failure(reply, "Who?"), cause, reply)
+
+    def test_a_reply_cut_at_the_scored_cap(self):
+        from ours import config as settings
+
+        reader = _CharReader([_long_reply()])
+        row = dev_ours.replay_row(_query("q1"), *reader(), cap=dev_ours.REPLAY_CAP,
+                                  banked={"q1": True})
+        self.assertGreater(len(_long_reply()), settings.DECOMPOSE_MAX_TOKENS)
+        self.assertEqual(reader.calls, [(settings.DECOMPOSE_PROMPT,
+                                         "Question: Did A report X before B reported Y?",
+                                         dev_ours.REPLAY_CAP)])
+        self.assertEqual((row["parse_failed"], row["failure"], row["cut"], row["ended"],
+                          row["parses_with_room"], row["n_aspects"], row["banked_parse_failed"]),
+                         (True, "bad_json", True, True, True, 1, True))
+        self.assertEqual(len(row["reply"]), settings.DECOMPOSE_MAX_TOKENS)
+        self.assertEqual(row["reply_full"], _long_reply())
+
+    def test_a_reply_that_fits(self):
+        reply = _long_reply(n_aspects=2, name_chars=5)
+        row = dev_ours.replay_row(_query("q1"), *_CharReader([reply])(), cap=512, banked={})
+        self.assertEqual((row["parse_failed"], row["failure"], row["cut"], row["n_aspects"],
+                          row["reply"], row["reply_full"], row["banked_parse_failed"]),
+                         (False, None, False, 2, reply, None, None))
+
+    def test_a_reply_that_never_ends(self):
+        row = dev_ours.replay_row(_query("q1"), *_CharReader(["{" * 600])(), cap=512,
+                                  banked={})
+        self.assertEqual((row["n_tokens"], row["ended"], row["cut"], row["parses_with_room"]),
+                         (512, False, True, False))
+
+    def test_summary_counts_causes_and_reproduction(self):
+        reader = _CharReader([_long_reply(), _long_reply(2, 5), "No JSON here."])
+        rows = [dev_ours.replay_row(_query(q, qtype=t), *reader(), cap=512,
+                                    banked={"q1": True, "q2": True})
+                for q, t in (("q1", "temporal_query"), ("q2", "temporal_query"),
+                             ("q3", "comparison_query"))]
+        s = dev_ours.replay_summary(rows)
+        self.assertEqual((s["n"], s["n_parse_failed"], s["failure"], s["failed_and_cut"],
+                          s["failed_but_parse_with_room"], s["never_ended"]),
+                         (3, 2, {"bad_json": 1, "no_json": 1}, 1, 1, 0))
+        self.assertEqual(s["failure_rate_by_type"],
+                         {"comparison_query": 1.0, "temporal_query": 0.5})
+        self.assertEqual(s["reproduction"], {"checked": 2, "mismatched": 1})
+
+    def test_replay_writes_resumes_and_refuses_to_overwrite(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            lock = root / "requirements.lock"
+            lock.write_text("# lock\nnumpy==0.0.0\n", encoding="utf-8")
+            banked = root / "banked.jsonl"
+            banked.write_text(json.dumps({"query_id": "q1",
+                                          "metadata": {"ours_parse_failed": True}}) + "\n",
+                              encoding="utf-8")
+            out = root / "diag" / "multihop_rag_decompose.jsonl"
+
+            def run(replies, resume):
+                with mock.patch.dict("src.eval.runner.BENCHMARK_REGISTRY",
+                                     {"multihop_rag": _ReplayBench}), \
+                        mock.patch("scripts.pin_environment.check_lockfile", return_value=0), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    return dev_ours.replay("multihop_rag", lock, banked, out, resume,
+                                           reader=_CharReader(replies))
+
+            first = run([_long_reply(), _long_reply(2, 5)], resume=False)
+            with self.assertRaises(SystemExit):
+                run([], resume=False)
+            # A dead session: q2's row half-written.
+            lines = out.read_text(encoding="utf-8").splitlines(keepends=True)
+            out.write_text(lines[0] + lines[1][:30], encoding="utf-8")
+            second = run([_long_reply(2, 5)], resume=True)
+            rows = dev_ours.read_rows(out)
+            summary = json.loads(out.with_suffix(".summary.json").read_text(encoding="utf-8"))
+        self.assertEqual([r["query_id"] for r in rows], ["q1", "q2"])
+        self.assertEqual(first["reproduction"], {"checked": 1, "mismatched": 0})
+        self.assertEqual(second, summary)
+        self.assertEqual((summary["n"], summary["n_parse_failed"], summary["cap"]),
+                         (2, 1, dev_ours.REPLAY_CAP))
 
 
 if __name__ == "__main__":
