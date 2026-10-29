@@ -2,7 +2,8 @@
 
   bar    the pooled MAP@10 Phase-2 target, from the six p11 pairs, after the
          same code reproduces the seven published Llama targets
-  table  outputs/ours/COMPARISON_OURS.{csv,md}: F1 | EM | R@5 per benchmark,
+  table  COMPARISON_OURS.{csv,md} into a scored round's bank (outputs/ours/
+         for round 1, outputs/ours_v<version>/ after): F1 | EM | R@5 per benchmark,
          Llama M1-M4 through the existing exporter's functions (checked
          against outputs/COMPARISON.csv) plus ours, and ours' mechanics
   stats  Family O (the three declared comparisons, Holm, m = 3) and Family
@@ -62,16 +63,22 @@ FAMILY_O = (("multihop_rag", "retrieval", "M3"),
             ("narrativeqa", "answer", "M2"),
             ("hotpotqa_pooled", "map10", "M3"))
 
-# Credited refusals per ours cell: recorded at the first export, then gated.
-# HotpotQA cells credit nothing: the yes/no guard scores a refusal 0.
-# MultiHop and NarrativeQA recorded 2026-10-29 from the scored cells at
-# 616abc8; the NarrativeQA mass (1.0357...) is rounded to 2 dp like the bank's.
-RECORDED_OURS: dict = {"hotpotqa": (0, 0.0), "hotpotqa_pooled": (0, 0.0),
-                       "multihop_rag": (418, 209.0), "narrativeqa": (4, 1.04)}
-# Ours' code fingerprint at the freeze; every scored row must carry it.
-# Frozen 2026-10-27 at 26a28e3: development v2, the model v2's held-out
-# rows measured.
-FROZEN_CODE: str | None = "d975038e7513cf11"
+# Ours' scored rounds, one bank each (docs/OURS_VERSIONS.md, "Scored rounds"),
+# keyed by the bank's directory name, latest last.
+# The code fingerprint every row of a bank must carry; None while the round's
+# version is still in development. Round 1, outputs/ours/: development v2,
+# frozen 2026-10-27 at 26a28e3, the model v2's held-out rows measured.
+FROZEN_CODE: dict = {"ours": "d975038e7513cf11", "ours_v4": None}
+# Credited refusals per bank and cell: recorded at the bank's first export,
+# then gated. HotpotQA cells credit nothing: the yes/no guard scores a refusal
+# 0. Round 1's MultiHop and NarrativeQA recorded 2026-10-29 from the scored
+# cells at 616abc8; the NarrativeQA mass (1.0357...) is rounded to 2 dp like
+# the bank's.
+RECORDED_OURS: dict = {
+    "ours": {"hotpotqa": (0, 0.0), "hotpotqa_pooled": (0, 0.0),
+             "multihop_rag": (418, 209.0), "narrativeqa": (4, 1.04)},
+    "ours_v4": {"hotpotqa": (0, 0.0), "hotpotqa_pooled": (0, 0.0)},
+}
 
 # The grid's constants (significance_diagnostic at the tag).
 N_PERM = 10_000
@@ -233,13 +240,22 @@ def credited(rows) -> tuple[int, float]:
     return n, mass
 
 
-def recorded_battery(benchmark, rows, recorded=RECORDED_OURS) -> tuple[int, float]:
+def recorded_battery(bank, benchmark, rows, recorded=RECORDED_OURS) -> tuple[int, float]:
     """The recorded credited-refusal count for an ours cell; refuse until it is recorded."""
-    if benchmark not in recorded:
-        raise SystemExit(f"[report] REFUSED: no recorded battery for ours/{benchmark}; "
-                         f"record RECORDED_OURS[{benchmark!r}] = {credited(rows)} "
+    if benchmark not in recorded.get(bank, {}):
+        raise SystemExit(f"[report] REFUSED: no recorded battery for {bank}/{benchmark}; "
+                         f"record RECORDED_OURS[{bank!r}][{benchmark!r}] = {credited(rows)} "
                          "in scripts/report_ours.py and export again")
-    return recorded[benchmark]
+    return recorded[bank][benchmark]
+
+
+def frozen_code_of(ours_dir: Path) -> str:
+    """The frozen fingerprint of a scored round's bank; refuse any other directory."""
+    if ours_dir.name not in FROZEN_CODE:
+        _fail(f"{ours_dir} is not a scored round's bank ({', '.join(FROZEN_CODE)})")
+    if FROZEN_CODE[ours_dir.name] is None:
+        _fail(f"round {ours_dir.name} is not frozen: its version is in development")
+    return FROZEN_CODE[ours_dir.name]
 
 
 # --- the table ------------------------------------------------------------------
@@ -274,7 +290,7 @@ def llama_row(p11: Path, benchmark, system, label, gold_map) -> dict:
 
 def ours_row(ours_dir: Path, benchmark, gold_map, gold_docs, rows) -> dict:
     """Ours' cell: the exporter's F1 and EM, R@K from the rows' document ranking."""
-    battery = recorded_battery(benchmark, rows)
+    battery = recorded_battery(ours_dir.name, benchmark, rows)
     cell = read_cell(ours_dir, LLAMA, benchmark, "OURS", {(LLAMA, benchmark, "OURS"): battery})
     summary = json.loads((ours_dir / f"{benchmark}_OURS_validation.summary.json")
                          .read_text(encoding="utf-8"))
@@ -304,6 +320,7 @@ def table(p11: Path, ours_dir: Path, comparison: Path) -> None:
 
     if ours_dir.resolve() == p11.resolve() or ours_dir.name in ("p10", "p11"):
         _fail(f"the ours bank {ours_dir} is a banked column")
+    frozen = frozen_code_of(ours_dir)
     published = {(r["benchmark"], r["system"]): r
                  for r in csv.DictReader(comparison.open(encoding="utf-8"))
                  if r["generator"] == LLAMA}
@@ -320,7 +337,7 @@ def table(p11: Path, ours_dir: Path, comparison: Path) -> None:
         golds, docs = golds_of(BENCHMARK_REGISTRY[benchmark]())
         rows_out.append(ours_row(ours_dir, benchmark, gold_maps[benchmark], docs, rows))
         mechanics[benchmark] = ours_numbers(rows, golds, docs)
-    check_code(cells, FROZEN_CODE)
+    check_code(cells, frozen)
     write_outputs(rows_out, mechanics, ours_dir)
 
 

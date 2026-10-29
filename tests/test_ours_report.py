@@ -8,6 +8,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -107,17 +108,35 @@ class TestOursCellGates(unittest.TestCase):
             ro.check_code({"x": self._rows()}, frozen="c9")
 
     def test_frozen_code_is_the_model_in_the_tree(self):
-        """The freeze names the model as it stands; a later edit to ours/ fails here."""
+        """The latest round's freeze names the model as it stands; a later edit
+        to ours/ fails here. A round still in development has no freeze yet."""
         from ours.model import CODE_FINGERPRINT
-        self.assertEqual(ro.FROZEN_CODE, CODE_FINGERPRINT)
+        latest = list(ro.FROZEN_CODE.values())[-1]
+        if latest is None:
+            self.skipTest("the latest round's version is in development")
+        self.assertEqual(latest, CODE_FINGERPRINT)
+
+    def test_every_round_has_its_batteries_and_round_one_stays_frozen(self):
+        self.assertEqual(list(ro.RECORDED_OURS), list(ro.FROZEN_CODE))
+        self.assertEqual(ro.FROZEN_CODE["ours"], "d975038e7513cf11")
+
+    def test_only_a_frozen_rounds_bank_is_reported(self):
+        self.assertEqual(ro.frozen_code_of(Path("outputs/ours")), "d975038e7513cf11")
+        for bank in ("outputs/ours_dev", "outputs/p11"):
+            with self.assertRaisesRegex(SystemExit, "not a scored round's bank"):
+                ro.frozen_code_of(Path(bank))
+        with mock.patch.dict(ro.FROZEN_CODE, {"ours_v9": None}):
+            with self.assertRaisesRegex(SystemExit, "not frozen"):
+                ro.frozen_code_of(Path("outputs/ours_v9"))
 
     def test_unrecorded_refusal_battery_refuses_and_says_what_to_record(self):
         rows = [{"query_id": "q0", "predicted_answer": "No answer available.",
                  "answer": {"value": 0.5, "method": "token_f1",
                             "metadata": {"abstained": True}}}]
         self.assertEqual(ro.credited(rows), (1, 0.5))
-        with self.assertRaisesRegex(SystemExit, r"\(1, 0\.5\)"):
-            ro.recorded_battery("multihop_rag", rows, recorded={})
+        with self.assertRaisesRegex(SystemExit, r"\['ours_v4'\]\['multihop_rag'\] = \(1, 0\.5\)"):
+            ro.recorded_battery("ours_v4", "multihop_rag", rows, recorded={})
+        self.assertEqual(ro.recorded_battery("ours", "multihop_rag", rows), (418, 209.0))
 
 
 class TestOursRowEndToEnd(unittest.TestCase):
