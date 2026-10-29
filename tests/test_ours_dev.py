@@ -285,11 +285,13 @@ class TestDecomposeReplay(unittest.TestCase):
     def test_failure_causes(self):
         ok = '{"type": "multi_aspect", "aspects": [{"name": "who", "importance": 0.5}]}'
         cases = {ok: None,
+                 ok[:-1]: None,
                  'Here it is: {"type": "simple", "aspects": []} done': None,
                  "The question asks two things.": "no_json",
                  ok[:40]: "bad_json",
                  '[{"name": "who"}]': "not_object",
                  '{"type": "multi-aspect", "aspects": []}': "bad_type",
+                 '{"type": "multi-aspect", "aspects": []': "bad_type",
                  '{"type": "multi_aspect", "aspects": [{"name": "who"}]}': "bad_aspects"}
         for reply, cause in cases.items():
             self.assertEqual(dev_ours.reply_failure(reply, "Who?"), cause, reply)

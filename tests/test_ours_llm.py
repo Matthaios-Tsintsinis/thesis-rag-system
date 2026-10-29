@@ -51,8 +51,28 @@ class TestParse(unittest.TestCase):
         for raw in (f"```json\n{body}\n```", f"Here it is: {body} Done."):
             self.assertIsNotNone(om.parse_aspects(raw, Q), raw)
 
+    def test_a_reply_one_brace_short_is_read(self):
+        """MultiHop's scored replies (v2): the reply ends after the aspects' ]."""
+        body = ('{"type": "multi_aspect", "aspects": ['
+                '{"name": "What is Twitch\'s revenue split?", "importance": 0.6}, '
+                '{"name": "Does it use \\"tiers\\" {or not}?", "importance": 0.4}]')
+        for raw in (body, f"```json\n{body}\n```"):
+            got = om.parse_aspects(raw, Q)
+            self.assertEqual([(a.text, a.importance) for a in got],
+                             [("What is Twitch's revenue split?", 0.6),
+                              ('Does it use "tiers" {or not}?', 0.4)], raw)
+
+    def test_close_brackets(self):
+        self.assertEqual(om.close_brackets('Here: {"a": [1, {"b": "]"}'), '{"a": [1, {"b": "]"}]}')
+        for text in ("no brace", '{"a": 1}', '{"a": "cut mid-str', '{"a": [1}', '{"a": 1}}'):
+            self.assertEqual(om.close_brackets(text), "", text)
+
     def test_unusable_replies_are_none(self):
         for raw in ("no json here", '{"type": "other"}',
+                    '{"type": "multi_aspect", "aspects": [{"name": "cut mid-na',
+                    '{"type": "multi_aspect", "aspects": [{"name": "x", "importance": 0.5},',
+                    '{"type": "multi_aspect", "aspects": [{"name": "Did "Fortune" say so?", '
+                    '"importance": 0.6}]',
                     '{"type": "multi_aspect", "aspects": []}',
                     '{"type": "multi_aspect", "aspects": [{"name": "x"}]}',
                     '{"type": "multi_aspect", "aspects": '

@@ -258,8 +258,11 @@ def parse_aspects(raw, question):
     """Read the decomposition reply; None when it cannot be used."""
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
     obj = None
-    # The reply itself, or the first {...} span when prose surrounds it.
-    for candidate in (text, text[text.find("{"): text.rfind("}") + 1]):
+    # The reply itself, the first {...} span when prose surrounds it, or the
+    # reply with the brackets it leaves open closed: Llama often ends a
+    # multi-aspect reply one } short.
+    for candidate in (text, text[text.find("{"): text.rfind("}") + 1],
+                      close_brackets(text)):
         try:
             obj = json.loads(candidate)
             break
@@ -285,6 +288,34 @@ def parse_aspects(raw, question):
             return None
         aspects.append(Aspect(name, name, importance))
     return aspects
+
+
+def close_brackets(text):
+    """The text from its first { with the brackets it leaves open closed; ""
+    when there is nothing to close or it cannot be closed (it ends inside a
+    string, or a bracket closes the wrong kind)."""
+    start = text.find("{")
+    if start < 0:
+        return ""
+    closers, in_string, escaped = [], False, False
+    for ch in text[start:]:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        elif ch == '"':
+            in_string = True
+        elif ch in "{[":
+            closers.append("}" if ch == "{" else "]")
+        elif ch in "}]":
+            if not closers or closers.pop() != ch:
+                return ""
+    if in_string or not closers:
+        return ""
+    return text[start:] + "".join(reversed(closers))
 
 
 def choose_aspects(aspects, question):

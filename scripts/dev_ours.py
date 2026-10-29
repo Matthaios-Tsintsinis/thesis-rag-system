@@ -483,7 +483,7 @@ REPLAY_CAP = 512
 
 def reply_failure(raw: str, question: str) -> str | None:
     """Why parse_aspects refuses a decomposition reply; None when it reads it."""
-    from ours.model import parse_aspects
+    from ours.model import close_brackets, parse_aspects
 
     if parse_aspects(raw, question) is not None:
         return None
@@ -491,7 +491,8 @@ def reply_failure(raw: str, question: str) -> str | None:
     text = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw.strip())
     if "{" not in text:
         return "no_json"
-    for candidate in (text, text[text.find("{"): text.rfind("}") + 1]):
+    for candidate in (text, text[text.find("{"): text.rfind("}") + 1],
+                      close_brackets(text)):
         try:
             obj = json.loads(candidate)
         except ValueError:
