@@ -702,18 +702,7 @@ def _ancestors(index, leaf):
 
 
 def build_context(aspects, aspect_chunks, aspect_orientation, global_chunks):
-    """The evidence block: flat (the orientation lines, then the label and
-    every chunk as [N] text), or the design's layout (each aspect, then the
-    global view)."""
-    if settings.EVIDENCE_LAYOUT == "flat":
-        orient = [f"[Orientation: {text}]" for lines in aspect_orientation
-                  for _, _, text in lines]
-        texts = [text for chunks in aspect_chunks for text in chunks] + list(global_chunks)
-        # The baselines' packer: "[N] text", blocks apart by a blank line.
-        blocks = ["\n".join(orient)] if orient else []
-        blocks.append("[Primary Evidence]")
-        blocks += [f"[{n}] {text}" for n, text in enumerate(texts, start=1)]
-        return "\n\n".join(blocks)
+    """The evidence block in the design's layout: each aspect, then the global view."""
     lines, number = [], 0
     for a, chunks, orient in zip(aspects, aspect_chunks, aspect_orientation):
         header = f"[Aspect: {a.name}]"
