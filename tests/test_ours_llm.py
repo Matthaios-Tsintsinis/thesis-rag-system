@@ -151,13 +151,57 @@ class TestAnswerPrompt(unittest.TestCase):
                          BASE_ANSWER_SYSTEM_PROMPT + " " + settings.ORIENTATION_LINE)
 
     def _contexts(self, **switches):
+        """The design's layout, one aspect of high and one of low confidence."""
         high = om.Aspect(name="main", text=Q, importance=1.0)
         high.confidence = 0.9
         low = om.Aspect(name="main", text=Q, importance=1.0)
         low.confidence = 0.1
-        with mock.patch.multiple(settings, **switches):
+        with mock.patch.multiple(settings, EVIDENCE_LAYOUT="aspects", **switches):
             return (om.build_context([high], [["Paris."]], [[]], []),
                     om.build_context([low], [["Paris."]], [[]], []))
+
+    def _flat(self, aspects, chunks, orientation, global_chunks):
+        with mock.patch.multiple(settings, EVIDENCE_LAYOUT="flat",
+                                 PASS_RETRIEVAL_CONFIDENCE_TO_LLM=True,
+                                 MARK_LOW_CONFIDENCE=True):
+            return om.build_context(aspects, chunks, orientation, global_chunks)
+
+    def test_flat_is_the_baselines_block_after_the_orientation(self):
+        """Orientation lines, the label, then every chunk in order as [N] text,
+        numbered across the aspects and the global view; no header, score or
+        marker."""
+        a = om.Aspect(name="Who directed Sinister?", text="Who directed Sinister?",
+                      importance=0.6)
+        b = om.Aspect(name="Where was he born?", text="Where was he born?", importance=0.4)
+        a.confidence, b.confidence = 0.9, 0.1
+        got = self._flat([a, b], [["Sinister is by Derrickson.", "It is a 2012 film."],
+                                  ["Derrickson was born in Denver."]],
+                         [[("title", ("d", 0), "Sinister")],
+                          [("summary", 7, "A film director.")]],
+                         ["Denver is in Colorado."])
+        self.assertEqual(got, "[Orientation: Sinister]\n[Orientation: A film director.]\n\n"
+                              "[Primary Evidence]\n\n"
+                              "[1] Sinister is by Derrickson.\n\n[2] It is a 2012 film.\n\n"
+                              "[3] Derrickson was born in Denver.\n\n[4] Denver is in Colorado.")
+
+    def test_flat_label_is_the_one_the_answer_prompt_names(self):
+        """ORIENTATION_LINE calls the primary evidence chunks reliable; the
+        flat block must carry that label (v5 without it refused more)."""
+        self.assertIn("primary evidence chunks", settings.ORIENTATION_LINE)
+        got = self._flat([om.Aspect(name="main", text=Q, importance=1.0)], [["Paris."]], [[]], [])
+        self.assertEqual(got.split("\n\n")[0], "[Primary Evidence]")
+
+    def test_flat_without_orientation_is_the_label_then_the_baselines_packer(self):
+        from src.prompt_packing import pack_context
+        texts = ["Paris.", "It is in France.", "Capital since 987."]
+        retrieved = [om.RetrievedChunk(chunk=om.Chunk(chunk_id=str(n), doc_id="d", text=t,
+                                                      n_words=len(t.split()), position=n),
+                                       score=1.0, rank=n)
+                     for n, t in enumerate(texts)]
+        a = om.Aspect(name="main", text=Q, importance=1.0)
+        a.confidence = 0.2
+        self.assertEqual(self._flat([a], [texts[:2]], [[]], texts[2:]),
+                         "[Primary Evidence]\n\n" + pack_context(retrieved)[2])
 
     def test_signal_off_shows_neither_score_nor_marker(self):
         for ctx in self._contexts(PASS_RETRIEVAL_CONFIDENCE_TO_LLM=False,
