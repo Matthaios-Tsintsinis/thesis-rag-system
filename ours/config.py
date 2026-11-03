@@ -109,20 +109,11 @@ CHUNK_CONTEXT_TOKEN_RATIO = 0.85
 
 # --- Step 9: prompt -------------------------------------------------------
 
-# The evidence block. "aspects" is the design's: each aspect's chunks under
-# its own header, then the global view. Development (round 2) found it loses
-# answers the evidence holds: with every gold sentence in context, two-aspect
-# questions refused 40 % against 17 % for one aspect, under v1 (no score) as
-# under v2. "flat" gives the reader the orientation lines, then every chunk
-# numbered as the baselines number theirs ([N] text), in the same order.
-EVIDENCE_LAYOUT = "flat"
-
 ABSTENTION_RETRIEVAL_CONFIDENCE_THRESHOLD = 0.40
 # The design shows each aspect's confidence and marks those below the
 # threshold. Development v0 found the marker drove refusals (60 % of flagged
 # NarrativeQA questions refused) and misfired (correct answers at confidence
-# 0.03-0.22), so v1 showed neither; v2 shows the score alone. Both apply to
-# the "aspects" layout only; "flat" has no headers.
+# 0.03-0.22), so v1 showed neither; v2 shows the score alone.
 PASS_RETRIEVAL_CONFIDENCE_TO_LLM = True
 MARK_LOW_CONFIDENCE = False
 
