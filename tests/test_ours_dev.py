@@ -107,7 +107,7 @@ class TestNumbers(unittest.TestCase):
         n = dev_ours.ours_numbers(rows, golds, docs)
         self.assertEqual(n["n_rows"], 2)
         self.assertEqual(n["parse_failure_rate"], 0.5)
-        self.assertEqual(n["mean_llm_calls"], 5.0)
+        self.assertEqual(n["mean_llm_calls"], 5.5)
         self.assertEqual(n["section_detector_share"], {"fixed": 1.0})
         self.assertEqual(len(n["code"]), 1)
         self.assertEqual(n["em"], 0.5)

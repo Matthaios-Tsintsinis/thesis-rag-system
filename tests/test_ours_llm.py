@@ -177,5 +177,45 @@ class TestAnswerPrompt(unittest.TestCase):
         self.assertIn("[LOW CONFIDENCE]", low)
 
 
+class TestShortAnswer(unittest.TestCase):
+    """shorten_answer keeps the answer's own words, or yes / no, and nothing else."""
+
+    LONG = "The film Sinister was directed by Scott Derrickson."
+
+    def _cut(self, reply, answer=LONG):
+        calls = []
+
+        def ask(system_prompt, user_prompt, max_tokens):
+            calls.append((system_prompt, user_prompt, max_tokens))
+            return reply
+        return om.shorten_answer(Q, answer, ask), calls
+
+    def test_the_cut_is_asked_with_its_prompt_and_cap(self):
+        _, calls = self._cut("Scott Derrickson")
+        self.assertEqual(calls, [(settings.SHORT_ANSWER_PROMPT,
+                                  f"Question: {Q}\nAnswer: {self.LONG}",
+                                  settings.SHORT_ANSWER_MAX_TOKENS)])
+
+    def test_a_phrase_from_the_answer_replaces_it(self):
+        self.assertEqual(self._cut("Scott Derrickson")[0], "Scott Derrickson")
+
+    def test_a_label_quotes_and_later_lines_are_dropped(self):
+        self.assertEqual(self._cut('Answer: "Scott Derrickson"\n\nHe directed it.')[0],
+                         "Scott Derrickson")
+
+    def test_yes_or_no_stands_though_the_answer_lacks_it(self):
+        self.assertEqual(self._cut("Yes", "Both were born in the United States.")[0], "Yes")
+
+    def test_a_cut_that_adds_a_word_leaves_the_answer(self):
+        self.assertEqual(self._cut("Scott Derrickson Jr")[0], self.LONG)
+
+    def test_a_cut_no_shorter_leaves_the_answer(self):
+        self.assertEqual(self._cut("the Derrickson", "Derrickson")[0], "Derrickson")
+
+    def test_an_empty_or_refusing_cut_leaves_the_answer(self):
+        for reply in ("", "   ", settings.REFUSAL):
+            self.assertEqual(self._cut(reply)[0], self.LONG)
+
+
 if __name__ == "__main__":
     unittest.main()

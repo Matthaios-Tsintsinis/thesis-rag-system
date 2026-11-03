@@ -161,3 +161,21 @@ ANSWER_PROMPT = (
     "Do not fabricate; do not guess. Be concise and factual. "
     + ORIENTATION_LINE
 )
+
+# --- Step 10: the answer --------------------------------------------------
+
+# One more call cuts the reader's answer to its shortest answering phrase
+# (development v7). Development (round 2, v4) found the gold inside a longer
+# answer for 77 / 82 of the answered held-out HotpotQA questions: answers of
+# about 20 words, at F1 0.31 / 0.29. The cut keeps only the answer's own
+# words, or yes / no; a cut that is not shorter, adds a word or refuses leaves
+# the answer as the reader gave it, and a refusal is never cut.
+SHORT_ANSWER = True
+SHORT_ANSWER_MAX_TOKENS = 32
+SHORT_ANSWER_PROMPT = (
+    "You shorten answers. Given a question and an answer to it, return only "
+    "the shortest phrase from the answer that fully answers the question: a "
+    "name, number, date or short phrase, not a sentence. If the question is "
+    "a yes/no question, return only yes or no. Use only words that appear in "
+    "the answer. Output only the short answer."
+)

@@ -57,10 +57,12 @@ def fake_cross_encoder(query, passages):
 class FakeReader:
     """Replaces src.models.generate: scripted replies, every config kept."""
 
-    def __init__(self, decompositions, answers, die_on_answer=None):
+    def __init__(self, decompositions, answers, die_on_answer=None, cuts=None):
         self.decompositions = decompositions
         self.answers = answers
         self.die_on_answer = die_on_answer
+        # Step 10's cut of an answer; an answer not listed comes back whole.
+        self.cuts = cuts or {}
         self.cfgs = []
         self.prompts = []
 
@@ -74,6 +76,9 @@ class FakeReader:
             return "Rephrased " + user_prompt.split(": ", 1)[1]
         if system_prompt == settings.HYDE_PROMPT:
             return "A passage says " + user_prompt.split(": ", 1)[1]
+        if system_prompt == settings.SHORT_ANSWER_PROMPT:
+            answer = user_prompt.rsplit("\nAnswer: ", 1)[1]
+            return self.cuts.get(answer, answer)
         question = user_prompt.rsplit("Question: ", 1)[1]
         if question == self.die_on_answer:
             raise RuntimeError("session died")
@@ -159,6 +164,7 @@ DECOMPOSITIONS = {Q0: json.dumps({"type": "multi_aspect", "aspects": [
     {"name": "Where did topic0x0 travel?", "importance": 0.6},
     {"name": "Who is topic0x1?", "importance": 0.4}]})}
 ANSWERS = {Q0: "the river", Q1: settings.REFUSAL}
+LONG0 = "They travelled to the river in the year 1800."
 
 
 def run_cell(cache_dir, out_path, *, reader=None, resume=False):
@@ -193,6 +199,8 @@ class TestOursSmoke(unittest.TestCase):
         cls.cold = run_cell(root / "cacheA", root / "a.jsonl", reader=cls.reader)
         cls.warm = run_cell(root / "cacheA", root / "b.jsonl")
         cls.cold_again = run_cell(root / "cacheB", root / "c.jsonl")
+        cls.cut = run_cell(root / "cacheA", root / "cut.jsonl", reader=FakeReader(
+            DECOMPOSITIONS, {Q0: LONG0, Q1: settings.REFUSAL}, cuts={LONG0: "the river"}))
         cls.root = root
 
     @classmethod
@@ -200,10 +208,11 @@ class TestOursSmoke(unittest.TestCase):
         cls.td.cleanup()
 
     def test_two_rows_with_the_expected_calls(self):
-        """Two aspects make six LLM calls; a parse failure makes four."""
+        """Two aspects make six LLM calls and the answer's cut a seventh; a
+        parse failure makes four, and a refusal is never cut."""
         r0, r1 = self.cold
         self.assertEqual((r0["metadata"]["ours_n_llm_calls"],
-                          r1["metadata"]["ours_n_llm_calls"]), (6, 4))
+                          r1["metadata"]["ours_n_llm_calls"]), (7, 4))
         self.assertEqual((r0["metadata"]["ours_parse_failed"],
                           r1["metadata"]["ours_parse_failed"]), (False, True))
 
@@ -235,6 +244,14 @@ class TestOursSmoke(unittest.TestCase):
         self.assertEqual(len(answer_calls), 2)
         self.assertTrue(self.cold[1]["answer"]["metadata"]["abstained"])
         self.assertEqual(self.cold[0]["answer"]["value"], 1.0)
+
+    def test_the_cut_answer_is_the_one_scored(self):
+        """The reader's long answer is kept in the row; the cut is scored."""
+        r0, r1 = self.cut
+        self.assertEqual(r0["predicted_answer"], "the river")
+        self.assertEqual(r0["metadata"]["ours_reader_answer"], LONG0)
+        self.assertEqual(r0["answer"]["value"], 1.0)
+        self.assertEqual(r1["predicted_answer"], settings.REFUSAL)
 
     def test_doc_ranking_reproduces_the_scorers_rank_metrics(self):
         from scripts.replay_retrieval import rank_stats_from_ranking

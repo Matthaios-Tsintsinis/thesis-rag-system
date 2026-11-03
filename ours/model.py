@@ -1,7 +1,8 @@
 """Ours: three-axis retrieval on top of M4's RAPTOR tree.
 
 The design is docs/three_axis_pipeline.pdf, section 4. This file follows its
-steps 1-9 in order; the class the runner calls is at the bottom. The tree,
+steps 1-9 in order, then the answer (step 10, from development v7); the class
+the runner calls is at the bottom. The tree,
 its 100-token leaves and their vectors are M4's own.
 """
 
@@ -28,6 +29,10 @@ from src import models
 # (c) The interface the runner calls.
 from src.chunking import Chunk
 from src.retrievers.base import BaseSystem, PreparedQuery, RetrievedChunk
+# (d) The scorers' own normaliser and refusal test, so the answer step reads an
+# answer as it will be scored.
+from src.eval.scorers.extractive import normalize_qasper_answer
+from src.eval.scorers.unanswerable import is_abstention
 
 
 # =========================================================================
@@ -737,6 +742,32 @@ def doc_ranking(chunks):
 
 
 # =========================================================================
+# Step 10. The answer
+# =========================================================================
+
+# The reader answers the step-9 prompt in OursSystem.answer; this cuts that
+# answer down.
+
+
+def shorten_answer(question, answer, ask):
+    """The answer cut to its shortest answering phrase; the answer itself when
+    the cut is empty, refuses, is not shorter, or brings in a word the answer
+    lacks (yes and no excepted)."""
+    reply = ask(settings.SHORT_ANSWER_PROMPT, f"Question: {question}\nAnswer: {answer}",
+                settings.SHORT_ANSWER_MAX_TOKENS).strip()
+    first_line = reply.splitlines()[0] if reply else ""
+    short = re.sub(r"^(short answer|answer)\s*:\s*", "", first_line,
+                   flags=re.IGNORECASE).strip().strip("\"'").strip()
+    words = normalize_qasper_answer(short).split()
+    have = normalize_qasper_answer(answer).split()
+    if not words or len(words) >= len(have) or is_abstention(short):
+        return answer
+    if words in (["yes"], ["no"]) or set(words) <= set(have):
+        return short
+    return answer
+
+
+# =========================================================================
 # Small helpers
 # =========================================================================
 
@@ -886,6 +917,28 @@ class OursSystem(BaseSystem):
         retrieved = self.prepare(query).retrieved
         return retrieved[:k] if k else retrieved
 
+    def answer(self, query, k=None):
+        """Steps 1-9, the reader's answer to their prompt, then step 10."""
+        prepared = self.prepare(query, k=k)
+        # The reader's call, as BaseSystem.answer makes it.
+        reply = models.generate(system_prompt=prepared.system_prompt,
+                                user_prompt=prepared.user_prompt,
+                                cfg=self.config.generation)
+        final, more_calls = reply, 0
+        if settings.SHORT_ANSWER and not is_abstention(reply):
+            final = shorten_answer(query, reply, self._ask)
+            more_calls += 1
+        result = self.finish(prepared, final)
+        result.extra["ours_n_llm_calls"] += more_calls
+        result.extra["ours_reader_answer"] = reply
+        return result
+
+    def _ask(self, system_prompt, user_prompt, max_tokens):
+        """(b) The shared reader, greedy, with this step's output cap."""
+        return models.generate(
+            system_prompt=system_prompt, user_prompt=user_prompt,
+            cfg=replace(self.config.generation, max_new_tokens=max_tokens))
+
     def prepare(self, query, k=None) -> PreparedQuery:
         """Steps 1-9 for one question: everything up to the reader's answer."""
         self._require_indexed()
@@ -895,10 +948,7 @@ class OursSystem(BaseSystem):
 
         def ask(system_prompt, user_prompt, max_tokens):
             calls.append(max_tokens)
-            # (b) The shared reader, greedy, with this step's output cap.
-            return models.generate(
-                system_prompt=system_prompt, user_prompt=user_prompt,
-                cfg=replace(self.config.generation, max_new_tokens=max_tokens))
+            return self._ask(system_prompt, user_prompt, max_tokens)
 
         # Step 1: aspects and their views; every text embedded in one call.
         aspects, parse_failed = decompose(query, ask)
@@ -975,7 +1025,8 @@ class OursSystem(BaseSystem):
                 for a, group in zip(aspects, aspect_groups)],
             "ours_global_selected": len(global_group),
             "ours_parse_failed": parse_failed,
-            # The reader's answer, made by BaseSystem.answer, is one more call.
+            # The reader's answer is one more call; OursSystem.answer adds
+            # step 10's.
             "ours_n_llm_calls": len(calls) + 1,
             "ours_doc_ranking": doc_ranking([r.chunk for r in scoring]),
             "ours_n_orientation_summaries": len(summaries),
