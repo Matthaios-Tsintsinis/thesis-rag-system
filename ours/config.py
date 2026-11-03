@@ -109,6 +109,16 @@ CHUNK_CONTEXT_TOKEN_RATIO = 0.85
 
 # --- Step 9: prompt -------------------------------------------------------
 
+# Each selected leaf reaches the reader with up to EVIDENCE_WINDOW_RADIUS
+# leaves on either side of it in its section, and windows that overlap or
+# touch are read as one passage (development v9). M4's leaves are about 100
+# tokens; the baselines read 15 windows of 200 words, about 2.5 times ours'
+# evidence on NarrativeQA, where v4 read 1,758 tokens and refused 54 %. The
+# selection, its scores and the document ranking are unchanged; the leaves a
+# window adds are retrieved and count in the set metrics. 0 keeps every leaf
+# apart, as v0-v8 did.
+EVIDENCE_WINDOW_RADIUS = 1
+
 ABSTENTION_RETRIEVAL_CONFIDENCE_THRESHOLD = 0.40
 # The design shows each aspect's confidence and marks those below the
 # threshold. Development v0 found the marker drove refusals (60 % of flagged
