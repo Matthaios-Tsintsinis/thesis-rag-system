@@ -745,8 +745,8 @@ def doc_ranking(chunks):
 # Step 10. The answer
 # =========================================================================
 
-# The reader answers the step-9 prompt in OursSystem.answer; this cuts that
-# answer down.
+# The reader answers the step-9 prompt in OursSystem.answer, a refusal is
+# asked once more there (v8), and this cuts the answer down (v7).
 
 
 def shorten_answer(question, answer, ask):
@@ -921,15 +921,24 @@ class OursSystem(BaseSystem):
         """Steps 1-9, the reader's answer to their prompt, then step 10."""
         prepared = self.prepare(query, k=k)
         # The reader's call, as BaseSystem.answer makes it.
-        reply = models.generate(system_prompt=prepared.system_prompt,
+        first = models.generate(system_prompt=prepared.system_prompt,
                                 user_prompt=prepared.user_prompt,
                                 cfg=self.config.generation)
-        final, more_calls = reply, 0
+        reply, more_calls = first, 0
+        reasked = settings.REASK_REFUSALS and is_abstention(first)
+        if reasked:
+            reply = models.generate(system_prompt=settings.REASK_PROMPT,
+                                    user_prompt=prepared.user_prompt,
+                                    cfg=self.config.generation)
+            more_calls += 1
+        final = reply
         if settings.SHORT_ANSWER and not is_abstention(reply):
             final = shorten_answer(query, reply, self._ask)
             more_calls += 1
         result = self.finish(prepared, final)
         result.extra["ours_n_llm_calls"] += more_calls
+        result.extra["ours_first_answer"] = first
+        result.extra["ours_reasked"] = reasked
         result.extra["ours_reader_answer"] = reply
         return result
 

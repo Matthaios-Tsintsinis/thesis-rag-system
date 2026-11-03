@@ -150,6 +150,10 @@ class TestAnswerPrompt(unittest.TestCase):
         self.assertEqual(settings.ANSWER_PROMPT,
                          BASE_ANSWER_SYSTEM_PROMPT + " " + settings.ORIENTATION_LINE)
 
+    def test_second_asking_keeps_the_exact_refusal_and_the_orientation_line(self):
+        self.assertIn(f"'{settings.REFUSAL}'", settings.REASK_PROMPT)
+        self.assertTrue(settings.REASK_PROMPT.endswith(settings.ORIENTATION_LINE))
+
     def _contexts(self, **switches):
         high = om.Aspect(name="main", text=Q, importance=1.0)
         high.confidence = 0.9

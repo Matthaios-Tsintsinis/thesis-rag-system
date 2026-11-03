@@ -57,12 +57,15 @@ def fake_cross_encoder(query, passages):
 class FakeReader:
     """Replaces src.models.generate: scripted replies, every config kept."""
 
-    def __init__(self, decompositions, answers, die_on_answer=None, cuts=None):
+    def __init__(self, decompositions, answers, die_on_answer=None, cuts=None,
+                 reasks=None):
         self.decompositions = decompositions
         self.answers = answers
         self.die_on_answer = die_on_answer
         # Step 10's cut of an answer; an answer not listed comes back whole.
         self.cuts = cuts or {}
+        # Step 10's second answer to a refused question; unlisted, it refuses.
+        self.reasks = reasks or {}
         self.cfgs = []
         self.prompts = []
 
@@ -82,6 +85,8 @@ class FakeReader:
         question = user_prompt.rsplit("Question: ", 1)[1]
         if question == self.die_on_answer:
             raise RuntimeError("session died")
+        if system_prompt == settings.REASK_PROMPT:
+            return self.reasks.get(question, settings.REFUSAL)
         return self.answers[question]
 
 
@@ -165,6 +170,7 @@ DECOMPOSITIONS = {Q0: json.dumps({"type": "multi_aspect", "aspects": [
     {"name": "Who is topic0x1?", "importance": 0.4}]})}
 ANSWERS = {Q0: "the river", Q1: settings.REFUSAL}
 LONG0 = "They travelled to the river in the year 1800."
+LONG1 = "They went to the castle together."
 
 
 def run_cell(cache_dir, out_path, *, reader=None, resume=False):
@@ -200,7 +206,8 @@ class TestOursSmoke(unittest.TestCase):
         cls.warm = run_cell(root / "cacheA", root / "b.jsonl")
         cls.cold_again = run_cell(root / "cacheB", root / "c.jsonl")
         cls.cut = run_cell(root / "cacheA", root / "cut.jsonl", reader=FakeReader(
-            DECOMPOSITIONS, {Q0: LONG0, Q1: settings.REFUSAL}, cuts={LONG0: "the river"}))
+            DECOMPOSITIONS, {Q0: LONG0, Q1: settings.REFUSAL},
+            cuts={LONG0: "the river", LONG1: "the castle"}, reasks={Q1: LONG1}))
         cls.root = root
 
     @classmethod
@@ -209,10 +216,11 @@ class TestOursSmoke(unittest.TestCase):
 
     def test_two_rows_with_the_expected_calls(self):
         """Two aspects make six LLM calls and the answer's cut a seventh; a
-        parse failure makes four, and a refusal is never cut."""
+        parse failure makes four and the refusal's second asking a fifth, and
+        a refusal is never cut."""
         r0, r1 = self.cold
         self.assertEqual((r0["metadata"]["ours_n_llm_calls"],
-                          r1["metadata"]["ours_n_llm_calls"]), (7, 4))
+                          r1["metadata"]["ours_n_llm_calls"]), (7, 5))
         self.assertEqual((r0["metadata"]["ours_parse_failed"],
                           r1["metadata"]["ours_parse_failed"]), (False, True))
 
@@ -247,11 +255,26 @@ class TestOursSmoke(unittest.TestCase):
 
     def test_the_cut_answer_is_the_one_scored(self):
         """The reader's long answer is kept in the row; the cut is scored."""
-        r0, r1 = self.cut
+        r0, _ = self.cut
         self.assertEqual(r0["predicted_answer"], "the river")
         self.assertEqual(r0["metadata"]["ours_reader_answer"], LONG0)
         self.assertEqual(r0["answer"]["value"], 1.0)
-        self.assertEqual(r1["predicted_answer"], settings.REFUSAL)
+        self.assertFalse(r0["metadata"]["ours_reasked"])
+
+    def test_a_refusal_is_asked_once_more_on_the_same_evidence(self):
+        first = [u for s, u in self.reader.prompts
+                 if s == settings.ANSWER_PROMPT and u.endswith(Q1)]
+        again = [u for s, u in self.reader.prompts if s == settings.REASK_PROMPT]
+        self.assertEqual(again, first)
+        self.assertTrue(self.cold[1]["metadata"]["ours_reasked"])
+        self.assertTrue(self.cold[1]["answer"]["metadata"]["abstained"])
+
+    def test_a_second_answer_is_cut_and_scored(self):
+        _, r1 = self.cut
+        self.assertEqual(r1["metadata"]["ours_first_answer"], settings.REFUSAL)
+        self.assertEqual(r1["metadata"]["ours_reader_answer"], LONG1)
+        self.assertEqual(r1["predicted_answer"], "the castle")
+        self.assertEqual(r1["metadata"]["ours_n_llm_calls"], 6)
 
     def test_doc_ranking_reproduces_the_scorers_rank_metrics(self):
         from scripts.replay_retrieval import rank_stats_from_ranking

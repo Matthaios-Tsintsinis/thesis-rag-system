@@ -164,6 +164,23 @@ ANSWER_PROMPT = (
 
 # --- Step 10: the answer --------------------------------------------------
 
+# A refusal is asked once more, the evidence unchanged, under REASK_PROMPT
+# (development v8); that prompt may still refuse. Development (round 2, v4)
+# found every gold sentence in the context for 45 / 42 of the 97 / 103
+# held-out HotpotQA refusals, and questions refused under one version but
+# answered under another with the same chunks scored F1 0.33 / 0.50 / 0.24
+# when answered (distractor / pooled / NarrativeQA).
+REASK_REFUSALS = True
+REASK_PROMPT = (
+    "Answer the user's question using only the provided evidence. The "
+    "evidence was retrieved for this question and usually contains the "
+    "answer, sometimes spread over several chunks that must be combined. "
+    "Give the answer the evidence best supports, in a few words. Only if "
+    "nothing in the evidence bears on the question, respond with exactly: "
+    f"'{REFUSAL}'. Do not use facts that are not in the evidence. "
+    + ORIENTATION_LINE
+)
+
 # One more call cuts the reader's answer to its shortest answering phrase
 # (development v7). Development (round 2, v4) found the gold inside a longer
 # answer for 77 / 82 of the answered held-out HotpotQA questions: answers of
