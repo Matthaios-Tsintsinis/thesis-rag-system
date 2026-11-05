@@ -193,12 +193,49 @@ REASK_PROMPT = (
 # about 20 words, at F1 0.31 / 0.29. The cut keeps only the answer's own
 # words, or yes / no; a cut that is not shorter, adds a word or refuses leaves
 # the answer as the reader gave it, and a refusal is never cut.
+#
+# Development v13: asked for the "shortest phrase", v12's cut lowered F1 on 82 /
+# 73 / 59 held-out rows, and the gold stood whole in the reader's answer on 80 /
+# 70 / 9 rows where the final answer was not it: too short ("Monitor" for USS
+# "Monitor"), other words ("Maseru" for the club based there), or a number
+# nobody asked for ("1992" for Lonestar). So it now asks for what the question
+# asks for, kept whole; the examples are invented. A why or how question is not
+# cut at all: it wants a clause.
 SHORT_ANSWER = True
 SHORT_ANSWER_MAX_TOKENS = 32
 SHORT_ANSWER_PROMPT = (
     "You shorten answers. Given a question and an answer to it, return only "
-    "the shortest phrase from the answer that fully answers the question: a "
-    "name, number, date or short phrase, not a sentence. If the question is "
-    "a yes/no question, return only yes or no. Use only words that appear in "
-    "the answer. Output only the short answer."
+    "what the question asks for, taken from the answer. Keep it whole: the "
+    "full name, title, place or phrase, with every word that belongs to it. "
+    "If the question offers a choice between two things, return the one the "
+    "answer picks, not a date or number that supports it. Return a number or "
+    "date only if the question asks for one. If the question is a yes/no "
+    "question, return only yes or no. Use only words that appear in the "
+    "answer. Output only the short answer.\n\n"
+    "Question: Which river is longer, the Ember or the Lode?\n"
+    "Answer: The Ember is longer, at 640 km against 410 km.\n"
+    "Short answer: The Ember\n\n"
+    "Question: In what city is the Hallam Glass Museum?\n"
+    "Answer: The Hallam Glass Museum stands in Tacoma, Washington, near the port.\n"
+    "Short answer: Tacoma, Washington\n\n"
+    "Question: Who directed the film Harbour Lights?\n"
+    "Answer: Harbour Lights was directed by Anna Reed and released in 1994.\n"
+    "Short answer: Anna Reed\n\n"
+    "Question: In what year did the Lode Bridge open?\n"
+    "Answer: The Lode Bridge opened in 1931 after six years of work.\n"
+    "Short answer: 1931"
 )
+# What marks a question as asking for a number; what, beside digits, makes a cut
+# nothing but a number or a date; and the words that alone never name one side
+# of an "A or B" question.
+NUMBER_QUESTION = (
+    r"\bhow\s+(?:many|much|old|long|tall|far|big|large|high|wide|deep|fast|heavy|often)\b|"
+    r"what year|which year|what date|\bwhen\b|\bnumber\b|\bage\b|\bdate\b|\byear\b|"
+    r"\bpopulation\b|\bcapacity\b|\bheight\b|\blength\b"
+)
+NUMBER_WORDS = frozenset({
+    "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+    "eleven", "twelve", "january", "february", "march", "april", "may", "june",
+    "july", "august", "september", "october", "november", "december",
+})
+OPTION_STOPWORDS = frozenset({"a", "an", "the", "of", "in", "on", "at", "to", "by", "for", "and"})

@@ -276,6 +276,20 @@ class TestOursSmoke(unittest.TestCase):
         self.assertEqual(r1["predicted_answer"], "the castle")
         self.assertEqual(r1["metadata"]["ours_n_llm_calls"], 6)
 
+    def test_a_why_question_keeps_the_readers_whole_answer(self):
+        from ours.model import OursSystem
+
+        why = "Why did topic0x0 travel with topic0x1?"
+        answer = "Because they wanted to see the river together."
+        reader = FakeReader(DECOMPOSITIONS, {why: answer}, cuts={answer: "the river"})
+        with tempfile.TemporaryDirectory() as td, ours_fakes(td, reader):
+            system = OursSystem(config=llama_config())
+            system.index_items(hotpot_unit(0).corpus)
+            result = system.answer(why)
+        self.assertEqual(result.answer, answer)
+        self.assertEqual(result.extra["ours_reader_answer"], answer)
+        self.assertFalse(any(p == settings.SHORT_ANSWER_PROMPT for p, _ in reader.prompts))
+
     def test_doc_ranking_reproduces_the_scorers_rank_metrics(self):
         from scripts.replay_retrieval import rank_stats_from_ranking
         from src.eval.hotpotqa import _TITLE_SPAN

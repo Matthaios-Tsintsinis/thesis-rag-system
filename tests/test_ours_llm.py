@@ -220,6 +220,89 @@ class TestShortAnswer(unittest.TestCase):
         for reply in ("", "   ", settings.REFUSAL):
             self.assertEqual(self._cut(reply)[0], self.LONG)
 
+    def _on(self, question, answer, reply):
+        return om.shorten_answer(question, answer, lambda *_: reply)
+
+    def test_an_either_or_cut_to_a_supporting_date_takes_the_side_named_first(self):
+        question = "Which was formed first, the duo Big & Rich or Lonestar?"
+        answer = "Lonestar was formed in 1992, and Big & Rich was formed by 2003."
+        self.assertEqual(self._on(question, answer, "1992"), "Lonestar")
+
+    def test_an_either_or_cut_that_names_a_side_stands(self):
+        question = "Which was formed first, the duo Big & Rich or Lonestar?"
+        answer = "Lonestar was formed in 1992, and Big & Rich was formed by 2003."
+        self.assertEqual(self._on(question, answer, "Big & Rich"), "Big & Rich")
+
+    def test_only_one_side_named_is_enough(self):
+        question = "Does Erodium or Cymbidium include more species?"
+        self.assertEqual(self._on(question, "Erodium includes about 60 species.", "60"), "Erodium")
+
+    def test_either_or_with_neither_side_named_keeps_the_cut(self):
+        question = "Who wrote the novel Foo or the play Bar?"
+        self.assertEqual(self._on(question, "Anna Reed wrote them both.", "Anna Reed"), "Anna Reed")
+
+    def test_a_side_is_never_a_lone_stopword(self):
+        question = "Was it the Battle of Foo or the Battle of Bar?"
+        answer = "It was the first of many in the war of 1931."
+        self.assertEqual(self._on(question, answer, "1931"), answer)
+
+    def test_a_side_matches_whole_words(self):
+        question = "Is the winner Rich or Poor?"
+        answer = "He enriched many people in 1931."
+        self.assertEqual(self._on(question, answer, "1931"), answer)
+
+    def test_an_or_that_is_no_choice_leaves_a_name_alone(self):
+        for question, answer, cut in (
+                ("What concert hall is on the northern edge or South Kensington, London?",
+                 "The Royal Albert Hall is on the northern edge of South Kensington.", "Royal Albert Hall"),
+                ('Len Wiseman directed "Live Free or Die Hard", whose hero is who?',
+                 'The hero of "Live Free or Die Hard" is John McClane.', "John McClane")):
+            self.assertEqual(self._on(question, answer, cut), cut)
+
+    def test_a_date_or_number_word_gives_way_to_a_side(self):
+        question = "Who was born first, Ann Reed or Bo Lane?"
+        answer = "Ann Reed was born on February 9, 1954, two years before Bo Lane."
+        for cut in ("February 9, 1954", "1954", "two"):
+            self.assertEqual(self._on(question, answer, cut), "Ann Reed", cut)
+
+    def test_a_number_nobody_asked_for_leaves_the_answer(self):
+        question = "Who founded the Lode Company?"
+        answer = "The Lode Company was founded in 1931."
+        self.assertEqual(self._on(question, answer, "1931"), answer)
+
+    def test_a_number_the_question_asks_for_stands(self):
+        for question in ("How many moons does it have, in all?", "In what year was the Lode Company founded?",
+                         "When was the Lode Company founded?"):
+            self.assertEqual(self._on(question, "It happened in 1931 after a long wait.", "1931"), "1931")
+
+    def test_the_prompts_examples_are_invented(self):
+        self.assertIn("Short answer: The Ember", settings.SHORT_ANSWER_PROMPT)
+        self.assertNotIn("Lonestar", settings.SHORT_ANSWER_PROMPT)
+
+
+class TestWhatTheQuestionAsks(unittest.TestCase):
+    """What a question asks for and what a cut is, read from their own words."""
+
+    def test_a_number_or_date_is_nothing_but_one(self):
+        for cut in ("1992", "19 April 1832", "February 9, 1954", "74th", "two", "1,500"):
+            self.assertTrue(om.is_a_number(cut), cut)
+
+    def test_a_name_holding_a_number_is_not(self):
+        for cut in ("Apollo 11", "2002 Winter Olympics", "875 acres", "Lonestar", ""):
+            self.assertFalse(om.is_a_number(cut), cut)
+
+    def test_how_big_asks_for_a_number(self):
+        self.assertTrue(om.asks_for_a_number("How big is the campus?"))
+        self.assertFalse(om.asks_for_a_number("Who founded the company?"))
+
+    def test_why_and_how_want_a_reason(self):
+        for question in ("Why did Foo leave?", "how does Foo escape?", "Why did it take so many years?"):
+            self.assertTrue(om.asks_for_a_reason(question), question)
+
+    def test_how_many_and_others_do_not(self):
+        for question in ("How many days did it take?", "How old is Foo?", "Who left?", "What happened?", ""):
+            self.assertFalse(om.asks_for_a_reason(question), question)
+
 
 if __name__ == "__main__":
     unittest.main()

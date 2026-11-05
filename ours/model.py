@@ -755,10 +755,58 @@ def doc_ranking(chunks):
 # asked once more there (v8), and this cuts the answer down (v7).
 
 
+def asks_for_a_number(question):
+    """True when the question's own words ask for a number or a date."""
+    return re.search(settings.NUMBER_QUESTION, question, re.IGNORECASE) is not None
+
+
+def asks_for_a_reason(question):
+    """True for a why question, or a how question that does not ask for a number."""
+    first = (question.split() or [""])[0].lower()
+    return first == "why" or (first == "how" and not asks_for_a_number(question))
+
+
+def is_a_number(cut):
+    """True when a cut is nothing but a number or a date."""
+    words = normalize_qasper_answer(cut).split()
+    return bool(words) and all(w in settings.NUMBER_WORDS or any(c.isdigit() for c in w)
+                               for w in words)
+
+
+def _named_in(phrase, text):
+    """Where the text names the phrase as whole words, or None; stopwords alone never count."""
+    if all(word.lower() in settings.OPTION_STOPWORDS for word in phrase.split()):
+        return None
+    found = re.search(rf"(?<!\w){re.escape(phrase)}(?!\w)", text, re.IGNORECASE)
+    return found.start() if found else None
+
+
+def chosen_option(question, answer):
+    """The side of an "A or B" question the answer names first, in the question's words, or None."""
+    body = question.strip().rstrip("?").strip()
+    if " or " not in body:
+        return None
+    left, right = body.rsplit(" or ", 1)
+    left = re.split(r"[,:]\s+", left)[-1].split()
+    right = right.split()
+    # The longest end of the left side and the longest start of the right that the answer names.
+    sides = ([" ".join(left[i:]) for i in range(len(left))],
+             [" ".join(right[:i]) for i in range(len(right), 0, -1)])
+    named = []
+    for phrases in sides:
+        for phrase in phrases:
+            at = _named_in(phrase, answer)
+            if at is not None:
+                named.append((at, phrase))
+                break
+    return min(named)[1] if named else None
+
+
 def shorten_answer(question, answer, ask):
-    """The answer cut to its shortest answering phrase; the answer itself when
-    the cut is empty, refuses, is not shorter, or brings in a word the answer
-    lacks (yes and no excepted)."""
+    """The answer cut to what the question asks for; the answer itself when the
+    cut is empty, refuses, is not shorter, or brings in a word the answer lacks (yes
+    and no excepted). A number or date the question did not ask for gives way to the
+    side of an "A or B" question the answer names first, or else to the answer."""
     reply = ask(settings.SHORT_ANSWER_PROMPT, f"Question: {question}\nAnswer: {answer}",
                 settings.SHORT_ANSWER_MAX_TOKENS).strip()
     first_line = reply.splitlines()[0] if reply else ""
@@ -768,9 +816,13 @@ def shorten_answer(question, answer, ask):
     have = normalize_qasper_answer(answer).split()
     if not words or len(words) >= len(have) or is_abstention(short):
         return answer
-    if words in (["yes"], ["no"]) or set(words) <= set(have):
+    if words in (["yes"], ["no"]):
         return short
-    return answer
+    if not set(words) <= set(have):
+        return answer
+    if is_a_number(short) and not asks_for_a_number(question):
+        return chosen_option(question, answer) or answer
+    return short
 
 
 # =========================================================================
@@ -978,7 +1030,7 @@ class OursSystem(BaseSystem):
                                     cfg=self.config.generation)
             more_calls += 1
         final = reply
-        if settings.SHORT_ANSWER and not is_abstention(reply):
+        if settings.SHORT_ANSWER and not is_abstention(reply) and not asks_for_a_reason(query):
             final = shorten_answer(query, reply, self._ask)
             more_calls += 1
         result = self.finish(prepared, final)
