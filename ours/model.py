@@ -755,6 +755,13 @@ def doc_ranking(chunks):
 # asked once more there (v8), and this cuts the answer down (v7).
 
 
+def final_answer(reply):
+    """What the reader's last "Answer:" line says; the whole reply when it has none."""
+    marks = list(re.finditer(r"(?im)^\W*(?:final\s+)?answer\s*:", reply))
+    tail = reply[marks[-1].end():].strip().strip("*").strip() if marks else ""
+    return tail.splitlines()[0].strip() if tail else reply
+
+
 def asks_for_a_number(question):
     """True when the question's own words ask for a number or a date."""
     return re.search(settings.NUMBER_QUESTION, question, re.IGNORECASE) is not None
@@ -1016,18 +1023,25 @@ class OursSystem(BaseSystem):
         return retrieved[:k] if k else retrieved
 
     def answer(self, query, k=None):
-        """Steps 1-9, the reader's answer to their prompt, then step 10."""
+        """Steps 1-9, the reader's reasoned answer to their prompt, then step 10."""
         prepared = self.prepare(query, k=k)
-        # The reader's call, as BaseSystem.answer makes it.
-        first = models.generate(system_prompt=prepared.system_prompt,
+        # The baselines' own prompt on the same evidence: for the report, never
+        # the answer, and not one of the system's calls.
+        plain = models.generate(system_prompt=settings.ANSWER_PROMPT,
                                 user_prompt=prepared.user_prompt,
                                 cfg=self.config.generation)
+        # The reader's call, as BaseSystem.answer makes it.
+        reasoning = models.generate(system_prompt=prepared.system_prompt,
+                                    user_prompt=prepared.user_prompt,
+                                    cfg=self.config.generation)
+        first = final_answer(reasoning)
         reply, more_calls = first, 0
         reasked = settings.REASK_REFUSALS and is_abstention(first)
         if reasked:
-            reply = models.generate(system_prompt=settings.REASK_PROMPT,
-                                    user_prompt=prepared.user_prompt,
-                                    cfg=self.config.generation)
+            reasoning = models.generate(system_prompt=settings.READER_REASK_PROMPT,
+                                        user_prompt=prepared.user_prompt,
+                                        cfg=self.config.generation)
+            reply = final_answer(reasoning)
             more_calls += 1
         final = reply
         if settings.SHORT_ANSWER and not is_abstention(reply) and not asks_for_a_reason(query):
@@ -1038,6 +1052,8 @@ class OursSystem(BaseSystem):
         result.extra["ours_first_answer"] = first
         result.extra["ours_reasked"] = reasked
         result.extra["ours_reader_answer"] = reply
+        result.extra["ours_reasoning"] = reasoning
+        result.extra["ours_plain_answer"] = plain
         return result
 
     def _ask(self, system_prompt, user_prompt, max_tokens):
@@ -1151,10 +1167,10 @@ class OursSystem(BaseSystem):
             retrieved=retrieved,
             packed=packed,
             scoring_ranking=scoring,
-            system_prompt=settings.ANSWER_PROMPT,
+            system_prompt=settings.READER_PROMPT,
             user_prompt=user_prompt,
             evidence_tokens=count_tokens(context),
-            n_input_tokens=count_tokens(settings.ANSWER_PROMPT + "\n" + user_prompt),
+            n_input_tokens=count_tokens(settings.READER_PROMPT + "\n" + user_prompt),
             n_retrieval_calls=2 * len(aspects) + 1,
             prepare_s=self._now() - t0,
             extra=extra,

@@ -85,7 +85,7 @@ class FakeReader:
         question = user_prompt.rsplit("Question: ", 1)[1]
         if question == self.die_on_answer:
             raise RuntimeError("session died")
-        if system_prompt == settings.REASK_PROMPT:
+        if system_prompt == settings.READER_REASK_PROMPT:
             return self.reasks.get(question, settings.REFUSAL)
         return self.answers[question]
 
@@ -264,7 +264,7 @@ class TestOursSmoke(unittest.TestCase):
     def test_a_refusal_is_asked_once_more_on_the_same_evidence(self):
         first = [u for s, u in self.reader.prompts
                  if s == settings.ANSWER_PROMPT and u.endswith(Q1)]
-        again = [u for s, u in self.reader.prompts if s == settings.REASK_PROMPT]
+        again = [u for s, u in self.reader.prompts if s == settings.READER_REASK_PROMPT]
         self.assertEqual(again, first)
         self.assertTrue(self.cold[1]["metadata"]["ours_reasked"])
         self.assertTrue(self.cold[1]["answer"]["metadata"]["abstained"])

@@ -422,6 +422,7 @@ def smoke() -> None:
     assert Path(warm_paths[1]).parent.name == M4_SUBSTRATE_NAMESPACE, warm_paths
     assert m4_paths[0] is None, "ours' own tree landed where M4 looks"
     assert m4_paths[1] == warm_paths[1], "M4 does not find the tree of a unit it reads whole"
+    assert all(r["metadata"]["ours_plain_answer"] for r in cold), "no plain answer on a row"
     assert cold[0]["metadata"]["ours_n_short_documents"] > 0, cold[0]["metadata"]
     assert cold[1]["metadata"]["ours_n_short_documents"] == 0, cold[1]["metadata"]
     assert [r["metadata"]["ours_tree_cache_hit"] for r in cold] == [False, False]

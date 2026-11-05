@@ -187,6 +187,27 @@ REASK_PROMPT = (
     + ORIENTATION_LINE
 )
 
+# The reader writes out its reasoning first (development v14); only its last
+# "Answer:" line goes on. Development (v8) found every gold sentence in the
+# context and no gold in the reader's answer on 67 / 65 held-out HotpotQA rows,
+# 32 / 31 % of all F1 lost, and 81 % of HotpotQA's questions are bridge questions:
+# it found the actor and stopped ("Daniel Henney", for what 2007 film he is known
+# for). ANSWER_PROMPT stays as it was: it is asked once on the same evidence,
+# saved for the report as the plain answer, never the answer. The example is
+# invented.
+REASON_LINE = (
+    "Before answering, work step by step: write the facts from the evidence that "
+    "bear on the question, and how they connect. A question may need two or more "
+    "facts joined, so follow each step until you reach what the question actually "
+    "asks for. Then end with a last line that begins 'Answer:' and gives only the "
+    "answer, or the refusal above. For example, for the question 'What river runs "
+    "through the birthplace of the author of Harbour Lights?': Harbour Lights was "
+    "written by Anna Reed. Anna Reed was born in Tacoma. The Ember runs through "
+    "Tacoma.\nAnswer: The Ember"
+)
+READER_PROMPT = ANSWER_PROMPT + " " + REASON_LINE
+READER_REASK_PROMPT = REASK_PROMPT + " " + REASON_LINE
+
 # One more call cuts the reader's answer to its shortest answering phrase
 # (development v7). Development (round 2, v4) found the gold inside a longer
 # answer for 77 / 82 of the answered held-out HotpotQA questions: answers of
