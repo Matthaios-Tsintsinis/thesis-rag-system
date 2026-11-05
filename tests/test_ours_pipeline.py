@@ -317,40 +317,6 @@ class TestOrientation(unittest.TestCase):
         self.assertLessEqual(used, chunk_tokens * 0.15 / 0.85)
 
 
-class TestEvidenceWindows(unittest.TestCase):
-    """Step 9's passages: a leaf and its section neighbours, merged when they meet."""
-
-    def setUp(self):
-        self.index = _index()
-
-    def _windows(self, groups, radius=1):
-        with mock.patch.object(settings, "EVIDENCE_WINDOW_RADIUS", radius):
-            return om.evidence_windows(self.index, groups)
-
-    def test_a_leaf_takes_one_neighbour_a_side(self):
-        self.assertEqual(self._windows([[(2, 0.9)]]), [[[1, 2, 3]]])
-
-    def test_windows_that_meet_merge_with_the_earlier_holder(self):
-        self.assertEqual(self._windows([[(2, 0.9)], [(4, 0.8)]]),
-                         [[[1, 2, 3, 4, 5]], []])
-
-    def test_a_window_stops_at_its_section(self):
-        """Leaf 5 ends Alpha Lake and leaf 6 starts Beta Mountain."""
-        self.assertEqual(self._windows([[(5, 0.9)], [(6, 0.8)]]),
-                         [[[4, 5]], [[6, 7]]])
-
-    def test_passages_follow_the_selection_order(self):
-        self.assertEqual(self._windows([[(9, 0.9), (0, 0.8)], [(3, 0.7)]]),
-                         [[[8, 9, 10], [0, 1, 2, 3, 4]], []])
-
-    def test_radius_two(self):
-        self.assertEqual(self._windows([[(8, 0.9)]], radius=2), [[[6, 7, 8, 9, 10]]])
-
-    def test_radius_zero_keeps_every_leaf_apart(self):
-        self.assertEqual(self._windows([[(2, 0.9), (3, 0.8)], [(4, 0.7)]], radius=0),
-                         [[[2], [3]], [[4]]])
-
-
 class TestDocRanking(unittest.TestCase):
     """The row's document ranking follows the scorer's rule."""
 

@@ -408,7 +408,7 @@ def smoke() -> None:
     assert [r["metadata"]["ours_n_llm_calls"] for r in cold] == [7, 5], cold
     assert [r["metadata"]["ours_parse_failed"] for r in cold] == [False, True]
     assert cold[1]["metadata"]["ours_aspects"][0]["budget"] == 13
-    assert all(0 < r["metadata"]["ours_n_selected"] <= 15 for r in cold)
+    assert all(0 < r["n_retrieved"] <= 15 for r in cold)
     assert all(set(r["retrieved_unit_types"]) == {"chunk"} for r in cold)
     assert cold[1]["answer"]["metadata"]["abstained"] is True
     assert all(warm_paths), "M4 does not find the trees ours built"

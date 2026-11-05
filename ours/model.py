@@ -706,41 +706,6 @@ def _ancestors(index, leaf):
 # =========================================================================
 
 
-def evidence_windows(index, groups):
-    """Each holder's passages for the reader: every selected leaf with up to
-    EVIDENCE_WINDOW_RADIUS leaves a side in its section; windows that overlap
-    or touch read as one passage, kept by the earliest holder whose selected
-    leaf it holds. Radius 0 keeps every leaf apart."""
-    if settings.EVIDENCE_WINDOW_RADIUS == 0:
-        return [[[leaf] for leaf, _ in group] for group in groups]
-    anchors = [leaf for group in groups for leaf, _ in group]
-    covered = set(anchors)
-    for leaf in anchors:
-        for step in (index.prev_leaf, index.next_leaf):
-            near = leaf
-            for _ in range(settings.EVIDENCE_WINDOW_RADIUS):
-                near = step[near]
-                if near is None:
-                    break
-                covered.add(near)
-    # A passage is a run of covered leaves linked through next_leaf; it sorts
-    # by the earliest selected leaf in it.
-    rank = {leaf: n for n, leaf in enumerate(anchors)}
-    holder = {leaf: g for g, group in enumerate(groups) for leaf, _ in group}
-    runs = []
-    for leaf in covered:
-        if index.prev_leaf[leaf] in covered:
-            continue
-        run = [leaf]
-        while index.next_leaf[run[-1]] in covered:
-            run.append(index.next_leaf[run[-1]])
-        runs.append((min(rank[x] for x in run if x in rank), run))
-    out = [[] for _ in groups]
-    for head, run in sorted(runs):
-        out[holder[anchors[head]]].append(run)
-    return out
-
-
 def build_context(aspects, aspect_chunks, aspect_orientation, global_chunks):
     """The evidence block in the design's layout: each aspect, then the global view."""
     lines, number = [], 0
@@ -1027,34 +992,22 @@ class OursSystem(BaseSystem):
             rankings, [a.budget for a in aspects] + [settings.GLOBAL_VIEW_QUOTA])
         aspect_groups, global_group = groups[:-1], groups[-1]
 
-        # Step 8: orientation for each aspect, its share taken of the
-        # passages step 9 shows.
+        # Step 8: orientation for each aspect.
         evidence = [pair for group in groups for pair in group]
-        passages = evidence_windows(index, groups)
-
-        def texts_of(runs):
-            return [" ".join(index.chunks[leaf].text for leaf in run) for run in runs]
-        chunk_tokens = sum(count_tokens(text) for runs in passages for text in texts_of(runs))
+        chunk_tokens = sum(count_tokens(index.chunks[leaf].text) for leaf, _ in evidence)
         orient = orientation(index, [[leaf for leaf, _ in g] for g in aspect_groups],
                              chunk_tokens)
 
         # Step 9: the prompt.
-        context = build_context(aspects, [texts_of(runs) for runs in passages[:-1]],
-                                orient, texts_of(passages[-1]))
+        def texts_of(group):
+            return [index.chunks[leaf].text for leaf, _ in group]
+        context = build_context(aspects, [texts_of(g) for g in aspect_groups],
+                                orient, texts_of(global_group))
         user_prompt = f"Evidence:\n{context}\n\nQuestion: {query}"
 
-        # Retrieval is every evidence leaf the reader sees, in prompt order;
-        # orientation is packed context. A leaf a window added scores below
-        # the best selected leaf of its passage.
-        selected = dict(evidence)
-        shown = []
-        for runs in passages:
-            for run in runs:
-                top = max(selected[leaf] for leaf in run if leaf in selected)
-                shown += [(leaf, selected.get(leaf, top * settings.NEIGHBOR_SCORE_DISCOUNT))
-                          for leaf in run]
+        # Retrieval is the evidence chunks only; orientation is packed context.
         retrieved = [RetrievedChunk(chunk=index.chunks[leaf], score=float(score), rank=n)
-                     for n, (leaf, score) in enumerate(shown)]
+                     for n, (leaf, score) in enumerate(evidence)]
         summaries = [(key, text) for lines in orient for kind, key, text in lines
                      if kind == "summary"]
         packed = retrieved + [
@@ -1080,8 +1033,6 @@ class OursSystem(BaseSystem):
                  "n_selected": len(group), "low_confidence": a.confidence < threshold}
                 for a, group in zip(aspects, aspect_groups)],
             "ours_global_selected": len(global_group),
-            "ours_n_selected": len(evidence),
-            "ours_n_passages": sum(len(runs) for runs in passages),
             "ours_parse_failed": parse_failed,
             # The reader's answer is one more call; OursSystem.answer adds
             # step 10's.

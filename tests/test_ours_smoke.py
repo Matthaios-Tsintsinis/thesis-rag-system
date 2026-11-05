@@ -233,15 +233,10 @@ class TestOursSmoke(unittest.TestCase):
         aspects = self.cold[1]["metadata"]["ours_aspects"]
         self.assertEqual([a["budget"] for a in aspects], [13])
 
-    def test_context_holds_at_most_fifteen_selected_leaves(self):
-        """Fifteen leaves at most are selected; their windows add neighbours,
-        which are retrieved too, and merge into at most as many passages."""
+    def test_context_holds_at_most_fifteen_chunks(self):
         for row in self.cold:
-            m = row["metadata"]
-            self.assertLessEqual(m["ours_n_selected"], 15)
-            self.assertGreater(m["ours_n_selected"], 0)
-            self.assertGreaterEqual(row["n_retrieved"], m["ours_n_selected"])
-            self.assertLessEqual(m["ours_n_passages"], m["ours_n_selected"])
+            self.assertLessEqual(row["n_retrieved"], 15)
+            self.assertGreater(row["n_retrieved"], 0)
 
     def test_retrieval_is_evidence_only(self):
         """Orientation summaries are packed but never scored as retrieval."""
