@@ -4,13 +4,13 @@ held-out data; the scored cells run with the values frozen here."""
 
 # --- Models ---------------------------------------------------------------
 
-# One model plays every LLM role: reader, aspects, paraphrases, HyDE, and
-# (through M4's own code) the tree summaries.
+# One model plays every LLM role: reader, aspects, paraphrases, HyDE, and the
+# tree summaries.
 READER = "meta-llama/Llama-3.1-8B-Instruct"
 READER_REVISION = "0e9e39f249a16976918f6564b8830bc894c89659"
 
-# M4's leaf embedder. Questions and views are embedded with it too, so they
-# land in the same space as the tree.
+# M4's embedder, kept from v0-v9. Sentences, leaves, questions and views are all
+# embedded with it, so they land in the same space as the tree.
 EMBEDDER = "sentence-transformers/multi-qa-mpnet-base-cos-v1"
 EMBEDDER_REVISION = "d51b22a1dfa8184e9258074e56e2875e50612dca"
 
@@ -19,16 +19,33 @@ RERANKER_REVISION = "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e"
 RERANK_BATCH = 32
 RERANK_MAX_LENGTH = 512
 
-# The topology stack the banked Llama trees were built under, as the p11
-# summaries record it (tree_build_env). M4's cache key folds this string, so
-# it must match for the existing trees to be found. Read from the four p11
-# M4 summaries by `python -m scripts.dev_ours census`, which found all 1,051
-# scored units warm under it.
+# The topology stack the trees are built under, as the p11 summaries record it
+# for M4's (tree_build_env). The cache key folds this string. Read from the four
+# p11 M4 summaries by `python -m scripts.dev_ours census`.
 TREE_BUILD_ENV: str | None = "python=3.12;umap-learn=0.5.12;scikit-learn=1.6.1;numpy=2.5.2"
 
 # Token counts use the harness's counter (o200k_base), so evidence_tokens
 # compares across cells.
 TOKEN_COUNTER_MODEL = "gpt-4o-mini"
+
+# --- Before any question: the leaves ---------------------------------------
+
+# Ours' trees live under this cache namespace, never under M4's (v10).
+TREE_NAMESPACE = "OURS_SEMANTIC"
+
+# Semantic chunking (design 2, 3.1; v10), with the values of the harness's own
+# chunker record (src/config.ChunkingConfig). Each sentence is embedded with
+# SENTENCE_BUFFER sentences either side. A document is cut where the cosine
+# distance between neighbouring sentences is above its BREAKPOINT_PERCENTILE,
+# or above BREAKPOINT_MAX_DISTANCE if that is lower. A piece over MAX_CHUNK_WORDS
+# is split into windows of that many words. A piece under MIN_CHUNK_WORDS joins
+# the one before it, unless that would pass MAX_MERGED_CHUNK_WORDS.
+SENTENCE_BUFFER = 1
+BREAKPOINT_PERCENTILE = 90.0
+BREAKPOINT_MAX_DISTANCE = 0.5
+MIN_CHUNK_WORDS = 80
+MAX_CHUNK_WORDS = 400
+MAX_MERGED_CHUNK_WORDS = 500
 
 # --- Step 1: aspects and views --------------------------------------------
 

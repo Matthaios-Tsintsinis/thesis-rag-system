@@ -61,7 +61,7 @@ class TestRegistry(unittest.TestCase):
         self.assertEqual(summary["generator"], settings.READER)
         self.assertEqual(summary["index_llm"], settings.READER)
         self.assertEqual(summary["model_revisions"]["reranker"], settings.RERANKER)
-        self.assertEqual(summary["chunking_strategy"], "raptor_100tok")
+        self.assertEqual(summary["chunking_strategy"], "ours_semantic")
         self.assertIs(summary["tree_cache_hit"], False)
 
     def test_warm_trees_are_not_refused(self):

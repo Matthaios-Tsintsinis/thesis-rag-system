@@ -1,6 +1,6 @@
-"""Pins that ours finds M4's trees under M4's own cache key and writes
-nothing else into the cache, that section settings never move that key, and
-that ours refuses a configuration it was not built for."""
+"""Pins that ours builds its own trees under its own cache namespace and
+touches nothing of M4's, that its leaf settings move the key and its section
+settings do not, and that ours refuses a configuration it was not built for."""
 
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ def _files(root: Path) -> list[str]:
 
 
 class TestCacheKey(unittest.TestCase):
-    """Ours indexes through M4's code and lands in M4's directory."""
+    """Ours' trees stand apart from M4's, whatever is in the cache."""
 
     @classmethod
     def setUpClass(cls):
@@ -45,28 +45,79 @@ class TestCacheKey(unittest.TestCase):
     def tearDownClass(cls):
         cls.td.cleanup()
 
-    def _m4_warm_path(self):
-        """Where plain M4, under the runner's config, finds this unit's tree."""
-        with ours_fakes(self.cache, FakeReader(DECOMPOSITIONS, ANSWERS)):
-            m4 = RaptorSystem(config=llama_config())
-            m4.topology_env_override = settings.TREE_BUILD_ENV
-            return m4.substrate_warm_path(self.items)
+    def _warm_path(self, cache=None):
+        """Where ours, under the runner's config, finds this unit's tree."""
+        with ours_fakes(cache or self.cache, FakeReader(DECOMPOSITIONS, ANSWERS)):
+            tree = om.OursTree(llama_config())
+            tree.topology_env_override = settings.TREE_BUILD_ENV
+            return tree.substrate_warm_path(self.items)
 
-    def test_the_tree_ours_built_is_where_m4_looks(self):
-        warm = self._m4_warm_path()
+    def _m4(self):
+        m4 = RaptorSystem(config=llama_config())
+        m4.topology_env_override = settings.TREE_BUILD_ENV
+        return m4
+
+    def test_the_tree_lands_in_ours_namespace_and_nowhere_else(self):
+        warm = self._warm_path()
         self.assertIsNotNone(warm)
-        self.assertTrue(all(f.startswith("M4_RAPTOR/" + Path(warm).name + "/")
+        self.assertTrue(self.files_after_index)
+        self.assertTrue(all(f.startswith(f"{settings.TREE_NAMESPACE}/{Path(warm).name}/")
                             for f in self.files_after_index), self.files_after_index)
 
-    def test_m4_inside_ours_runs_with_the_runners_config(self):
-        self.assertEqual(self.ours._m4.config, llama_config())
+    def test_m4_finds_nothing_in_a_cache_only_ours_built(self):
+        with ours_fakes(self.cache, FakeReader(DECOMPOSITIONS, ANSWERS)):
+            self.assertIsNone(self._m4().substrate_warm_path(self.items))
+
+    def test_a_tree_of_m4s_is_neither_read_nor_touched(self):
+        """Beside M4's tree for the same corpus, ours still builds its own."""
+        with tempfile.TemporaryDirectory() as td:
+            cache = Path(td)
+            with ours_fakes(cache, FakeReader(DECOMPOSITIONS, ANSWERS)):
+                self._m4().index_items(self.items)
+                banked = {f: (cache / f).read_bytes() for f in _files(cache)}
+                self.assertTrue(banked)
+                ours = om.OursSystem(config=llama_config())
+                ours.index_items(self.items)
+                self.assertIs(ours.tree_cache_hit, False)
+            for f, data in banked.items():
+                self.assertEqual((cache / f).read_bytes(), data, f)
+            added = set(_files(cache)) - set(banked)
+            self.assertTrue(added)
+            self.assertTrue(all(f.startswith(settings.TREE_NAMESPACE + "/") for f in added))
+
+    def test_the_builder_runs_with_the_runners_config_but_for_its_leaves(self):
+        expected = llama_config()
+        expected = replace(expected, m4=replace(expected.m4, chunker=om.semantic_chunker()))
+        self.assertEqual(self.ours._builder.config, expected)
+        self.assertEqual(self.ours._builder.config.m4.chunker.strategy, "ours_semantic")
+
+    def test_a_built_tree_is_read_back_the_same_as_a_cached_one(self):
+        with ours_fakes(self.cache, FakeReader(DECOMPOSITIONS, ANSWERS)):
+            again = om.OursSystem(config=llama_config())
+            again.index_items(self.items)
+        self.assertIs(self.ours.tree_cache_hit, False)
+        self.assertIs(again.tree_cache_hit, True)
+        self.assertEqual([c.text for c in again.chunks], [c.text for c in self.ours.chunks])
+        self.assertEqual([c.gold_provenance for c in again.chunks],
+                         [c.gold_provenance for c in self.ours.chunks])
+        self.assertEqual(sorted(again._builder._tree.nodes),
+                         sorted(self.ours._builder._tree.nodes))
+
+    def test_every_leaf_setting_moves_the_key(self):
+        before = self._warm_path()
+        for name, value in (("SENTENCE_BUFFER", 2), ("BREAKPOINT_PERCENTILE", 80.0),
+                            ("BREAKPOINT_MAX_DISTANCE", 0.4), ("MIN_CHUNK_WORDS", 60),
+                            ("MAX_CHUNK_WORDS", 300), ("MAX_MERGED_CHUNK_WORDS", 450)):
+            with mock.patch.object(settings, name, value):
+                self.assertIsNone(self._warm_path(), name)
+        self.assertEqual(self._warm_path(), before)
 
     def test_section_settings_do_not_move_the_key(self):
         """Changing every section setting leaves the cache untouched."""
-        before = self._m4_warm_path()
+        before = self._warm_path()
         with mock.patch.multiple(settings, SECTION_SIZE_CHUNKS=2,
                                  MIN_HEADINGS=1, MIN_SECTION_CHUNKS=1):
-            after = self._m4_warm_path()
+            after = self._warm_path()
             with ours_fakes(self.cache, FakeReader(DECOMPOSITIONS, ANSWERS)):
                 again = om.OursSystem(config=llama_config())
                 again.index_items(self.items)
@@ -74,10 +125,11 @@ class TestCacheKey(unittest.TestCase):
         self.assertTrue(again.tree_cache_hit)
         self.assertEqual(_files(self.cache), self.files_after_index)
 
-    def test_summary_sees_the_reranker_and_m4s_embedder(self):
+    def test_summary_sees_the_reranker_the_embedder_and_the_leaves(self):
         resolved = self.ours.resolved_components
         self.assertEqual(resolved.reranker_id, settings.RERANKER)
         self.assertEqual(resolved.embedder_id, settings.EMBEDDER)
+        self.assertEqual(resolved.chunker_config, om.semantic_chunker())
 
 
 class TestGates(unittest.TestCase):
@@ -104,10 +156,10 @@ class TestGates(unittest.TestCase):
         system = om.OursSystem(config=llama_config())
         with mock.patch.object(settings, "TREE_BUILD_ENV", None), \
                 mock.patch("ours.model.check_model_revisions", lambda: None), \
-                mock.patch.object(system._m4, "index_items") as m4_index:
+                mock.patch.object(system._builder, "index_items") as tree_index:
             with self.assertRaises(SystemExit):
                 system.index_items(hotpot_unit(0).corpus)
-        m4_index.assert_not_called()
+        tree_index.assert_not_called()
 
     def test_hub_revision_must_match_the_pin(self):
         class _Info:

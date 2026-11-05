@@ -184,8 +184,10 @@ class TestCensus(unittest.TestCase):
         # Build the first unit's tree only, as an earlier M4 cell would have.
         unit = TwoHotpotUnits().units[0]
         with ours_fakes(self.cache, FakeReader(DECOMPOSITIONS, ANSWERS)):
-            from ours.model import OursSystem
-            OursSystem(config=dev_ours.llama_config()).index_items(unit.corpus)
+            from src.retrievers.m4_raptor import RaptorSystem
+            m4 = RaptorSystem(config=dev_ours.llama_config())
+            m4.topology_env_override = "test-env"
+            m4.index_items(unit.corpus)
 
     def tearDown(self):
         self.td.cleanup()
@@ -225,6 +227,16 @@ class TestDevRun(unittest.TestCase):
         with mock.patch.dict(os.environ, {"THESIS_CACHE_DIR": ""}):
             with self.assertRaises(SystemExit):
                 dev_ours.dev_run("hotpotqa", "v0", Path("requirements.lock"), False)
+
+    def test_refuses_the_cache_that_holds_m4s_trees(self):
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "M4_RAPTOR").mkdir()
+            with mock.patch.dict(os.environ, {"THESIS_CACHE_DIR": td}), \
+                    mock.patch("scripts.pin_environment.check_lockfile") as lock:
+                with self.assertRaises(SystemExit) as refused:
+                    dev_ours.dev_run("hotpotqa", "v0", Path("requirements.lock"), False)
+            lock.assert_not_called()
+        self.assertIn("cache_ours_semantic_dev", str(refused.exception))
 
     def test_run_appends_one_log_line(self):
         with tempfile.TemporaryDirectory() as td:
