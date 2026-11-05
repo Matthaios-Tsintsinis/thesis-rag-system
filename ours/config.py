@@ -47,6 +47,28 @@ MIN_CHUNK_WORDS = 80
 MAX_CHUNK_WORDS = 400
 MAX_MERGED_CHUNK_WORDS = 500
 
+# The tree (design 3.4; v11): leaves clustered top-down by MiniBatchKMeans into
+# at most TREE_BRANCHING_FACTOR groups, never fewer than two, and about
+# TREE_MIN_CLUSTER_SIZE leaves a group. A group under that size, or at
+# TREE_MAX_DEPTH, stops; a unit under that size has no tree above its leaves.
+TREE_BRANCHING_FACTOR = 4
+TREE_MIN_CLUSTER_SIZE = 24
+TREE_MAX_DEPTH = 4
+KMEANS_BATCH_SIZE = 2048
+KMEANS_N_INIT = 3
+KMEANS_RANDOM_STATE = 42
+
+# Every node above the leaves is summarised, bottom-up: from its leaves, or from
+# its children's summaries. SUMMARY_CONTEXT_TOKENS is RAPTOR's cap on one
+# cluster's text (raptor/cluster_utils.py, max_length_in_cluster); the children
+# nearest their centre are the ones kept. The design asks for 3-5 sentences.
+SUMMARY_PROMPT = (
+    "Summarize the following passages in the same language they are written "
+    "in. Output 3-5 sentences of factual content. Do not invent."
+)
+SUMMARY_MAX_TOKENS = 200
+SUMMARY_CONTEXT_TOKENS = 3500
+
 # --- Step 1: aspects and views --------------------------------------------
 
 MAX_ASPECTS = 3

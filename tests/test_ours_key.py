@@ -112,6 +112,17 @@ class TestCacheKey(unittest.TestCase):
                 self.assertIsNone(self._warm_path(), name)
         self.assertEqual(self._warm_path(), before)
 
+    def test_every_tree_setting_moves_the_key(self):
+        before = self._warm_path()
+        for name, value in (("TREE_BRANCHING_FACTOR", 3), ("TREE_MIN_CLUSTER_SIZE", 12),
+                            ("TREE_MAX_DEPTH", 3), ("KMEANS_BATCH_SIZE", 1024),
+                            ("KMEANS_N_INIT", 5), ("KMEANS_RANDOM_STATE", 7),
+                            ("SUMMARY_PROMPT", "Summarize."), ("SUMMARY_MAX_TOKENS", 100),
+                            ("SUMMARY_CONTEXT_TOKENS", 2000)):
+            with mock.patch.object(settings, name, value):
+                self.assertIsNone(self._warm_path(), name)
+        self.assertEqual(self._warm_path(), before)
+
     def test_section_settings_do_not_move_the_key(self):
         """Changing every section setting leaves the cache untouched."""
         before = self._warm_path()

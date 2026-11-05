@@ -2,8 +2,9 @@
 
 The design is docs/three_axis_pipeline.pdf, section 4. This file follows its
 steps 1-9 in order, then the answer (step 10, from development v7); the class
-the runner calls is at the bottom. The tree's leaves are semantic chunks (design
-3.1, from development v10), and the tree is built and cached apart from M4's.
+the runner calls is at the bottom. The tree is the design's own: semantic chunks
+(3.1, from development v10) under recursive k-means and summaries (3.4, from v11),
+built and cached apart from M4's.
 """
 
 from __future__ import annotations
@@ -21,20 +22,27 @@ import numpy as np
 
 from ours import config as settings
 
-# (a) M4's code lays out each corpus and reads a finished tree, and its builder
-# makes the tree; the leaves and the cache are ours.
+# (a) M4's code lays out each corpus and reads a finished tree from its files,
+# and the tree keeps M4's file format; what is in the tree, and the cache, are ours.
 from src import paths
-from src.cache import CacheDir, Manifest, save_chunks, save_embeddings, corpus_content_hash
+from src.cache import (
+    CacheDir,
+    Manifest,
+    compute_cache_key,
+    corpus_content_hash,
+    save_chunks,
+    save_embeddings,
+)
 from src.config import ChunkingConfig
 from src.components import resolve_components
 from src.parsing import walk_corpus
 from src.raptor_paper import (
     PAPER_TREE_BUILD_ENV,
+    PaperNode,
+    PaperTree,
     build_collapsed_index,
-    build_paper_tree,
     save_collapsed_index,
     save_paper_tree,
-    summarize_paper_style_batch,
     tree_stats,
 )
 from src.retrievers.m4_raptor import REQUIRED_FILES, RaptorSystem
@@ -135,8 +143,80 @@ def semantic_chunker():
         max_if_min_words=settings.MAX_MERGED_CHUNK_WORDS)
 
 
+def kmeans_groups(vectors, members):
+    """The members split by k-means, each group in order, the groups by their first member."""
+    from sklearn.cluster import MiniBatchKMeans
+
+    k = min(settings.TREE_BRANCHING_FACTOR,
+            max(2, len(members) // settings.TREE_MIN_CLUSTER_SIZE))
+    labels = MiniBatchKMeans(
+        n_clusters=k, random_state=settings.KMEANS_RANDOM_STATE,
+        batch_size=min(settings.KMEANS_BATCH_SIZE, len(members)),
+        n_init=settings.KMEANS_N_INIT).fit_predict(vectors[members])
+    groups: dict = {}
+    for member, label in zip(members, labels.tolist()):
+        groups.setdefault(label, []).append(member)
+    return sorted(groups.values())
+
+
+def summary_context(node, nodes):
+    """The text a node is summarised from: its children, those nearest their centre, in order."""
+    children = [nodes[c] for c in node.children]
+    vectors = np.vstack([c.embedding for c in children])
+    kept, used = [], 0
+    for i in _best(vectors @ vectors.mean(axis=0), len(children)):
+        cost = count_tokens(children[i].text)
+        if not kept or used + cost <= settings.SUMMARY_CONTEXT_TOKENS:
+            kept.append(i)
+            used += cost
+    return "\n\n".join(children[i].text for i in sorted(kept))
+
+
+def kmeans_tree(texts, vectors, summarize, embed, params):
+    """The tree over the leaves: k-means from the top down, then summaries from the bottom up."""
+    nodes = {f"L0_{i:06d}": PaperNode(node_id=f"L0_{i:06d}", layer=0, text=text,
+                                      leaf_indices=[i], embedding=vectors[i])
+             for i, text in enumerate(texts)}
+    layers = {0: list(nodes)}
+    # A lone root is never searched or shown, and every leaf under it would be
+    # one cluster to step 5's cap. A unit this small has leaves only.
+    if len(texts) < settings.TREE_MIN_CLUSTER_SIZE:
+        return PaperTree(nodes=nodes, layer_to_nodes=layers, n_layers=1, params=params,
+                         stats={"n_summary_calls": 0, "degenerate_no_tree": True})
+
+    above = []
+
+    def grow(members, depth):
+        node = PaperNode(node_id=f"K{len(above):06d}", layer=1, text="",
+                         leaf_indices=list(members))
+        above.append(node)
+        nodes[node.node_id] = node
+        groups = ([] if depth >= settings.TREE_MAX_DEPTH
+                  or len(members) < settings.TREE_MIN_CLUSTER_SIZE
+                  else kmeans_groups(vectors, members))
+        if len(groups) < 2:
+            node.children = [f"L0_{i:06d}" for i in members]
+        else:
+            below = [grow(group, depth + 1) for group in groups]
+            node.children = [b.node_id for b in below]
+            node.layer = 1 + max(b.layer for b in below)
+        for child in node.children:
+            nodes[child].parent_ids.append(node.node_id)
+        return node
+
+    grow(list(range(len(texts))), 0)
+    for layer in sorted({n.layer for n in above}):
+        mine = [n for n in above if n.layer == layer]
+        layers[layer] = [n.node_id for n in mine]
+        summaries = summarize([summary_context(n, nodes) for n in mine])
+        for node, text, vector in zip(mine, summaries, embed(summaries)):
+            node.text, node.embedding = text, vector
+    return PaperTree(nodes=nodes, layer_to_nodes=layers, n_layers=len(layers), params=params,
+                     stats={"n_summary_calls": len(above), "degenerate_no_tree": False})
+
+
 class OursTree(RaptorSystem):
-    """Ours' tree for one unit: laid out and read back by M4's code, built on ours' leaves."""
+    """Ours' tree for one unit: built here, kept in ours' cache, read back by M4's code."""
 
     system_id = "OURS_TREE"
 
@@ -144,9 +224,26 @@ class OursTree(RaptorSystem):
         super().__init__(replace(config, m4=replace(config.m4, chunker=semantic_chunker())))
 
     def _cache_dir(self, corpus_hash):
-        """M4's key, which folds the leaf settings, under ours' own namespace."""
-        return CacheDir(paths.cache_dir(), settings.TREE_NAMESPACE,
-                        super()._cache_dir(corpus_hash).cache_key)
+        """Under ours' namespace, a key over all that makes the tree (design 3.6)."""
+        m4 = self.config.m4
+        return CacheDir(paths.cache_dir(), settings.TREE_NAMESPACE, compute_cache_key(
+            chunking_config=self._resolved.chunker_config,
+            embedder_model=self._resolved.embedder_id,
+            corpus_hash=corpus_hash,
+            extra={"tree": {"algo": "minibatch_kmeans",
+                            "branching_factor": settings.TREE_BRANCHING_FACTOR,
+                            "min_cluster_size": settings.TREE_MIN_CLUSTER_SIZE,
+                            "max_depth": settings.TREE_MAX_DEPTH,
+                            "batch_size": settings.KMEANS_BATCH_SIZE,
+                            "n_init": settings.KMEANS_N_INIT,
+                            "random_state": settings.KMEANS_RANDOM_STATE},
+                   "summary": {"model": m4.summary_model,
+                               "prompt": settings.SUMMARY_PROMPT,
+                               "max_tokens": settings.SUMMARY_MAX_TOKENS,
+                               "context_tokens": settings.SUMMARY_CONTEXT_TOKENS,
+                               "batch_size": m4.summary_batch_size,
+                               "max_padded_tokens": m4.summary_max_padded_tokens},
+                   "build_env": self.topology_env_override}))
 
     def index(self, corpus_path):
         """Build the tree if the cache lacks it, then read it back from the cache."""
@@ -161,7 +258,7 @@ class OursTree(RaptorSystem):
         self.tree_cache_hit = not cold
 
     def _build(self, corpus_path, cdir, corpus_hash):
-        """Chunk, embed, cluster and summarise, then save everything; the manifest goes last."""
+        """Chunk, embed, cluster and summarise, then save it all; the manifest goes last."""
         self._guard_index_llm()
         m4, chunker = self.config.m4, self._resolved.chunker_config
         chunks = semantic_chunks(list(walk_corpus(Path(corpus_path),
@@ -169,14 +266,17 @@ class OursTree(RaptorSystem):
         if not chunks:
             raise RuntimeError(f"No chunks produced from {corpus_path}")
         vectors = models.embed_texts([c.text for c in chunks], model_name=settings.EMBEDDER)
-        tree = build_paper_tree(
-            [c.text for c in chunks], vectors, params=m4.paper,
-            summarize_batch_fn=lambda contexts: summarize_paper_style_batch(
-                contexts, model=m4.summary_model, max_tokens=m4.summary_max_tokens,
-                batch_size=m4.summary_batch_size,
+        tree = kmeans_tree(
+            [c.text for c in chunks], vectors,
+            summarize=lambda contexts: models.generate_batch(
+                [settings.SUMMARY_PROMPT] * len(contexts),
+                [f"Passages:\n{context}" for context in contexts],
+                cfg=replace(self.config.generation, model=m4.summary_model,
+                            max_new_tokens=settings.SUMMARY_MAX_TOKENS),
+                batch_size=m4.summary_batch_size, sort_by_length=True,
                 max_padded_tokens=m4.summary_max_padded_tokens),
-            embed_fn=lambda texts: models.embed_texts(texts, model_name=settings.EMBEDDER),
-            verbose=True)
+            embed=lambda texts: models.embed_texts(texts, model_name=settings.EMBEDDER),
+            params=m4.paper)
         save_chunks(chunks, cdir.chunks_path)
         save_embeddings(vectors, cdir.embeddings_path)
         save_paper_tree(tree, cdir.path / "paper_tree.json",
@@ -222,7 +322,7 @@ class TreeIndex:
     detector: dict                    # document -> which section detector fired
     prev_leaf: list                   # the leaf before, in the same section
     next_leaf: list                   # the leaf after, in the same section
-    cluster: list                     # leaf -> its nearest parent (its RAPTOR cluster)
+    cluster: list                     # leaf -> its nearest parent (its cluster)
 
 
 def build_tree_index(chunks, leaf_vectors, tree, docs) -> TreeIndex:
@@ -735,7 +835,7 @@ def _stopwords():
 
 
 def aspect_pool(index, view_rankings):
-    """Union of the views' candidates (best score kept), at most 4 leaves per RAPTOR cluster."""
+    """Union of the views' candidates (best score kept), at most 4 leaves per cluster."""
     best: dict = {}
     for ranking in view_rankings:
         for leaf, score in ranking:
