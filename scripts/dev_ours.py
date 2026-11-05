@@ -355,9 +355,8 @@ def smoke() -> None:
     """Two held-out HotpotQA units, cold then warm: real loader and embedder, reader and cross-encoder faked."""
     from unittest import mock
 
-    from ours.model import OursSystem, OursTree
+    from ours.model import OursSystem
     from scripts.replay_retrieval import rank_stats_from_ranking
-    from src.cache import load_chunks
     from src.eval.base import BenchmarkRunner
     from src.eval.hotpotqa import _TITLE_SPAN
     from src.retrievers.m4_raptor import RaptorSystem
@@ -399,12 +398,9 @@ def smoke() -> None:
             system = OursSystem(config=llama_config())
             list(BenchmarkRunner(output_path=out, verbose=False).run(
                 system, _TwoUnits(), split="validation"))
-            tree = OursTree(llama_config())
-            tree.topology_env_override = env
-            warm_paths = [tree.substrate_warm_path(u.corpus) for u in units]
             m4 = RaptorSystem(config=llama_config())
             m4.topology_env_override = env
-            m4_paths = [m4.substrate_warm_path(u.corpus) for u in units]
+            warm_paths = [m4.substrate_warm_path(u.corpus) for u in units]
         passes.append(read_rows(out))
 
     cold, warm = passes
@@ -415,9 +411,7 @@ def smoke() -> None:
     assert all(0 < r["n_retrieved"] <= 15 for r in cold)
     assert all(set(r["retrieved_unit_types"]) == {"chunk"} for r in cold)
     assert cold[1]["answer"]["metadata"]["abstained"] is True
-    assert all(warm_paths), "ours does not find the trees it built"
-    assert not any(m4_paths), "ours' trees landed where M4 looks"
-    assert all(settings.TREE_NAMESPACE in Path(p).parts for p in warm_paths)
+    assert all(warm_paths), "M4 does not find the trees ours built"
     assert [r["metadata"]["ours_tree_cache_hit"] for r in cold] == [False, False]
     assert [r["metadata"]["ours_tree_cache_hit"] for r in warm] == [True, True]
     for row, unit in zip(cold, units):
@@ -437,9 +431,6 @@ def smoke() -> None:
     for row in cold:
         print(f"SMOKE OK {row['query_id']}: calls={row['metadata']['ours_n_llm_calls']} "
               f"chunks={row['n_retrieved']} docs={row['metadata']['ours_doc_ranking'][:3]}")
-    leaves = [c for p in warm_paths for c in load_chunks(Path(p) / "chunks.jsonl")]
-    print(f"[smoke] {len(leaves)} semantic leaves over two units, "
-          f"{min(c.n_words for c in leaves)}-{max(c.n_words for c in leaves)} words")
     print(f"[smoke] rows and cache under {root}")
 
 
@@ -457,18 +448,12 @@ def dev_run(benchmark: str, version: str, lockfile: Path, resume: bool) -> dict:
         assert_bank_gpu_consistent,
         assert_environment_pinned,
     )
-    from src.retrievers.m4_raptor import M4_SUBSTRATE_NAMESPACE
 
-    # Development trees never go into the banked cache, and ours' trees have a
-    # development cache of their own, apart from M4's held-out trees.
+    # Development trees never go into the banked cache.
     if not os.environ.get("THESIS_CACHE_DIR"):
         raise SystemExit("[dev] REFUSED: set THESIS_CACHE_DIR to a development cache "
-                         "(.../thesis_rag/cache_ours_semantic_dev); the banked "
+                         "(for example .../thesis_rag/cache_ours_dev); the banked "
                          "cache holds only scored-unit trees")
-    if (paths.cache_dir() / M4_SUBSTRATE_NAMESPACE).exists():
-        raise SystemExit(f"[dev] REFUSED: {paths.cache_dir()} holds M4's trees; set "
-                         "THESIS_CACHE_DIR to ours' own development cache "
-                         "(.../thesis_rag/cache_ours_semantic_dev)")
     assert_environment_pinned(lockfile)
     out = paths.output_dir() / "ours_dev" / version / f"{benchmark}_OURS_dev.jsonl"
     assert_bank_generator_consistent(out.parent, settings.READER)

@@ -1,7 +1,7 @@
 """Smoke test for ours through the real runner loop and the real HotpotQA
-scorers, on two synthetic HotpotQA-shaped units. The tree build, ours' whole
-pipeline and the row writer are real; the embedder, the reader, the tree
-summariser and the cross-encoder are faked so no model loads."""
+scorers, on two synthetic HotpotQA-shaped units. M4's tree build, ours'
+whole pipeline and the row writer are real; the embedder, the reader, the
+tree summariser and the cross-encoder are faked so no model loads."""
 
 from __future__ import annotations
 

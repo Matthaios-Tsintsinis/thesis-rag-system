@@ -1,10 +1,9 @@
-"""Ours: three-axis retrieval on a tree of its own.
+"""Ours: three-axis retrieval on top of M4's RAPTOR tree.
 
 The design is docs/three_axis_pipeline.pdf, section 4. This file follows its
 steps 1-9 in order, then the answer (step 10, from development v7); the class
-the runner calls is at the bottom. The tree is the design's own: semantic chunks
-(3.1, from development v10) under recursive k-means and summaries (3.4, from v11),
-built and cached apart from M4's.
+the runner calls is at the bottom. The tree,
+its 100-token leaves and their vectors are M4's own.
 """
 
 from __future__ import annotations
@@ -15,38 +14,17 @@ import hashlib
 import json
 import math
 import re
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
 
 from ours import config as settings
 
-# (a) M4's code lays out each corpus and reads a finished tree from its files,
-# and the tree keeps M4's file format; what is in the tree, and the cache, are ours.
-from src import paths
-from src.cache import (
-    CacheDir,
-    Manifest,
-    compute_cache_key,
-    corpus_content_hash,
-    save_chunks,
-    save_embeddings,
-)
-from src.config import ChunkingConfig
-from src.components import resolve_components
-from src.parsing import walk_corpus
-from src.raptor_paper import (
-    PAPER_TREE_BUILD_ENV,
-    PaperNode,
-    PaperTree,
-    build_collapsed_index,
-    save_collapsed_index,
-    save_paper_tree,
-    tree_stats,
-)
-from src.retrievers.m4_raptor import REQUIRED_FILES, RaptorSystem
-# (b) The shared reader every system answers with; it also holds the embedder.
+# (a) M4's own code loads or builds the tree, so the tree and its cache key stay M4's.
+from src.retrievers.m4_raptor import RaptorSystem
+# (b) The shared reader every system answers with; it also holds the embedder
+# M4's leaves were made with.
 from src import models
 # (c) The interface the runner calls.
 from src.chunking import Chunk
@@ -58,252 +36,15 @@ from src.eval.scorers.unanswerable import is_abstention
 
 
 # =========================================================================
-# Before any question: the semantic leaves and the tree over them
-# =========================================================================
-
-
-def split_sentences(text):
-    """(start, end) of each sentence: the design's terminators, or a line break."""
-    spans, start = [], 0
-    for m in re.finditer(r"(?<=[.!?;])\s+|\n+", text):
-        spans.append((start, m.start()))
-        start = m.end()
-    spans.append((start, len(text)))
-    return [(lo, hi) for lo, hi in spans if text[lo:hi].strip()]
-
-
-def buffered_sentences(text, spans):
-    """Each sentence with its neighbours, for a steadier embedding."""
-    b = settings.SENTENCE_BUFFER
-    return [" ".join(text[lo:hi] for lo, hi in spans[max(0, i - b): i + b + 1])
-            for i in range(len(spans))]
-
-
-def topic_segments(spans, vectors):
-    """The sentences grouped into (start, end) pieces, cut where the topic moves."""
-    if len(spans) < 2:
-        return list(spans)
-    distances = 1.0 - (vectors[:-1] * vectors[1:]).sum(axis=1)
-    threshold = min(float(np.percentile(distances, settings.BREAKPOINT_PERCENTILE)),
-                    settings.BREAKPOINT_MAX_DISTANCE)
-    segments, first = [], 0
-    for i, distance in enumerate(distances):
-        if distance > threshold:
-            segments.append((spans[first][0], spans[i][1]))
-            first = i + 1
-    segments.append((spans[first][0], spans[-1][1]))
-    return segments
-
-
-def sized_segments(text, segments):
-    """(start, end, words): long pieces split into windows, short ones joined to the one before."""
-    sized = []
-    for lo, hi in segments:
-        words = [m.span() for m in re.finditer(r"\S+", text[lo:hi])]
-        for k in range(0, len(words), settings.MAX_CHUNK_WORDS):
-            window = words[k: k + settings.MAX_CHUNK_WORDS]
-            sized.append((lo + window[0][0], lo + window[-1][1], len(window)))
-    merged = []
-    for lo, hi, n in sized:
-        if (merged and n < settings.MIN_CHUNK_WORDS
-                and merged[-1][2] + n <= settings.MAX_MERGED_CHUNK_WORDS):
-            merged[-1] = (merged[-1][0], hi, merged[-1][2] + n)
-        else:
-            merged.append((lo, hi, n))
-    return merged
-
-
-def semantic_chunks(docs):
-    """Every document's leaves. The offsets are what gold provenance is stamped from."""
-    # Chunk text has no line breaks, as with M4's chunker; sections find their
-    # headings in the document's own text.
-    spans = [split_sentences(doc.text) for doc in docs]
-    vectors = models.embed_texts(
-        [s for doc, mine in zip(docs, spans) for s in buffered_sentences(doc.text, mine)],
-        model_name=settings.EMBEDDER)
-    chunks, at = [], 0
-    for doc, mine in zip(docs, spans):
-        pieces = sized_segments(doc.text, topic_segments(mine, vectors[at: at + len(mine)]))
-        at += len(mine)
-        chunks += [Chunk(chunk_id=f"{doc.doc_id}::{i:04d}", doc_id=doc.doc_id,
-                         text=" ".join(doc.text[lo:hi].split()), n_words=n, position=i,
-                         metadata={"start_char": lo, "end_char": hi})
-                   for i, (lo, hi, n) in enumerate(pieces)]
-    return chunks
-
-
-def semantic_chunker():
-    """The leaf settings in the harness's chunker record, so the log and the cache key name them."""
-    return ChunkingConfig(
-        strategy="ours_semantic", chunk_words=settings.MAX_CHUNK_WORDS, overlap_words=0,
-        buffer_size=settings.SENTENCE_BUFFER,
-        breakpoint_percentile=settings.BREAKPOINT_PERCENTILE,
-        absolute_threshold=settings.BREAKPOINT_MAX_DISTANCE,
-        min_words=settings.MIN_CHUNK_WORDS, max_words=settings.MAX_CHUNK_WORDS,
-        max_if_min_words=settings.MAX_MERGED_CHUNK_WORDS)
-
-
-def kmeans_groups(vectors, members):
-    """The members split by k-means, each group in order, the groups by their first member."""
-    from sklearn.cluster import MiniBatchKMeans
-
-    k = min(settings.TREE_BRANCHING_FACTOR,
-            max(2, len(members) // settings.TREE_MIN_CLUSTER_SIZE))
-    labels = MiniBatchKMeans(
-        n_clusters=k, random_state=settings.KMEANS_RANDOM_STATE,
-        batch_size=min(settings.KMEANS_BATCH_SIZE, len(members)),
-        n_init=settings.KMEANS_N_INIT).fit_predict(vectors[members])
-    groups: dict = {}
-    for member, label in zip(members, labels.tolist()):
-        groups.setdefault(label, []).append(member)
-    return sorted(groups.values())
-
-
-def summary_context(node, nodes):
-    """The text a node is summarised from: its children, those nearest their centre, in order."""
-    children = [nodes[c] for c in node.children]
-    vectors = np.vstack([c.embedding for c in children])
-    kept, used = [], 0
-    for i in _best(vectors @ vectors.mean(axis=0), len(children)):
-        cost = count_tokens(children[i].text)
-        if not kept or used + cost <= settings.SUMMARY_CONTEXT_TOKENS:
-            kept.append(i)
-            used += cost
-    return "\n\n".join(children[i].text for i in sorted(kept))
-
-
-def kmeans_tree(texts, vectors, summarize, embed, params):
-    """The tree over the leaves: k-means from the top down, then summaries from the bottom up."""
-    nodes = {f"L0_{i:06d}": PaperNode(node_id=f"L0_{i:06d}", layer=0, text=text,
-                                      leaf_indices=[i], embedding=vectors[i])
-             for i, text in enumerate(texts)}
-    layers = {0: list(nodes)}
-    # A lone root is never searched or shown, and every leaf under it would be
-    # one cluster to step 5's cap. A unit this small has leaves only.
-    if len(texts) < settings.TREE_MIN_CLUSTER_SIZE:
-        return PaperTree(nodes=nodes, layer_to_nodes=layers, n_layers=1, params=params,
-                         stats={"n_summary_calls": 0, "degenerate_no_tree": True})
-
-    above = []
-
-    def grow(members, depth):
-        node = PaperNode(node_id=f"K{len(above):06d}", layer=1, text="",
-                         leaf_indices=list(members))
-        above.append(node)
-        nodes[node.node_id] = node
-        groups = ([] if depth >= settings.TREE_MAX_DEPTH
-                  or len(members) < settings.TREE_MIN_CLUSTER_SIZE
-                  else kmeans_groups(vectors, members))
-        if len(groups) < 2:
-            node.children = [f"L0_{i:06d}" for i in members]
-        else:
-            below = [grow(group, depth + 1) for group in groups]
-            node.children = [b.node_id for b in below]
-            node.layer = 1 + max(b.layer for b in below)
-        for child in node.children:
-            nodes[child].parent_ids.append(node.node_id)
-        return node
-
-    grow(list(range(len(texts))), 0)
-    for layer in sorted({n.layer for n in above}):
-        mine = [n for n in above if n.layer == layer]
-        layers[layer] = [n.node_id for n in mine]
-        summaries = summarize([summary_context(n, nodes) for n in mine])
-        for node, text, vector in zip(mine, summaries, embed(summaries)):
-            node.text, node.embedding = text, vector
-    return PaperTree(nodes=nodes, layer_to_nodes=layers, n_layers=len(layers), params=params,
-                     stats={"n_summary_calls": len(above), "degenerate_no_tree": False})
-
-
-class OursTree(RaptorSystem):
-    """Ours' tree for one unit: built here, kept in ours' cache, read back by M4's code."""
-
-    system_id = "OURS_TREE"
-
-    def __init__(self, config) -> None:
-        super().__init__(replace(config, m4=replace(config.m4, chunker=semantic_chunker())))
-
-    def _cache_dir(self, corpus_hash):
-        """Under ours' namespace, a key over all that makes the tree (design 3.6)."""
-        m4 = self.config.m4
-        return CacheDir(paths.cache_dir(), settings.TREE_NAMESPACE, compute_cache_key(
-            chunking_config=self._resolved.chunker_config,
-            embedder_model=self._resolved.embedder_id,
-            corpus_hash=corpus_hash,
-            extra={"tree": {"algo": "minibatch_kmeans",
-                            "branching_factor": settings.TREE_BRANCHING_FACTOR,
-                            "min_cluster_size": settings.TREE_MIN_CLUSTER_SIZE,
-                            "max_depth": settings.TREE_MAX_DEPTH,
-                            "batch_size": settings.KMEANS_BATCH_SIZE,
-                            "n_init": settings.KMEANS_N_INIT,
-                            "random_state": settings.KMEANS_RANDOM_STATE},
-                   "summary": {"model": m4.summary_model,
-                               "prompt": settings.SUMMARY_PROMPT,
-                               "max_tokens": settings.SUMMARY_MAX_TOKENS,
-                               "context_tokens": settings.SUMMARY_CONTEXT_TOKENS,
-                               "batch_size": m4.summary_batch_size,
-                               "max_padded_tokens": m4.summary_max_padded_tokens},
-                   "build_env": self.topology_env_override}))
-
-    def index(self, corpus_path):
-        """Build the tree if the cache lacks it, then read it back from the cache."""
-        self._resolved = resolve_components(self.config.m4, self.config, default_reranker=None)
-        corpus_hash = corpus_content_hash(Path(corpus_path))
-        cdir = self._cache_dir(corpus_hash)
-        cold = not cdir.is_complete(REQUIRED_FILES)
-        if cold:
-            self._build(corpus_path, cdir, corpus_hash)
-        # A fresh tree and a cached one reach the query steps by the same road.
-        super().index(corpus_path)
-        self.tree_cache_hit = not cold
-
-    def _build(self, corpus_path, cdir, corpus_hash):
-        """Chunk, embed, cluster and summarise, then save it all; the manifest goes last."""
-        self._guard_index_llm()
-        m4, chunker = self.config.m4, self._resolved.chunker_config
-        chunks = semantic_chunks(list(walk_corpus(Path(corpus_path),
-                                                  min_chars=chunker.min_chars_per_doc)))
-        if not chunks:
-            raise RuntimeError(f"No chunks produced from {corpus_path}")
-        vectors = models.embed_texts([c.text for c in chunks], model_name=settings.EMBEDDER)
-        tree = kmeans_tree(
-            [c.text for c in chunks], vectors,
-            summarize=lambda contexts: models.generate_batch(
-                [settings.SUMMARY_PROMPT] * len(contexts),
-                [f"Passages:\n{context}" for context in contexts],
-                cfg=replace(self.config.generation, model=m4.summary_model,
-                            max_new_tokens=settings.SUMMARY_MAX_TOKENS),
-                batch_size=m4.summary_batch_size, sort_by_length=True,
-                max_padded_tokens=m4.summary_max_padded_tokens),
-            embed=lambda texts: models.embed_texts(texts, model_name=settings.EMBEDDER),
-            params=m4.paper)
-        save_chunks(chunks, cdir.chunks_path)
-        save_embeddings(vectors, cdir.embeddings_path)
-        save_paper_tree(tree, cdir.path / "paper_tree.json",
-                        cdir.path / "paper_tree_embeddings.npy")
-        save_collapsed_index(build_collapsed_index(tree), cdir.path / "collapsed.index",
-                             cdir.path / "collapsed_meta.json")
-        Manifest(system_id=settings.TREE_NAMESPACE, cache_key=cdir.cache_key,
-                 chunking_config=asdict(chunker), embedder_model=settings.EMBEDDER,
-                 corpus_hash=corpus_hash, n_chunks=len(chunks), files=list(REQUIRED_FILES),
-                 extra={"m4": asdict(m4), "tree": tree_stats(tree),
-                        "summariser_runtime": self._summariser_runtime(),
-                        "build_env": PAPER_TREE_BUILD_ENV}).save(cdir.manifest_path)
-
-    def _warn_if_degenerate(self):
-        """Silent: a small unit with no summary layer is no fault here, and each row says so."""
-
-
-# =========================================================================
 # 0. The tree, as the query steps read it
 # =========================================================================
 
 
 @dataclass
 class TreeIndex:
-    """Ours' tree for one unit, plus a BM25 table and the documents' sections."""
+    """M4's tree for one unit, plus a BM25 table and the documents' sections."""
 
-    chunks: list                      # the leaf chunks; leaf i is chunks[i]
+    chunks: list                      # M4's leaf chunks; leaf i is chunks[i]
     leaf_vectors: np.ndarray          # one unit-length row per leaf
     node_ids: list[str]               # searchable nodes: every leaf, then every summary but the root
     node_vectors: np.ndarray          # one row per searchable node
@@ -322,11 +63,11 @@ class TreeIndex:
     detector: dict                    # document -> which section detector fired
     prev_leaf: list                   # the leaf before, in the same section
     next_leaf: list                   # the leaf after, in the same section
-    cluster: list                     # leaf -> its nearest parent (its cluster)
+    cluster: list                     # leaf -> its nearest parent (its RAPTOR cluster)
 
 
 def build_tree_index(chunks, leaf_vectors, tree, docs) -> TreeIndex:
-    """Collect what the query steps need from the tree and the unit's documents."""
+    """Collect what the query steps need from M4's tree and the unit's documents."""
     from rank_bm25 import BM25Okapi
 
     nodes = tree.nodes
@@ -467,7 +208,7 @@ def _words(text: str) -> str:
 
 def _place_headings(lines, chunk_texts):
     """(chunk index, heading) for each heading line found in the chunks, in order."""
-    # Chunk text has no line breaks (the chunker joins sentences with
+    # Chunk text has no line breaks (M4's chunker joins sentences with
     # spaces), so headings are found as lines of the document and placed on
     # the chunk where their words appear.
     stream, starts = " ", []
@@ -835,7 +576,7 @@ def _stopwords():
 
 
 def aspect_pool(index, view_rankings):
-    """Union of the views' candidates (best score kept), at most 4 leaves per cluster."""
+    """Union of the views' candidates (best score kept), at most 4 leaves per RAPTOR cluster."""
     best: dict = {}
     for ranking in view_rankings:
         for leaf, score in ranking:
@@ -1108,7 +849,7 @@ def check_model_revisions():
 
 
 class OursSystem(BaseSystem):
-    """Ours as the runner sees it: index a unit through its tree, then prepare each question."""
+    """Ours as the runner sees it: index a unit through M4, then prepare each question."""
 
     system_id = "OURS"
 
@@ -1126,19 +867,19 @@ class OursSystem(BaseSystem):
         if problems:
             raise SystemExit(
                 "OURS REFUSED: " + ", ".join(problems) + f". Ours runs with one "
-                f"model, {settings.READER}, greedy, with M4's embedder: pass "
+                f"model, {settings.READER}, greedy, on M4's tree: pass "
                 f"--generator {settings.READER} and keep M4's defaults.")
-        self._builder = OursTree(config)
+        self._m4 = RaptorSystem(config)
         self._tree_index: TreeIndex | None = None
         self._revisions_checked = False
 
     def index(self, corpus_path):
         """Not used: the runner indexes through index_items."""
         raise NotImplementedError(
-            "OURS indexes through index_items, which hands the corpus to its tree.")
+            "OURS indexes through index_items, which hands the corpus to M4's own code.")
 
     def index_items(self, items) -> None:
-        """Load or build this unit's tree, then index it for the query steps."""
+        """Load or build this unit's tree through M4's own code, then index it for the query steps."""
         items = list(items)
         if settings.TREE_BUILD_ENV is None:
             raise SystemExit(
@@ -1147,26 +888,28 @@ class OursSystem(BaseSystem):
         if not self._revisions_checked:
             check_model_revisions()
             self._revisions_checked = True
-        # The cache key folds the topology stack in.
-        self._builder.topology_env_override = settings.TREE_BUILD_ENV
-        # (a) Lays out the corpus, computes the cache key, and loads the tree or
-        # builds it.
-        self._builder.index_items(items)
-        self.chunks = self._builder.chunks
+        # The banked Llama trees were built under this topology stack, and
+        # M4's cache key folds it in.
+        self._m4.topology_env_override = settings.TREE_BUILD_ENV
+        # (a) M4's own code: lays out the corpus, computes its cache key, and
+        # loads the tree or builds it.
+        self._m4.index_items(items)
+        self.chunks = self._m4.chunks
+        # M4 keeps the tree it loaded or built on _tree.
         self._tree_index = build_tree_index(
-            self.chunks, self._builder.chunk_embeddings, self._builder._tree,
+            self.chunks, self._m4.chunk_embeddings, self._m4._tree,
             documents_of(items, self.chunks))
         self._indexed = True
 
     @property
     def tree_cache_hit(self):
         """True when this unit's tree came from the cache."""
-        return self._builder.tree_cache_hit
+        return self._m4.tree_cache_hit
 
     @property
     def resolved_components(self):
-        """The tree's components plus the reranker, for the run summary."""
-        resolved = self._builder.resolved_components
+        """M4's components plus the reranker, for the run summary."""
+        resolved = self._m4.resolved_components
         return None if resolved is None else replace(resolved, reranker_id=settings.RERANKER)
 
     def retrieve(self, query, k=None):
@@ -1299,8 +1042,8 @@ class OursSystem(BaseSystem):
             "ours_orientation_tokens": sum(count_tokens(text) for lines in orient
                                            for _, _, text in lines),
             "ours_section_detectors": detectors,
-            "ours_tree_cache_hit": self._builder.tree_cache_hit,
-            "ours_tree_degenerate": bool(self._builder.index_stats.get("degenerate_no_tree")),
+            "ours_tree_cache_hit": self._m4.tree_cache_hit,
+            "ours_tree_degenerate": bool(self._m4.index_stats.get("degenerate_no_tree")),
             "ours_code": CODE_FINGERPRINT,
             "ours_reranker_revision": settings.RERANKER_REVISION,
         }
