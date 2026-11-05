@@ -352,18 +352,22 @@ def census(p11: Path, benchmarks=SCORED_BENCHMARKS) -> str:
 
 
 def smoke() -> None:
-    """Two held-out HotpotQA units, cold then warm: real loader and embedder, reader and cross-encoder faked."""
+    """Two held-out HotpotQA units, one with a short document, cold then warm: real loader and embedder, reader and cross-encoder faked."""
     from unittest import mock
 
-    from ours.model import OursSystem
+    from ours.model import OursSystem, short_documents
     from scripts.replay_retrieval import rank_stats_from_ranking
     from src.eval.base import BenchmarkRunner
     from src.eval.hotpotqa import _TITLE_SPAN
-    from src.retrievers.m4_raptor import RaptorSystem
+    from src.retrievers.m4_raptor import M4_SUBSTRATE_NAMESPACE, RaptorSystem
     from tests.test_ours_smoke import FakeReader, fake_cross_encoder, fake_generate_batch
 
     loader = HeldOutHotpotQA()
-    units = list(loader.iter_eval_units(split="validation"))[:2]
+    every = list(loader.iter_eval_units(split="validation"))
+    judge = RaptorSystem(config=llama_config())
+    # One unit for each tree: ours' own first, then M4's.
+    units = [next(u for u in every if short_documents(u.corpus, judge)),
+             next(u for u in every if not short_documents(u.corpus, judge))]
 
     class _TwoUnits:
         name = "hotpotqa"
@@ -398,9 +402,11 @@ def smoke() -> None:
             system = OursSystem(config=llama_config())
             list(BenchmarkRunner(output_path=out, verbose=False).run(
                 system, _TwoUnits(), split="validation"))
+            warm_paths = [system.tree_for(u.corpus)[0].substrate_warm_path(u.corpus)
+                          for u in units]
             m4 = RaptorSystem(config=llama_config())
             m4.topology_env_override = env
-            warm_paths = [m4.substrate_warm_path(u.corpus) for u in units]
+            m4_paths = [m4.substrate_warm_path(u.corpus) for u in units]
         passes.append(read_rows(out))
 
     cold, warm = passes
@@ -411,7 +417,13 @@ def smoke() -> None:
     assert all(0 < r["n_retrieved"] <= 15 for r in cold)
     assert all(set(r["retrieved_unit_types"]) == {"chunk"} for r in cold)
     assert cold[1]["answer"]["metadata"]["abstained"] is True
-    assert all(warm_paths), "M4 does not find the trees ours built"
+    assert all(warm_paths), "ours does not find the trees it built"
+    assert Path(warm_paths[0]).parent.name == settings.TREE_NAMESPACE, warm_paths
+    assert Path(warm_paths[1]).parent.name == M4_SUBSTRATE_NAMESPACE, warm_paths
+    assert m4_paths[0] is None, "ours' own tree landed where M4 looks"
+    assert m4_paths[1] == warm_paths[1], "M4 does not find the tree of a unit it reads whole"
+    assert cold[0]["metadata"]["ours_n_short_documents"] > 0, cold[0]["metadata"]
+    assert cold[1]["metadata"]["ours_n_short_documents"] == 0, cold[1]["metadata"]
     assert [r["metadata"]["ours_tree_cache_hit"] for r in cold] == [False, False]
     assert [r["metadata"]["ours_tree_cache_hit"] for r in warm] == [True, True]
     for row, unit in zip(cold, units):
@@ -431,6 +443,8 @@ def smoke() -> None:
     for row in cold:
         print(f"SMOKE OK {row['query_id']}: calls={row['metadata']['ours_n_llm_calls']} "
               f"chunks={row['n_retrieved']} docs={row['metadata']['ours_doc_ranking'][:3]}")
+    print(f"[smoke] short documents per unit: "
+          f"{[r['metadata']['ours_n_short_documents'] for r in cold]}")
     print(f"[smoke] rows and cache under {root}")
 
 

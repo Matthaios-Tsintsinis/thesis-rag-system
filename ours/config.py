@@ -26,6 +26,12 @@ RERANK_MAX_LENGTH = 512
 # scored units warm under it.
 TREE_BUILD_ENV: str | None = "python=3.12;umap-learn=0.5.12;scikit-learn=1.6.1;numpy=2.5.2"
 
+# M4's filter (the harness's min_chars_per_doc) leaves out documents under 200
+# characters. A unit holding one gets a tree of ours' own, from M4's builder with
+# the filter lifted, kept under this namespace so M4's bank stays M4's. Every
+# other unit reads M4's tree. (Development v12.)
+TREE_NAMESPACE = "OURS_WHOLE_CORPUS"
+
 # Token counts use the harness's counter (o200k_base), so evidence_tokens
 # compares across cells.
 TOKEN_COUNTER_MODEL = "gpt-4o-mini"

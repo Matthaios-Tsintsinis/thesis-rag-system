@@ -3,7 +3,8 @@
 The design is docs/three_axis_pipeline.pdf, section 4. This file follows its
 steps 1-9 in order, then the answer (step 10, from development v7); the class
 the runner calls is at the bottom. The tree,
-its 100-token leaves and their vectors are M4's own.
+its 100-token leaves and their vectors are M4's own, except that a unit holding a
+document under M4's filter gets its own tree from M4's builder (development v12).
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import hashlib
 import json
 import math
 import re
+import tempfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -21,7 +23,11 @@ import numpy as np
 
 from ours import config as settings
 
-# (a) M4's own code loads or builds the tree, so the tree and its cache key stay M4's.
+# (a) M4's own code loads or builds the tree, so the tree and its cache key stay
+# M4's; a tree ours needs apart from M4's has its own place in the cache.
+from src import paths
+from src.cache import CacheDir
+from src.parsing import walk_corpus
 from src.retrievers.m4_raptor import RaptorSystem
 # (b) The shared reader every system answers with; it also holds the embedder
 # M4's leaves were made with.
@@ -844,6 +850,35 @@ def check_model_revisions():
 
 
 # =========================================================================
+# The documents M4's filter leaves out
+# =========================================================================
+
+
+class WholeCorpusTree(RaptorSystem):
+    """M4's builder with M4's short-document filter lifted, its trees in ours' own cache."""
+
+    system_id = "OURS_TREE"
+
+    def __init__(self, config) -> None:
+        # The chunker is in M4's cache key, so lifting the filter moves the key too.
+        chunker = replace(config.m4.chunker, min_chars_per_doc=0)
+        super().__init__(replace(config, m4=replace(config.m4, chunker=chunker)))
+
+    def _cache_dir(self, corpus_hash):
+        """M4's key under ours' own namespace."""
+        return CacheDir(paths.cache_dir(), settings.TREE_NAMESPACE,
+                        super()._cache_dir(corpus_hash).cache_key)
+
+
+def short_documents(items, m4):
+    """How many of a unit's documents M4's filter leaves out, laid out and judged as M4 does."""
+    with tempfile.TemporaryDirectory(prefix="OURS_short_") as td:
+        m4._write_corpus_layout(items, Path(td))
+        return sum(len(doc.text) < m4.config.m4.chunker.min_chars_per_doc
+                   for doc in walk_corpus(Path(td)))
+
+
+# =========================================================================
 # The system the runner calls
 # =========================================================================
 
@@ -870,6 +905,10 @@ class OursSystem(BaseSystem):
                 f"model, {settings.READER}, greedy, on M4's tree: pass "
                 f"--generator {settings.READER} and keep M4's defaults.")
         self._m4 = RaptorSystem(config)
+        self._whole = WholeCorpusTree(config)
+        # The one holding the current unit's tree.
+        self._tree_system = self._m4
+        self._n_short_documents = 0
         self._tree_index: TreeIndex | None = None
         self._revisions_checked = False
 
@@ -888,28 +927,35 @@ class OursSystem(BaseSystem):
         if not self._revisions_checked:
             check_model_revisions()
             self._revisions_checked = True
-        # The banked Llama trees were built under this topology stack, and
-        # M4's cache key folds it in.
-        self._m4.topology_env_override = settings.TREE_BUILD_ENV
+        self._tree_system, self._n_short_documents = self.tree_for(items)
         # (a) M4's own code: lays out the corpus, computes its cache key, and
         # loads the tree or builds it.
-        self._m4.index_items(items)
-        self.chunks = self._m4.chunks
+        self._tree_system.index_items(items)
+        self.chunks = self._tree_system.chunks
         # M4 keeps the tree it loaded or built on _tree.
         self._tree_index = build_tree_index(
-            self.chunks, self._m4.chunk_embeddings, self._m4._tree,
+            self.chunks, self._tree_system.chunk_embeddings, self._tree_system._tree,
             documents_of(items, self.chunks))
         self._indexed = True
+
+    def tree_for(self, items):
+        """The system holding a unit's tree, M4 unless its filter would leave a document out, and that count."""
+        n_short = short_documents(items, self._m4)
+        tree = self._whole if n_short else self._m4
+        # The banked Llama trees were built under this topology stack, and
+        # M4's cache key folds it in.
+        tree.topology_env_override = settings.TREE_BUILD_ENV
+        return tree, n_short
 
     @property
     def tree_cache_hit(self):
         """True when this unit's tree came from the cache."""
-        return self._m4.tree_cache_hit
+        return self._tree_system.tree_cache_hit
 
     @property
     def resolved_components(self):
         """M4's components plus the reranker, for the run summary."""
-        resolved = self._m4.resolved_components
+        resolved = self._tree_system.resolved_components
         return None if resolved is None else replace(resolved, reranker_id=settings.RERANKER)
 
     def retrieve(self, query, k=None):
@@ -1042,8 +1088,9 @@ class OursSystem(BaseSystem):
             "ours_orientation_tokens": sum(count_tokens(text) for lines in orient
                                            for _, _, text in lines),
             "ours_section_detectors": detectors,
-            "ours_tree_cache_hit": self._m4.tree_cache_hit,
-            "ours_tree_degenerate": bool(self._m4.index_stats.get("degenerate_no_tree")),
+            "ours_tree_cache_hit": self._tree_system.tree_cache_hit,
+            "ours_tree_degenerate": bool(self._tree_system.index_stats.get("degenerate_no_tree")),
+            "ours_n_short_documents": self._n_short_documents,
             "ours_code": CODE_FINGERPRINT,
             "ours_reranker_revision": settings.RERANKER_REVISION,
         }
