@@ -36,6 +36,15 @@ TREE_NAMESPACE = "OURS_WHOLE_CORPUS"
 # compares across cells.
 TOKEN_COUNTER_MODEL = "gpt-4o-mini"
 
+# Every chunk goes to the reader, the reranker and BM25 under its document's name:
+# source, date and title, as the corpus gives them (development v15). Development (v14)
+# found 36 / 32 % of held-out HotpotQA chunks not naming their document, rows with such a
+# gold chunk at F1 0.688 / 0.620 against 0.754 / 0.752, and titles alone lifting BM25's
+# pooled R@5 from 0.675 to 0.745; 91 % of MultiHop's questions name a source, and only 35 %
+# of its articles hold theirs in their text. A one-document unit has nothing to tell apart,
+# so NarrativeQA stays as it was. M4's tree and vectors do not see the name.
+DOCUMENT_HEADERS = True
+
 # --- Step 1: aspects and views --------------------------------------------
 
 MAX_ASPECTS = 3

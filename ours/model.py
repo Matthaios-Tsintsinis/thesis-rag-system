@@ -17,6 +17,7 @@ import math
 import re
 import tempfile
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -70,9 +71,10 @@ class TreeIndex:
     prev_leaf: list                   # the leaf before, in the same section
     next_leaf: list                   # the leaf after, in the same section
     cluster: list                     # leaf -> its nearest parent (its RAPTOR cluster)
+    headers: list                     # leaf -> its document's name, or "" with nothing to tell apart
 
 
-def build_tree_index(chunks, leaf_vectors, tree, docs) -> TreeIndex:
+def build_tree_index(chunks, leaf_vectors, tree, docs, headers=None) -> TreeIndex:
     """Collect what the query steps need from M4's tree and the unit's documents."""
     from rank_bm25 import BM25Okapi
 
@@ -128,6 +130,7 @@ def build_tree_index(chunks, leaf_vectors, tree, docs) -> TreeIndex:
             if section[a] == section[b]:
                 next_leaf[a], prev_leaf[b] = b, a
 
+    names = [(headers or {}).get(chunk.doc_id, "") for chunk in chunks]
     return TreeIndex(
         chunks=list(chunks),
         leaf_vectors=np.asarray(leaf_vectors, dtype=np.float32),
@@ -142,14 +145,55 @@ def build_tree_index(chunks, leaf_vectors, tree, docs) -> TreeIndex:
         leaf_node=leaf_node,
         root=root,
         top_nodes=top_nodes,
-        bm25=BM25Okapi([tokenize(c.text) for c in chunks]),
+        bm25=BM25Okapi([tokenize(_headed(name, c.text)) for name, c in zip(names, chunks)]),
         section=section,
         section_title=section_title,
         detector=detector,
         prev_leaf=prev_leaf,
         next_leaf=next_leaf,
         cluster=cluster,
+        headers=names,
     )
+
+
+def _headed(name, text):
+    """A text under its document's name, when it has one."""
+    return f"[{name}] {text}" if name else text
+
+
+def headed_text(index, leaf):
+    """A leaf as the reader, the reranker and BM25 read it."""
+    return _headed(index.headers[leaf], index.chunks[leaf].text)
+
+
+def published_date(value):
+    """A timestamp in the words questions use ("October 7, 2023"); "" when there is none to read."""
+    try:
+        moment = datetime.fromisoformat(str(value))
+    except ValueError:
+        return ""
+    return f"{moment:%B} {moment.day}, {moment.year}"
+
+
+def document_headers(items, chunks) -> dict:
+    """Each chunked document's name: its source, date and title, as the corpus gives them.
+
+    Empty for a one-document unit, whose chunks have nothing to tell apart."""
+    first: dict = {}
+    for item in items:
+        first.setdefault(str(item.parent_id), item)
+    if not settings.DOCUMENT_HEADERS or len(first) < 2:
+        return {}
+    out = {}
+    for chunk in chunks:
+        if chunk.doc_id in out or not chunk.gold_provenance:
+            continue
+        parent = str(chunk.gold_provenance[0][0])
+        metadata = first[parent].metadata if parent in first else {}
+        parts = (metadata.get("source"), published_date(metadata.get("published_at")),
+                 metadata.get("title") or parent)
+        out[chunk.doc_id] = " | ".join(p for p in parts if p)
+    return out
 
 
 def documents_of(items, chunks) -> dict:
@@ -600,7 +644,7 @@ def rerank(index, query, leaves):
     """Leaves ordered by cross-encoder relevance to the query."""
     if not leaves:
         return []
-    scores = cross_encoder_scores(query, [index.chunks[i].text for i in leaves])
+    scores = cross_encoder_scores(query, [headed_text(index, i) for i in leaves])
     return sorted(zip(leaves, scores), key=lambda x: (-x[1], x[0]))
 
 
@@ -991,11 +1035,14 @@ class OursSystem(BaseSystem):
         # loads the tree or builds it.
         self._tree_system.index_items(items)
         self.chunks = self._tree_system.chunks
-        # M4 keeps the tree it loaded or built on _tree.
+        self.build_index(items)
+        self._indexed = True
+
+    def build_index(self, items) -> None:
+        """What the query steps read, from the tree M4 loaded or built (kept on _tree)."""
         self._tree_index = build_tree_index(
             self.chunks, self._tree_system.chunk_embeddings, self._tree_system._tree,
-            documents_of(items, self.chunks))
-        self._indexed = True
+            documents_of(items, self.chunks), document_headers(items, self.chunks))
 
     def tree_for(self, items):
         """The system holding a unit's tree, M4 unless its filter would leave a document out, and that count."""
@@ -1114,7 +1161,7 @@ class OursSystem(BaseSystem):
 
         # Step 9: the prompt.
         def texts_of(group):
-            return [index.chunks[leaf].text for leaf, _ in group]
+            return [headed_text(index, leaf) for leaf, _ in group]
         context = build_context(aspects, [texts_of(g) for g in aspect_groups],
                                 orient, texts_of(global_group))
         user_prompt = f"Evidence:\n{context}\n\nQuestion: {query}"
