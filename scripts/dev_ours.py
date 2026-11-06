@@ -13,16 +13,22 @@
 
 Held-out data: HotpotQA validation questions outside the registered 1,000
 (both variants) and NarrativeQA validation stories outside the registered 40.
+Three draws, which never meet: a, the first; b, larger, for development once a
+had tested ten versions; c, kept for the last check before a freeze.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
+import random
 import re
+import shutil
 import sys
 import tempfile
+import threading
 import time
 from collections import Counter
 from dataclasses import replace
@@ -46,6 +52,12 @@ from src.eval.sampling import subsample_indices
 DEV_SEED = 20261007
 N_DEV_QUESTIONS = 300
 N_DEV_STORIES = 10
+# Later draws, from what the registered sample and the first draw left. b has
+# four times a's HotpotQA questions, so a paired interval about half as wide, and
+# NarrativeQA's 40 stories match the scored cell's. c takes the 25 stories left.
+LATER_SEED = 20261106
+N_LATER_QUESTIONS = {"b": 1200, "c": 1000}
+N_LATER_STORIES = {"b": 40, "c": 25}
 SCORED_BENCHMARKS = ("multihop_rag", "narrativeqa", "hotpotqa", "hotpotqa_pooled")
 
 
@@ -69,22 +81,56 @@ def held_out_indices(n_total: int) -> list[int]:
     return [held[j] for j in subsample_indices(len(held), N_DEV_QUESTIONS, seed=DEV_SEED)]
 
 
+def later_slice(keys, sizes: dict, draw: str) -> list:
+    """A later draw's share of what is left: a seeded order, cut so the draws never meet."""
+    order = list(keys)
+    random.Random(LATER_SEED).shuffle(order)
+    start = sizes["b"] if draw == "c" else 0
+    return order[start: start + sizes[draw]]
+
+
+def later_indices(n_total: int, draw: str) -> list[int]:
+    """A later draw's questions, outside the registered 1,000 and the first draw."""
+    taken = set(subsample_indices(n_total, PREREGISTERED_Q)) | set(held_out_indices(n_total))
+    rest = [i for i in range(n_total) if i not in taken]
+    return sorted(later_slice(rest, N_LATER_QUESTIONS, draw))
+
+
+def question_indices(n_total: int, draw: str) -> list[int]:
+    """Which questions a draw holds."""
+    return held_out_indices(n_total) if draw == "a" else later_indices(n_total, draw)
+
+
+def draw_seed(draw: str) -> int:
+    """The seed behind a draw."""
+    return DEV_SEED if draw == "a" else LATER_SEED
+
+
 class _HeldOutRows:
-    """Loads the held-out draw in place of the registered sample."""
+    """Loads a held-out draw in place of the registered sample."""
+
+    draw = "a"
 
     def _load(self):
         if self._rows is None:
             from datasets import load_dataset
 
             ds = load_dataset(HF_REPO, HF_CONFIG, split=_HF_SPLIT)
-            ds = ds.select(held_out_indices(len(ds)))
+            ds = ds.select(question_indices(len(ds), self.draw))
+            if self.draw != "a":
+                # The loader refuses a gold that normalises to empty ("!!!"); a later
+                # draw goes without that question.
+                from src.eval.scorers.extractive import normalize_qasper_answer
+
+                ds = ds.select([i for i, answer in enumerate(ds["answer"])
+                                if normalize_qasper_answer((answer or "").strip())])
             self._rows = ds
             self._measure(ds)
-            self.stats["subsample_seed"] = DEV_SEED
+            self.stats["subsample_seed"] = draw_seed(self.draw)
             self.stats["held_out"] = True
             # _measure prints the registered seed; this is what was drawn.
-            print(f"[dev] held-out draw: {len(ds)} questions outside the "
-                  f"registered {PREREGISTERED_Q}, seed {DEV_SEED}")
+            print(f"[dev] held-out draw {self.draw}: {len(ds)} questions outside the "
+                  f"registered {PREREGISTERED_Q}, seed {draw_seed(self.draw)}")
         return self._rows
 
 
@@ -92,19 +138,22 @@ class HeldOutHotpotQA(_HeldOutRows, HotpotQABenchmark):
     """HotpotQA distractor over the held-out questions."""
 
     def __init__(self) -> None:
-        super().__init__(max_questions=N_DEV_QUESTIONS)
+        super().__init__(max_questions=N_DEV_QUESTIONS if self.draw == "a"
+                         else N_LATER_QUESTIONS[self.draw])
 
 
 class HeldOutHotpotQAPooled(_HeldOutRows, HotpotQAPooledBenchmark):
     """HotpotQA pooled over the same held-out questions."""
 
     def __init__(self) -> None:
-        super().__init__(max_questions=N_DEV_QUESTIONS)
+        super().__init__(max_questions=N_DEV_QUESTIONS if self.draw == "a"
+                         else N_LATER_QUESTIONS[self.draw])
 
 
 class HeldOutNarrativeQA(NarrativeQABenchmark):
     """NarrativeQA over a seeded draw of the stories outside the registered 40."""
 
+    draw = "a"
     cell_units = N_DEV_STORIES
 
     def iter_eval_units(self, *, split, max_units=None):
@@ -113,8 +162,12 @@ class HeldOutNarrativeQA(NarrativeQABenchmark):
         held = [u for u in units if u.corpus_id not in scored]
         picked = [held[i] for i in subsample_indices(len(held), N_DEV_STORIES,
                                                      seed=DEV_SEED)]
+        if self.draw != "a":
+            first = {u.corpus_id for u in picked}
+            picked = later_slice([u for u in held if u.corpus_id not in first],
+                                 N_LATER_STORIES, self.draw)
         self.stats.update(n_queries=sum(len(u.queries) for u in picked),
-                          n_stories=len(picked), subsample_seed=DEV_SEED,
+                          n_stories=len(picked), subsample_seed=draw_seed(self.draw),
                           sampled_story_ids=[u.corpus_id for u in picked],
                           held_out=True)
         yield from picked
@@ -123,6 +176,18 @@ class HeldOutNarrativeQA(NarrativeQABenchmark):
 HELD_OUT = {"hotpotqa": HeldOutHotpotQA,
             "hotpotqa_pooled": HeldOutHotpotQAPooled,
             "narrativeqa": HeldOutNarrativeQA}
+
+
+def _later_draw(draw: str) -> dict:
+    """The three loaders of a later draw."""
+    return {"hotpotqa": type(f"HotpotQADraw{draw}", (HeldOutHotpotQA,), {"draw": draw}),
+            "hotpotqa_pooled": type(f"HotpotQAPooledDraw{draw}", (HeldOutHotpotQAPooled,),
+                                    {"draw": draw}),
+            "narrativeqa": type(f"NarrativeQADraw{draw}", (HeldOutNarrativeQA,),
+                                {"draw": draw, "cell_units": N_LATER_STORIES[draw]})}
+
+
+DRAWS = {"a": HELD_OUT, "b": _later_draw("b"), "c": _later_draw("c")}
 
 
 class _NoGold:
@@ -477,12 +542,86 @@ def smoke() -> None:
 # --- held-out development runs ---------------------------------------------
 
 
+def backup_of(path: Path) -> Path:
+    """Where a running cell's copy sits on Drive: a name nothing reads as a finished cell."""
+    return path.with_name(path.name + ".bak")
+
+
+def _copy_whole(source: Path, target: Path) -> None:
+    """Copy, then rename, so a reader never sees half a file."""
+    temporary = target.with_name(target.name + ".tmp")
+    shutil.copyfile(source, temporary)
+    temporary.replace(target)
+
+
+@contextlib.contextmanager
+def kept_on_drive(drive_path: Path, local_dir: Path | None, every: float = 300.0):
+    """Yield where a cell should write: the VM's disk, copied to Drive every few minutes.
+
+    Drive saves a file only when its writer closes it, so a runtime that dies mid-cell
+    would leave nothing there. A new session starts from the copy; only a finished
+    cell reaches the final name. Without a local_dir the cell writes to Drive itself."""
+    if local_dir is None:
+        yield drive_path
+        return
+    local = Path(local_dir) / drive_path.parent.name / drive_path.name
+    local.parent.mkdir(parents=True, exist_ok=True)
+    drive_path.parent.mkdir(parents=True, exist_ok=True)
+    backup = backup_of(drive_path)
+    if not local.exists():
+        for found in (drive_path, backup):
+            if found.exists():
+                shutil.copyfile(found, local)
+                break
+    stop = threading.Event()
+
+    def copy_now() -> None:
+        if local.exists():
+            _copy_whole(local, backup)
+
+    def keep_copying() -> None:
+        while not stop.wait(every):
+            copy_now()
+
+    copier = threading.Thread(target=keep_copying, daemon=True)
+    copier.start()
+    try:
+        yield local
+    except BaseException:
+        stop.set()
+        copier.join()
+        copy_now()
+        raise
+    stop.set()
+    copier.join()
+    _copy_whole(local, drive_path)
+    if backup.exists():
+        backup.unlink()
+
+
+def refuse_other_code(path: Path, code: str) -> None:
+    """A cell holds one model state: rows of another code are never resumed over."""
+    if not path.exists():
+        return
+    with path.open(encoding="utf-8") as f:
+        first = f.readline()
+    try:
+        found = json.loads(first)["metadata"]["ours_code"]
+    except (ValueError, KeyError, TypeError):
+        return
+    if found != code:
+        raise SystemExit(f"[dev] REFUSED: {path} holds rows of code {found}, and this is {code}. "
+                         "Check out that commit, or give this version its own name.")
+
+
 def dev_run(benchmark: str, version: str, lockfile: Path, resume: bool,
-            no_gold: bool = False) -> dict:
+            no_gold: bool = False, draw: str = "a", local_dir: Path | None = None) -> dict:
     """One held-out cell; its numbers are appended to outputs/ours_dev/DEV_LOG.jsonl."""
     if no_gold and benchmark not in NO_GOLD:
         raise SystemExit(f"[dev] REFUSED: {benchmark} has no gold documents to take out")
-    label = f"{version}_no_gold" if no_gold else version
+    if no_gold and draw != "a":
+        raise SystemExit("[dev] REFUSED: the no-gold measure is on the first draw")
+    label = f"{version}_no_gold" if no_gold else (version if draw == "a" else f"{version}_{draw}")
     from ours.model import CODE_FINGERPRINT, OursSystem
     from src import paths
     from src.eval.base import BenchmarkRunner
@@ -503,11 +642,13 @@ def dev_run(benchmark: str, version: str, lockfile: Path, resume: bool,
     assert_bank_generator_consistent(out.parent, settings.READER)
     assert_bank_gpu_consistent(out.parent)
 
-    loader = (NO_GOLD if no_gold else HELD_OUT)[benchmark]()
-    runner = BenchmarkRunner(output_path=out, resume=resume)
+    loader = (NO_GOLD if no_gold else DRAWS[draw])[benchmark]()
     t0 = time.perf_counter()
-    n_this = sum(1 for _ in runner.run(OursSystem(config=llama_config()), loader,
-                                       split="validation"))
+    with kept_on_drive(out, local_dir) as rows_path:
+        refuse_other_code(rows_path, CODE_FINGERPRINT)
+        runner = BenchmarkRunner(output_path=rows_path, resume=resume)
+        n_this = sum(1 for _ in runner.run(OursSystem(config=llama_config()), loader,
+                                           split="validation"))
     golds, docs = golds_of(loader)
     numbers = ours_numbers(read_rows(out), golds, docs)
     line = {"version": label, "benchmark": benchmark,
@@ -688,6 +829,10 @@ def main() -> None:
     r.add_argument("--resume", action="store_true")
     r.add_argument("--no-gold", action="store_true",
                    help="HotpotQA only: take each unit's gold paragraphs out; rows go to <version>_no_gold.")
+    r.add_argument("--draw", default="a", choices=sorted(DRAWS),
+                   help="Which held-out questions; rows of b or c go to <version>_<draw>.")
+    r.add_argument("--local-dir", type=Path, default=None,
+                   help="Write rows here and copy them to Drive every 5 minutes (for a cell that may outlive a session).")
     i = sub.add_parser("inspect", help="Answer-side breakdown of a development cell.")
     i.add_argument("--benchmark", required=True, choices=sorted(HELD_OUT))
     i.add_argument("--version", required=True)
@@ -695,6 +840,7 @@ def main() -> None:
     v.add_argument("--benchmark", required=True, choices=sorted(HELD_OUT))
     v.add_argument("--a", required=True, help="The earlier version.")
     v.add_argument("--b", required=True, help="The later version.")
+    v.add_argument("--draw", default="a", choices=sorted(DRAWS))
     p = sub.add_parser("replay", help="Decomposition replies over a scored benchmark's questions.")
     p.add_argument("--benchmark", required=True, choices=SCORED_BENCHMARKS)
     p.add_argument("--banked", type=Path, default=None,
@@ -712,9 +858,10 @@ def main() -> None:
         from src import paths
 
         def rows_of(version):
-            return read_rows(paths.output_dir() / "ours_dev" / version
+            label = version if args.draw == "a" else f"{version}_{args.draw}"
+            return read_rows(paths.output_dir() / "ours_dev" / label
                              / f"{args.benchmark}_OURS_dev.jsonl")
-        golds, _ = golds_of(HELD_OUT[args.benchmark]())
+        golds, _ = golds_of(DRAWS[args.draw][args.benchmark]())
         print(json.dumps(compare_versions(rows_of(args.a), rows_of(args.b), golds), indent=2))
         return
     if args.command == "census":
@@ -724,7 +871,8 @@ def main() -> None:
     elif args.command == "inspect":
         inspect(args.benchmark, args.version)
     else:
-        dev_run(args.benchmark, args.version, args.lockfile, args.resume, no_gold=args.no_gold)
+        dev_run(args.benchmark, args.version, args.lockfile, args.resume, no_gold=args.no_gold,
+                draw=args.draw, local_dir=args.local_dir)
 
 
 def inspect(benchmark: str, version: str) -> None:

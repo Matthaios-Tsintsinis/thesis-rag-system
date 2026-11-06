@@ -10,6 +10,7 @@ import io
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -89,6 +90,123 @@ class TestHeldOutDraws(unittest.TestCase):
         self.assertEqual(len(ids), dev_ours.N_DEV_STORIES)
         self.assertFalse(registered & set(ids))
         self.assertEqual(loader.stats["n_queries"], 2 * dev_ours.N_DEV_STORIES)
+
+
+class TestLaterDraws(unittest.TestCase):
+    """Draws b and c come from what the registered sample and draw a left, and never meet."""
+
+    def test_questions_never_overlap(self):
+        n = 7405
+        registered = set(subsample_indices(n, 1000))
+        first = set(dev_ours.held_out_indices(n))
+        b = dev_ours.later_indices(n, "b")
+        c = dev_ours.later_indices(n, "c")
+        self.assertEqual((len(b), len(c)), (dev_ours.N_LATER_QUESTIONS["b"], dev_ours.N_LATER_QUESTIONS["c"]))
+        self.assertEqual(len(set(b)), len(b))
+        self.assertFalse(set(b) & registered)
+        self.assertFalse(set(b) & first)
+        self.assertFalse(set(c) & registered)
+        self.assertFalse(set(c) & first)
+        self.assertFalse(set(b) & set(c))
+
+    def test_a_draw_does_not_move(self):
+        self.assertEqual(dev_ours.later_indices(7405, "b"), dev_ours.later_indices(7405, "b"))
+
+    def test_the_first_draw_stays_as_it_was(self):
+        self.assertEqual(dev_ours.question_indices(7405, "a"), dev_ours.held_out_indices(7405))
+
+    def test_hotpotqa_loaders_yield_the_draw(self):
+        from datasets import Dataset
+
+        rows = _hotpot_rows(3000)
+        with mock.patch("datasets.load_dataset", return_value=Dataset.from_list(rows)), \
+                contextlib.redirect_stdout(io.StringIO()) as printed:
+            units = list(dev_ours.DRAWS["b"]["hotpotqa"]().iter_eval_units(split="validation"))
+            pooled = list(dev_ours.DRAWS["b"]["hotpotqa_pooled"]().iter_eval_units(split="validation"))
+        expected = [f"hotpot::id{i}" for i in dev_ours.later_indices(3000, "b")]
+        self.assertEqual([u.corpus_id for u in units], expected)
+        self.assertEqual(sum(len(u.queries) for u in pooled), len(expected))
+        self.assertIn(f"seed {dev_ours.LATER_SEED}", printed.getvalue())
+
+    def test_a_later_draw_goes_without_a_gold_the_scorer_refuses(self):
+        from datasets import Dataset
+
+        rows = _hotpot_rows(3000)
+        bad = dev_ours.later_indices(3000, "b")[0]
+        rows[bad]["answer"] = "!!!"
+        with mock.patch("datasets.load_dataset", return_value=Dataset.from_list(rows)), \
+                contextlib.redirect_stdout(io.StringIO()):
+            units = list(dev_ours.DRAWS["b"]["hotpotqa"]().iter_eval_units(split="validation"))
+        ids = [u.corpus_id for u in units]
+        self.assertNotIn(f"hotpot::id{bad}", ids)
+        self.assertEqual(len(ids), len(dev_ours.later_indices(3000, "b")) - 1)
+
+    def test_narrativeqa_draws_share_no_story_with_anything(self):
+        def stories(draw):
+            loader = dev_ours.DRAWS[draw]["narrativeqa"]()
+            with mock.patch.object(loader, "_load_split", return_value=_story_rows(115)):
+                units = list(loader.iter_eval_units(split="validation"))
+            self.assertEqual(loader.stats["n_stories"], len(units))
+            return {u.corpus_id for u in units}
+        a, b, c = stories("a"), stories("b"), stories("c")
+        registered = set(select_units([f"s{i}" for i in range(115)], None))
+        self.assertEqual((len(b), len(c)), (dev_ours.N_LATER_STORIES["b"], dev_ours.N_LATER_STORIES["c"]))
+        for one, other in ((a, b), (a, c), (b, c), (b, registered), (c, registered)):
+            self.assertFalse(one & other)
+
+
+class TestKeptOnDrive(unittest.TestCase):
+    """Long cells write to the VM's disk: Drive saves a file only when it is closed."""
+
+    def test_without_a_local_dir_nothing_moves(self):
+        with tempfile.TemporaryDirectory() as td:
+            drive = Path(td) / "v0" / "cell.jsonl"
+            with dev_ours.kept_on_drive(drive, None) as path:
+                self.assertEqual(path, drive)
+
+    def test_the_finished_file_lands_on_drive_and_the_backup_goes(self):
+        with tempfile.TemporaryDirectory() as td:
+            drive = Path(td) / "drive" / "v0" / "cell.jsonl"
+            drive.parent.mkdir(parents=True)
+            with dev_ours.kept_on_drive(drive, Path(td) / "vm", every=0.01) as path:
+                self.assertNotEqual(path, drive)
+                path.write_text("row\n", encoding="utf-8")
+                deadline = time.time() + 5
+                while not dev_ours.backup_of(drive).exists() and time.time() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(dev_ours.backup_of(drive).exists())
+            self.assertEqual(drive.read_text(encoding="utf-8"), "row\n")
+            self.assertFalse(dev_ours.backup_of(drive).exists())
+
+    def test_a_copy_reaches_drive_while_the_file_is_open(self):
+        with tempfile.TemporaryDirectory() as td:
+            drive = Path(td) / "drive" / "v0" / "cell.jsonl"
+            drive.parent.mkdir(parents=True)
+            with dev_ours.kept_on_drive(drive, Path(td) / "vm", every=0.01) as path:
+                path.write_text("row\n", encoding="utf-8")
+                deadline = time.time() + 5
+                while not dev_ours.backup_of(drive).exists() and time.time() < deadline:
+                    time.sleep(0.01)
+                self.assertEqual(dev_ours.backup_of(drive).read_text(encoding="utf-8"), "row\n")
+
+    def test_a_dead_run_leaves_the_backup_and_no_final_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            drive = Path(td) / "drive" / "v0" / "cell.jsonl"
+            drive.parent.mkdir(parents=True)
+            with self.assertRaises(RuntimeError):
+                with dev_ours.kept_on_drive(drive, Path(td) / "vm", every=60) as path:
+                    path.write_text("row\n", encoding="utf-8")
+                    raise RuntimeError("session died")
+            self.assertFalse(drive.exists())
+            self.assertEqual(dev_ours.backup_of(drive).read_text(encoding="utf-8"), "row\n")
+
+    def test_a_new_session_starts_from_the_backup(self):
+        with tempfile.TemporaryDirectory() as td:
+            drive = Path(td) / "drive" / "v0" / "cell.jsonl"
+            drive.parent.mkdir(parents=True)
+            dev_ours.backup_of(drive).write_text("old row\n", encoding="utf-8")
+            with dev_ours.kept_on_drive(drive, Path(td) / "new_vm", every=60) as path:
+                self.assertEqual(path.read_text(encoding="utf-8"), "old row\n")
 
 
 class TestNoGold(unittest.TestCase):
@@ -319,6 +437,51 @@ class TestDevRun(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         for row in rows:
             self.assertEqual(float(row["retrieval"]["recall"]), 0.0, "gold reached the reader")
+
+    def test_a_later_draw_keeps_its_rows_apart(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            lock = root / "requirements.lock"
+            lock.write_text("# lock\nnumpy==0.0.0\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"THESIS_CACHE_DIR": str(root / "cache"),
+                                              "THESIS_OUTPUT_DIR": str(root / "out")}), \
+                    mock.patch.dict(dev_ours.DRAWS["b"], {"hotpotqa": TwoHotpotUnits}), \
+                    mock.patch("scripts.pin_environment.check_lockfile", return_value=0), \
+                    ours_fakes(root / "cache", FakeReader(DECOMPOSITIONS, ANSWERS)), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                dev_ours.dev_run("hotpotqa", "v0", lock, False, draw="b", local_dir=root / "vm")
+            log = (root / "out" / "ours_dev" / "DEV_LOG.jsonl").read_text().splitlines()
+            self.assertTrue((root / "out" / "ours_dev" / "v0_b" / "hotpotqa_OURS_dev.jsonl").exists())
+            self.assertFalse((root / "out" / "ours_dev" / "v0").exists())
+        self.assertEqual(json.loads(log[0])["version"], "v0_b")
+
+    def test_no_gold_is_for_the_first_draw(self):
+        with self.assertRaises(SystemExit) as caught:
+            dev_ours.dev_run("hotpotqa", "v0", Path("requirements.lock"), False, no_gold=True, draw="b")
+        self.assertIn("first draw", str(caught.exception))
+
+    def test_rows_of_another_code_are_not_resumed_over(self):
+        from ours.model import CODE_FINGERPRINT
+
+        with tempfile.TemporaryDirectory() as td:
+            cell = Path(td) / "cell.jsonl"
+            dev_ours.refuse_other_code(cell, CODE_FINGERPRINT)
+            cell.write_text(json.dumps({"metadata": {"ours_code": "something else"}}) + "\n", encoding="utf-8")
+            with self.assertRaises(SystemExit) as caught:
+                dev_ours.refuse_other_code(cell, CODE_FINGERPRINT)
+            self.assertIn("something else", str(caught.exception))
+            cell.write_text(json.dumps({"metadata": {"ours_code": CODE_FINGERPRINT}}) + "\n", encoding="utf-8")
+            dev_ours.refuse_other_code(cell, CODE_FINGERPRINT)
+            cell.write_text('{"torn', encoding="utf-8")
+            dev_ours.refuse_other_code(cell, CODE_FINGERPRINT)
+
+    def test_the_draw_and_the_local_dir_reach_the_run(self):
+        argv = ["dev_ours", "run", "--benchmark", "hotpotqa", "--version", "v0", "--draw", "b",
+                "--local-dir", "/content/ours_local"]
+        with mock.patch("sys.argv", argv), mock.patch.object(dev_ours, "dev_run") as run:
+            dev_ours.main()
+        self.assertEqual(run.call_args.kwargs["draw"], "b")
+        self.assertEqual(run.call_args.kwargs["local_dir"], Path("/content/ours_local"))
 
     def test_the_flag_reaches_the_run(self):
         argv = ["dev_ours", "run", "--benchmark", "hotpotqa", "--version", "v0", "--no-gold"]
