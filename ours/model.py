@@ -72,9 +72,12 @@ class TreeIndex:
     next_leaf: list                   # the leaf after, in the same section
     cluster: list                     # leaf -> its nearest parent (its RAPTOR cluster)
     headers: list                     # leaf -> its document's name, or "" with nothing to tell apart
+    source: list                      # leaf -> its document's source, or ""
+    date: list                        # leaf -> its document's date in words, or ""
+    source_names: list                # the unit's sources, longest first
 
 
-def build_tree_index(chunks, leaf_vectors, tree, docs, headers=None) -> TreeIndex:
+def build_tree_index(chunks, leaf_vectors, tree, docs, headers=None, fields=None) -> TreeIndex:
     """Collect what the query steps need from M4's tree and the unit's documents."""
     from rank_bm25 import BM25Okapi
 
@@ -131,6 +134,7 @@ def build_tree_index(chunks, leaf_vectors, tree, docs, headers=None) -> TreeInde
                 next_leaf[a], prev_leaf[b] = b, a
 
     names = [(headers or {}).get(chunk.doc_id, "") for chunk in chunks]
+    known = [(fields or {}).get(chunk.doc_id, ("", "")) for chunk in chunks]
     return TreeIndex(
         chunks=list(chunks),
         leaf_vectors=np.asarray(leaf_vectors, dtype=np.float32),
@@ -153,6 +157,9 @@ def build_tree_index(chunks, leaf_vectors, tree, docs, headers=None) -> TreeInde
         next_leaf=next_leaf,
         cluster=cluster,
         headers=names,
+        source=[source for source, _ in known],
+        date=[date for _, date in known],
+        source_names=sorted({source for source, _ in known if source}, key=lambda s: (-len(s), s)),
     )
 
 
@@ -179,9 +186,7 @@ def document_headers(items, chunks) -> dict:
     """Each chunked document's name: its source, date and title, as the corpus gives them.
 
     Empty for a one-document unit, whose chunks have nothing to tell apart."""
-    first: dict = {}
-    for item in items:
-        first.setdefault(str(item.parent_id), item)
+    first = _first_of_each_document(items)
     if not settings.DOCUMENT_HEADERS or len(first) < 2:
         return {}
     out = {}
@@ -194,6 +199,28 @@ def document_headers(items, chunks) -> dict:
                  metadata.get("title") or parent)
         out[chunk.doc_id] = " | ".join(p for p in parts if p)
     return out
+
+
+def document_fields(items, chunks) -> dict:
+    """Each chunked document's source and date, for the steps a question's words can steer."""
+    first = _first_of_each_document(items)
+    out = {}
+    for chunk in chunks:
+        if chunk.doc_id in out or not chunk.gold_provenance:
+            continue
+        parent = str(chunk.gold_provenance[0][0])
+        metadata = first[parent].metadata if parent in first else {}
+        out[chunk.doc_id] = (metadata.get("source") or "",
+                             published_date(metadata.get("published_at")))
+    return out
+
+
+def _first_of_each_document(items) -> dict:
+    """Each document's first item; its metadata speaks for the document."""
+    first: dict = {}
+    for item in items:
+        first.setdefault(str(item.parent_id), item)
+    return first
 
 
 def documents_of(items, chunks) -> dict:
@@ -297,6 +324,7 @@ class Aspect:
     confidence: float = 0.0
     score: float = 0.0
     budget: int = 0
+    focus: object = None   # the leaves its searches may return, when its words name a source
 
 
 def decompose(question, ask):
@@ -401,7 +429,7 @@ def add_views(aspects, ask):
 def preliminary_confidence(index, aspect, paraphrase_vector):
     """Top cross-encoder score over the paraphrase view's first ten hits."""
     hits = collapsed_candidates(index, paraphrase_vector,
-                                bm25_scores(index, aspect.views[0]))
+                                bm25_scores(index, aspect.views[0], aspect.focus), aspect.focus)
     top = [leaf for leaf, _ in hits[: settings.PRELIMINARY_RERANK_TOP_K]]
     return max((score for _, score in rerank(index, aspect.text, top)), default=0.0)
 
@@ -454,11 +482,11 @@ def allocate_budgets(aspects):
 # =========================================================================
 
 
-def view_candidates(index, view_text, view_vector, aspect_text):
+def view_candidates(index, view_text, view_vector, aspect_text, focus=None):
     """Collapsed and multi-branch rankings fused by RRF, then the structural step."""
-    view_bm25 = bm25_scores(index, view_text)
-    collapsed = collapsed_candidates(index, view_vector, view_bm25)
-    branches = multi_branch_candidates(index, view_vector, view_bm25)
+    view_bm25 = bm25_scores(index, view_text, focus)
+    collapsed = collapsed_candidates(index, view_vector, view_bm25, focus)
+    branches = multi_branch_candidates(index, view_vector, view_bm25, focus)
     merged = rrf([[leaf for leaf, _ in collapsed], [leaf for leaf, _ in branches]])
     return apply_structure(index, merged, aspect_text)
 
@@ -466,27 +494,38 @@ def view_candidates(index, view_text, view_vector, aspect_text):
 # --- 4a. Collapsed retrieval and summary expansion ------------------------
 
 
-def collapsed_candidates(index, view_vector, view_bm25):
+def collapsed_candidates(index, view_vector, view_bm25, focus=None):
     """Dense search over every node and BM25 over the leaves, fused; summaries expand to leaves."""
     depth = settings.FLAT_TREE_TOP_K_PER_VIEW
-    dense = _best(index.node_vectors @ view_vector, depth)
+    dense = _dense_ranking(index.node_vectors, view_vector, depth, focus)
     # BM25 covers leaves only, and leaf i is search position i.
     sparse = [i for i in _best(view_bm25, depth) if view_bm25[i] > 0]
     best: dict = {}
     for position, score in rrf([dense, sparse])[:depth]:
         node = index.node_ids[position]
         leaves = ([position] if index.layer[node] == 0
-                  else expand_summary(index, node, view_vector))
+                  else expand_summary(index, node, view_vector, focus=focus))
         for leaf in leaves:
             best[leaf] = max(best.get(leaf, 0.0), score)
     return _ranked(best)
 
 
-def expand_summary(index, node, view_vector, depth=0):
+def _dense_ranking(vectors, view_vector, depth, focus):
+    """The nodes nearest a view, best first; with a focus, only those holding a leaf of it."""
+    scores = vectors @ view_vector
+    if focus is None:
+        return _best(scores, depth)
+    allowed = np.flatnonzero(focus.nodes)
+    return allowed[_best(scores[allowed], depth)].tolist()
+
+
+def expand_summary(index, node, view_vector, depth=0, focus=None):
     """Turn a summary hit into leaves, by the design's rule for its layer."""
     # Layer 1 is the lowest summary tier, 2 the middle, 3 and up the broad tiers.
     leaves = index.leaves_under[node]
     layer = index.layer[node]
+    if focus is not None:
+        leaves = [leaf for leaf in leaves if leaf in focus.leaves]
     direct = layer == 1 or (
         layer == 2 and len(leaves) <= settings.MAX_DESCENDANT_CHUNKS_FOR_DIRECT_EXPANSION)
     if (direct or depth >= settings.MAX_EXPANSION_RECURSION_DEPTH
@@ -495,10 +534,10 @@ def expand_summary(index, node, view_vector, depth=0):
                             settings.SUMMARY_EXPANSION_TOP_K_CHUNKS)
     # A broad summary routes to its best children and expands each of them.
     out = []
-    best_children = sorted(index.children[node],
+    best_children = sorted(_inside(index, index.children[node], focus),
                            key=lambda c: (-_cosine(index, c, view_vector), c))
     for child in best_children[: settings.MAX_CHILDREN_TO_FOLLOW_FROM_BROAD_SUMMARY]:
-        for leaf in expand_summary(index, child, view_vector, depth + 1):
+        for leaf in expand_summary(index, child, view_vector, depth + 1, focus):
             if leaf not in out:
                 out.append(leaf)
     return out
@@ -507,11 +546,11 @@ def expand_summary(index, node, view_vector, depth=0):
 # --- 4b. Multi-branch traversal -------------------------------------------
 
 
-def multi_branch_candidates(index, view_vector, view_bm25):
+def multi_branch_candidates(index, view_vector, view_bm25, focus=None):
     """Walk down from the top keeping several branches alive; collect leaves at the ends."""
     if not index.top_nodes:
         return []
-    frontier = _hybrid_nodes(index, index.top_nodes, view_vector, view_bm25)
+    frontier = _hybrid_nodes(index, _inside(index, index.top_nodes, focus), view_vector, view_bm25)
     frontier = frontier[: settings.MULTI_BRANCH_TOP_K_DEPTH_1]
     ends, depth = [], 1
     while frontier:
@@ -522,13 +561,15 @@ def multi_branch_candidates(index, view_vector, view_bm25):
                     or not kids):
                 ends.append(node)
             else:
-                below += _hybrid_nodes(index, kids, view_vector, view_bm25)[
+                below += _hybrid_nodes(index, _inside(index, kids, focus), view_vector, view_bm25)[
                     : settings.MULTI_BRANCH_TOP_K_PER_LEVEL]
         frontier = list(dict.fromkeys(below))
         depth += 1
     best: dict = {}
     for node in dict.fromkeys(ends):
         leaves = index.leaves_under[node]
+        if focus is not None:
+            leaves = [leaf for leaf in leaves if leaf in focus.leaves]
         order = hybrid_order(
             leaves,
             dense={i: float(index.leaf_vectors[i] @ view_vector) for i in leaves},
@@ -554,9 +595,11 @@ def tokenize(text):
     return re.findall(r"\w+", text.lower())
 
 
-def bm25_scores(index, text):
-    """BM25 score of every leaf for a text."""
-    return np.asarray(index.bm25.get_scores(tokenize(text)), dtype=float)
+def bm25_scores(index, text, focus=None):
+    """BM25 score of every leaf for a text; with a focus, nothing outside it scores."""
+    scores = np.asarray(index.bm25.get_scores(tokenize(text)), dtype=float)
+    # Leaves come first in search order, so the focus's first entries are the leaves.
+    return scores if focus is None else scores * focus.nodes[: len(scores)]
 
 
 def rrf(rankings):
@@ -618,6 +661,112 @@ def content_words(text):
 def _stopwords():
     from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
     return ENGLISH_STOP_WORDS
+
+
+# --- A question's words steering the search (development v16) -----------
+
+
+@dataclass(frozen=True)
+class Focus:
+    """The leaves a search may return, and which searchable nodes hold one."""
+
+    leaves: frozenset
+    nodes: np.ndarray
+
+
+def focus_on(index, leaves):
+    """A search limited to these leaves."""
+    leaves = frozenset(leaves)
+    nodes = np.fromiter((not leaves.isdisjoint(index.leaves_under[n]) for n in index.node_ids),
+                        dtype=bool, count=len(index.node_ids))
+    return Focus(leaves, nodes)
+
+
+def _inside(index, nodes, focus):
+    """The nodes holding a leaf of the focus; all of them without one."""
+    if focus is None:
+        return nodes
+    return [n for n in nodes if not focus.leaves.isdisjoint(index.leaves_under[n])]
+
+
+def named_sources(index, text):
+    """The unit's sources a text names as the corpus writes them; a name inside a longer one does not count."""
+    found, rest = [], text
+    for name in index.source_names:
+        pattern = rf"(?<!\w){re.escape(name)}(?!\w)"
+        if re.search(pattern, rest):
+            found.append(name)
+            rest = re.sub(pattern, " ", rest)
+    return found
+
+
+def named_dates(text):
+    """The full dates a text names, in the form published_date gives."""
+    return list(dict.fromkeys(f"{month} {int(day)}, {year}"
+                              for month, day, year in re.findall(settings.FULL_DATE, text)))
+
+
+def source_focus(index, text):
+    """A search limited to the sources a text names; None when it names none."""
+    names = named_sources(index, text) if settings.SOURCE_FOCUS else []
+    if not names:
+        return None
+    return focus_on(index, [leaf for leaf, source in enumerate(index.source) if source in names])
+
+
+def search_targets(index, question):
+    """What the evidence must hold some of: each article the question dates, then each source it names."""
+    if not settings.SOURCE_FOCUS or not index.source_names:
+        return []
+    names = named_sources(index, question)
+    targets = []
+    for date in named_dates(question):
+        dated = {leaf for leaf, day in enumerate(index.date)
+                 if day == date and (not names or index.source[leaf] in names)}
+        if dated:
+            targets.append(dated)
+    for name in names:
+        targets.append({leaf for leaf, source in enumerate(index.source) if source == name})
+    return targets
+
+
+def _make_room(groups, keep):
+    """The group a new chunk joins: a free slot first, else the place of the weakest chunk no target needs."""
+    aspects = sorted(groups[:-1], key=len, reverse=True)
+    if sum(len(group) for group in groups) < settings.FINAL_CONTEXT_CHUNKS:
+        return aspects[0]
+    for group in aspects + [groups[-1]]:
+        for at in range(len(group) - 1, -1, -1):
+            if group[at][0] not in keep:
+                del group[at]
+                return group
+    return None
+
+
+def cover_targets(groups, targets, search):
+    """Give each target MIN_CHUNKS_PER_TARGET chunks; returns how many had to be placed."""
+    least, placed = settings.MIN_CHUNKS_PER_TARGET, 0
+    held = lambda: {leaf for group in groups for leaf, _ in group}  # noqa: E731
+    in_order = [leaf for group in groups for leaf, _ in group]
+    # The chunks already covering a target stay.
+    keep = {leaf for target in targets for leaf in [x for x in in_order if x in target][:least]}
+    for target in targets:
+        need = least - len(held() & set(target))
+        if need <= 0:
+            continue
+        for leaf, score in search(target):
+            if need == 0:
+                break
+            if leaf in held():
+                continue
+            group = _make_room(groups, keep)
+            if group is None:
+                return placed
+            group.append((leaf, score))
+            keep.add(leaf)
+            need -= 1
+            placed += 1
+    return placed
 
 
 # =========================================================================
@@ -1042,7 +1191,8 @@ class OursSystem(BaseSystem):
         """What the query steps read, from the tree M4 loaded or built (kept on _tree)."""
         self._tree_index = build_tree_index(
             self.chunks, self._tree_system.chunk_embeddings, self._tree_system._tree,
-            documents_of(items, self.chunks), document_headers(items, self.chunks))
+            documents_of(items, self.chunks), document_headers(items, self.chunks),
+            document_fields(items, self.chunks))
 
     def tree_for(self, items):
         """The system holding a unit's tree, M4 unless its filter would leave a document out, and that count."""
@@ -1128,6 +1278,11 @@ class OursSystem(BaseSystem):
         view_vectors = [vectors[2 * i: 2 * i + 2] for i in range(len(aspects))]
         question_vector = vectors[-1]
 
+        # Each aspect searches the sources it names, or else the question's.
+        question_focus = source_focus(index, query)
+        for a in aspects:
+            a.focus = source_focus(index, a.text) or question_focus
+
         # Step 2: aspect scores.
         for a, (paraphrase_vector, _) in zip(aspects, view_vectors):
             a.confidence = preliminary_confidence(index, a, paraphrase_vector)
@@ -1139,7 +1294,7 @@ class OursSystem(BaseSystem):
         # Steps 4-5: each aspect's views, pooled and reranked against the aspect.
         rankings = []
         for a, vecs in zip(aspects, view_vectors):
-            views = [view_candidates(index, text, vec, a.text)
+            views = [view_candidates(index, text, vec, a.text, a.focus)
                      for text, vec in zip(a.views, vecs)]
             pool = aspect_pool(index, views)
             rankings.append(rerank(index, a.text, [leaf for leaf, _ in pool]))
@@ -1151,6 +1306,14 @@ class OursSystem(BaseSystem):
         # Step 7: merge and backfill.
         groups = merge_and_backfill(
             rankings, [a.budget for a in aspects] + [settings.GLOBAL_VIEW_QUOTA])
+
+        # Some of every article the question dates and every source it names.
+        def search_target(leaves):
+            focus = focus_on(index, leaves)
+            found = aspect_pool(index, [view_candidates(index, query, question_vector, query, focus)])
+            return rerank(index, query, [leaf for leaf, _ in found])
+
+        n_placed = cover_targets(groups, search_targets(index, query), search_target)
         aspect_groups, global_group = groups[:-1], groups[-1]
 
         # Step 8: orientation for each aspect.
@@ -1206,6 +1369,9 @@ class OursSystem(BaseSystem):
             "ours_tree_cache_hit": self._tree_system.tree_cache_hit,
             "ours_tree_degenerate": bool(self._tree_system.index_stats.get("degenerate_no_tree")),
             "ours_n_short_documents": self._n_short_documents,
+            "ours_named_sources": named_sources(index, query),
+            "ours_named_dates": named_dates(query) if index.source_names else [],
+            "ours_n_chunks_placed": n_placed,
             "ours_code": CODE_FINGERPRINT,
             "ours_reranker_revision": settings.RERANKER_REVISION,
         }

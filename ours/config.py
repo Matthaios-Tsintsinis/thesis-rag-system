@@ -45,6 +45,22 @@ TOKEN_COUNTER_MODEL = "gpt-4o-mini"
 # so NarrativeQA stays as it was. M4's tree and vectors do not see the name.
 DOCUMENT_HEADERS = True
 
+# A question naming a source or a date steers retrieval (development v16). 2,331 of
+# MultiHop's 2,556 questions name a source as the corpus writes it, which leaves about 94
+# of its 609 articles, and 810 of the 823 full dates they name belong to an article of a
+# named source. Each aspect searches the sources it names, or else the question's; the
+# global view stays open; and the evidence holds at least MIN_CHUNKS_PER_TARGET chunks of
+# every named source and dated article. No call: names are matched as written. On this
+# dataset a source and date filter took Hits@10 from 0.749 to 0.891 with bge-large-en-v1.5
+# (Multi-Meta-RAG, arXiv 2406.13213). HotpotQA and NarrativeQA have no sources, so they stay
+# as they were; MultiHop has no held-out questions, so this rests on label-free checks.
+SOURCE_FOCUS = True
+MIN_CHUNKS_PER_TARGET = 2
+FULL_DATE = (
+    r"\b(January|February|March|April|May|June|July|August|September|October|November|December)"
+    r"\s+(\d{1,2}),?\s+(\d{4})\b"
+)
+
 # --- Step 1: aspects and views --------------------------------------------
 
 MAX_ASPECTS = 3
