@@ -4,7 +4,9 @@
           the topology string to pin in ours/config.py, the pinned revisions
   smoke   two held-out HotpotQA units through the runner loop on a CPU:
           real loader and embedder, reader and cross-encoder faked
-  run     one held-out development cell; appends its scores to DEV_LOG.jsonl
+  run     one held-out development cell; appends its scores to DEV_LOG.jsonl;
+          --no-gold takes each unit's gold paragraphs out, so nothing answers
+          the questions: what a refusal is worth, rows kept apart
   replay  the decomposition call alone over a scored benchmark's questions,
           with more room than the scored cap, raw replies saved: why the
           aspect parse fails (reads questions only, never gold or scores)
@@ -121,6 +123,29 @@ class HeldOutNarrativeQA(NarrativeQABenchmark):
 HELD_OUT = {"hotpotqa": HeldOutHotpotQA,
             "hotpotqa_pooled": HeldOutHotpotQAPooled,
             "narrativeqa": HeldOutNarrativeQA}
+
+
+class _NoGold:
+    """A held-out HotpotQA loader with each unit's gold paragraphs taken out."""
+
+    def iter_eval_units(self, *, split, max_units=None):
+        for unit in super().iter_eval_units(split=split, max_units=max_units):
+            gold = {doc for query in unit.queries for doc in gold_documents(query)}
+            corpus = tuple(item for item in unit.corpus if str(item.parent_id) not in gold)
+            if corpus:
+                yield replace(unit, corpus_id=f"{unit.corpus_id}::no_gold", corpus=corpus)
+
+
+class NoGoldHotpotQA(_NoGold, HeldOutHotpotQA):
+    """Each question over its own paragraphs, its gold ones gone."""
+
+
+class NoGoldHotpotQAPooled(_NoGold, HeldOutHotpotQAPooled):
+    """Each shard with the gold paragraphs of all its questions gone."""
+
+
+# NarrativeQA's gold is an answer, not a document: there is nothing to take out.
+NO_GOLD = {"hotpotqa": NoGoldHotpotQA, "hotpotqa_pooled": NoGoldHotpotQAPooled}
 
 
 # --- numbers from a cell's rows (also used by scripts/report_ours.py) -----
@@ -452,8 +477,12 @@ def smoke() -> None:
 # --- held-out development runs ---------------------------------------------
 
 
-def dev_run(benchmark: str, version: str, lockfile: Path, resume: bool) -> dict:
+def dev_run(benchmark: str, version: str, lockfile: Path, resume: bool,
+            no_gold: bool = False) -> dict:
     """One held-out cell; its numbers are appended to outputs/ours_dev/DEV_LOG.jsonl."""
+    if no_gold and benchmark not in NO_GOLD:
+        raise SystemExit(f"[dev] REFUSED: {benchmark} has no gold documents to take out")
+    label = f"{version}_no_gold" if no_gold else version
     from ours.model import CODE_FINGERPRINT, OursSystem
     from src import paths
     from src.eval.base import BenchmarkRunner
@@ -470,18 +499,18 @@ def dev_run(benchmark: str, version: str, lockfile: Path, resume: bool) -> dict:
                          "(for example .../thesis_rag/cache_ours_dev); the banked "
                          "cache holds only scored-unit trees")
     assert_environment_pinned(lockfile)
-    out = paths.output_dir() / "ours_dev" / version / f"{benchmark}_OURS_dev.jsonl"
+    out = paths.output_dir() / "ours_dev" / label / f"{benchmark}_OURS_dev.jsonl"
     assert_bank_generator_consistent(out.parent, settings.READER)
     assert_bank_gpu_consistent(out.parent)
 
-    loader = HELD_OUT[benchmark]()
+    loader = (NO_GOLD if no_gold else HELD_OUT)[benchmark]()
     runner = BenchmarkRunner(output_path=out, resume=resume)
     t0 = time.perf_counter()
     n_this = sum(1 for _ in runner.run(OursSystem(config=llama_config()), loader,
                                        split="validation"))
     golds, docs = golds_of(loader)
     numbers = ours_numbers(read_rows(out), golds, docs)
-    line = {"version": version, "benchmark": benchmark,
+    line = {"version": label, "benchmark": benchmark,
             "git_commit": _git_commit_short(), "ours_code": CODE_FINGERPRINT,
             "rows_this_process": n_this, "elapsed_s": round(time.perf_counter() - t0, 1),
             "timestamp": time.strftime("%Y%m%d-%H%M%S"), **numbers}
@@ -657,6 +686,8 @@ def main() -> None:
     r.add_argument("--version", required=True, help="Label for this development version.")
     r.add_argument("--lockfile", type=Path, default=Path("requirements.lock"))
     r.add_argument("--resume", action="store_true")
+    r.add_argument("--no-gold", action="store_true",
+                   help="HotpotQA only: take each unit's gold paragraphs out; rows go to <version>_no_gold.")
     i = sub.add_parser("inspect", help="Answer-side breakdown of a development cell.")
     i.add_argument("--benchmark", required=True, choices=sorted(HELD_OUT))
     i.add_argument("--version", required=True)
@@ -693,7 +724,7 @@ def main() -> None:
     elif args.command == "inspect":
         inspect(args.benchmark, args.version)
     else:
-        dev_run(args.benchmark, args.version, args.lockfile, args.resume)
+        dev_run(args.benchmark, args.version, args.lockfile, args.resume, no_gold=args.no_gold)
 
 
 def inspect(benchmark: str, version: str) -> None:

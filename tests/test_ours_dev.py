@@ -91,6 +91,55 @@ class TestHeldOutDraws(unittest.TestCase):
         self.assertEqual(loader.stats["n_queries"], 2 * dev_ours.N_DEV_STORIES)
 
 
+class TestNoGold(unittest.TestCase):
+    """The held-out questions with their gold paragraphs gone: nothing in the corpus answers them."""
+
+    def _units(self, loader):
+        from datasets import Dataset
+
+        with mock.patch("datasets.load_dataset",
+                        return_value=Dataset.from_list(_hotpot_rows(1500))), \
+                contextlib.redirect_stdout(io.StringIO()):
+            return list(loader().iter_eval_units(split="validation"))
+
+    def test_only_the_gold_paragraphs_go(self):
+        for name in ("hotpotqa", "hotpotqa_pooled"):
+            whole = self._units(dev_ours.HELD_OUT[name])
+            gone = self._units(dev_ours.NO_GOLD[name])
+            self.assertEqual(len(gone), len(whole), name)
+            for a, b in zip(whole, gone):
+                gold = {doc for q in a.queries for doc in dev_ours.gold_documents(q)}
+                self.assertTrue(gold, name)
+                self.assertEqual(b.corpus, tuple(i for i in a.corpus if str(i.parent_id) not in gold))
+                self.assertLess(len(b.corpus), len(a.corpus), name)
+
+    def test_the_questions_and_their_gold_stay(self):
+        for name in ("hotpotqa", "hotpotqa_pooled"):
+            whole, gone = self._units(dev_ours.HELD_OUT[name]), self._units(dev_ours.NO_GOLD[name])
+            self.assertEqual([u.queries for u in gone], [u.queries for u in whole], name)
+
+    def test_a_unit_is_not_taken_for_the_whole_one(self):
+        whole, gone = self._units(dev_ours.HELD_OUT["hotpotqa"]), self._units(dev_ours.NO_GOLD["hotpotqa"])
+        self.assertFalse({u.corpus_id for u in whole} & {u.corpus_id for u in gone})
+
+    def test_a_unit_left_empty_is_skipped(self):
+        from datasets import Dataset
+
+        rows = _hotpot_rows(1500)
+        for row in rows:
+            row["context"] = {"title": [row["context"]["title"][0]],
+                              "sentences": [row["context"]["sentences"][0]]}
+        with mock.patch("datasets.load_dataset", return_value=Dataset.from_list(rows)), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(list(dev_ours.NO_GOLD["hotpotqa"]().iter_eval_units(split="validation")), [])
+
+    def test_narrativeqa_has_no_documents_to_take_out(self):
+        self.assertNotIn("narrativeqa", dev_ours.NO_GOLD)
+        with self.assertRaises(SystemExit) as caught:
+            dev_ours.dev_run("narrativeqa", "v0", Path("requirements.lock"), False, no_gold=True)
+        self.assertIn("gold", str(caught.exception))
+
+
 class TestNumbers(unittest.TestCase):
     """The numbers a cell's rows give, as the report and the dev log read them."""
 
@@ -218,6 +267,10 @@ class TestCensus(unittest.TestCase):
         self.assertIn("hotpotqa: 0 units warm, 2 to build", text)
 
 
+class _TwoUnitsNoGold(dev_ours._NoGold, TwoHotpotUnits):
+    """The smoke test's units through the real filter."""
+
+
 class TestDevRun(unittest.TestCase):
     """A development run logs its numbers and refuses the banked cache."""
 
@@ -245,6 +298,33 @@ class TestDevRun(unittest.TestCase):
                          ("v0", "hotpotqa", 2))
         from ours.model import CODE_FINGERPRINT
         self.assertEqual(line["ours_code"], CODE_FINGERPRINT)
+
+    def test_a_no_gold_run_keeps_its_rows_apart(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            lock = root / "requirements.lock"
+            lock.write_text("# lock\nnumpy==0.0.0\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"THESIS_CACHE_DIR": str(root / "cache"),
+                                              "THESIS_OUTPUT_DIR": str(root / "out")}), \
+                    mock.patch.dict(dev_ours.NO_GOLD, {"hotpotqa": _TwoUnitsNoGold}), \
+                    mock.patch("scripts.pin_environment.check_lockfile", return_value=0), \
+                    ours_fakes(root / "cache", FakeReader(DECOMPOSITIONS, ANSWERS)), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                dev_ours.dev_run("hotpotqa", "v0", lock, False, no_gold=True)
+            log = (root / "out" / "ours_dev" / "DEV_LOG.jsonl").read_text().splitlines()
+            self.assertTrue((root / "out" / "ours_dev" / "v0_no_gold" / "hotpotqa_OURS_dev.jsonl").exists())
+            self.assertFalse((root / "out" / "ours_dev" / "v0").exists())
+            rows = dev_ours.read_rows(root / "out" / "ours_dev" / "v0_no_gold" / "hotpotqa_OURS_dev.jsonl")
+        self.assertEqual(json.loads(log[0])["version"], "v0_no_gold")
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            self.assertEqual(float(row["retrieval"]["recall"]), 0.0, "gold reached the reader")
+
+    def test_the_flag_reaches_the_run(self):
+        argv = ["dev_ours", "run", "--benchmark", "hotpotqa", "--version", "v0", "--no-gold"]
+        with mock.patch("sys.argv", argv), mock.patch.object(dev_ours, "dev_run") as run:
+            dev_ours.main()
+        self.assertTrue(run.call_args.kwargs["no_gold"])
 
 
 def _query(qid, text="Did A report X before B reported Y?", qtype="temporal_query"):
