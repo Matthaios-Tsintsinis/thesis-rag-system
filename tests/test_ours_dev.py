@@ -389,6 +389,213 @@ class _TwoUnitsNoGold(dev_ours._NoGold, TwoHotpotUnits):
     """The smoke test's units through the real filter."""
 
 
+class _NoLabels:
+    """A MultiHop-shaped question: its text and id, and nothing a label-free check may touch."""
+
+    def __init__(self, query_id, question_text):
+        self.query_id, self.question_text = query_id, question_text
+
+    def __getattr__(self, name):
+        raise AssertionError(f"the label-free bench read {name}")
+
+
+class _NewsUnits:
+    """A corpus with sources; every scorer raises, as nothing may be scored."""
+
+    name = "multihop_rag"
+    stats: dict = {}
+
+    def __init__(self):
+        from tests.test_ours_sources import NEWS
+        self.corpus = NEWS.corpus
+
+    def iter_eval_units(self, *, split, max_units=None):
+        questions = [_NoLabels(f"q{i}", f"Did The Verge report the merger of the firms in week {i}?")
+                     for i in range(6)]
+        yield SimpleNamespace(corpus_id="news", corpus=self.corpus, queries=tuple(questions))
+
+    def score_answer(self, predicted, query):
+        raise AssertionError("the label-free bench scored an answer")
+
+    def score_retrieval(self, retrieved, query, scoring_ranking=None):
+        raise AssertionError("the label-free bench scored retrieval")
+
+
+class TestBench(unittest.TestCase):
+    """Retrieval alone, option against option."""
+
+    def _bench(self, root, reader, benchmark="hotpotqa", options=("v14", "v15", "v17"), **kwargs):
+        lock = root / "requirements.lock"
+        lock.write_text("# lock\nnumpy==0.0.0\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"THESIS_CACHE_DIR": str(root / "cache"),
+                                          "THESIS_OUTPUT_DIR": str(root / "out")}), \
+                mock.patch.dict(dev_ours.DRAWS["a"], {"hotpotqa": TwoHotpotUnits}), \
+                mock.patch("scripts.pin_environment.check_lockfile", return_value=0), \
+                ours_fakes(root / "cache", reader), \
+                contextlib.redirect_stdout(io.StringIO()):
+            return dev_ours.bench(benchmark, "a", list(options), lock, **kwargs)
+
+    def test_every_option_answers_every_question(self):
+        with tempfile.TemporaryDirectory() as td:
+            report = self._bench(Path(td), FakeReader(DECOMPOSITIONS, ANSWERS))
+            self.assertTrue((Path(td) / "out" / "ours_bench" / "hotpotqa_a.json").exists())
+        self.assertEqual(sorted(report["per_question"]), ["v14", "v15", "v17"])
+        for rows in report["per_question"].values():
+            self.assertEqual(sorted(rows), ["q0", "q1"])
+
+    def test_it_measures_what_a_full_run_records(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            rows = run_cell(root / "cache", root / "cell.jsonl")
+            report = self._bench(root, FakeReader(DECOMPOSITIONS, ANSWERS), options=("as_is",))
+        from ours import config as settings
+        for row in rows:
+            numbers = report["per_question"]["as_is"][str(row["query_id"])]
+            self.assertAlmostEqual(numbers["context_recall"], float(row["retrieval"]["recall"]))
+            self.assertAlmostEqual(numbers["map10"], float(row["retrieval"]["map_at_k"]["10"]))
+            self.assertEqual(numbers["chunks"], float(row["n_retrieved"]))
+            self.assertLessEqual(numbers["chunks"], settings.FINAL_CONTEXT_CHUNKS)
+
+    def test_the_reader_is_asked_once_across_the_options(self):
+        with tempfile.TemporaryDirectory() as td:
+            once = FakeReader(DECOMPOSITIONS, ANSWERS)
+            self._bench(Path(td), once, options=("v15",))
+        with tempfile.TemporaryDirectory() as td:
+            three = FakeReader(DECOMPOSITIONS, ANSWERS)
+            self._bench(Path(td), three, options=("v14", "v15", "v17"))
+        self.assertEqual(len(once.prompts), len(three.prompts))
+
+    def test_a_later_session_pays_for_no_reply(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._bench(Path(td), FakeReader(DECOMPOSITIONS, ANSWERS))
+            again = FakeReader(DECOMPOSITIONS, ANSWERS)
+            self._bench(Path(td), again)
+        self.assertEqual(again.prompts, [])
+
+    def test_no_answer_is_asked_for(self):
+        reader = FakeReader(DECOMPOSITIONS, ANSWERS)
+        with tempfile.TemporaryDirectory() as td:
+            self._bench(Path(td), reader)
+        from ours import config as settings
+        asked = {s for s, _ in reader.prompts}
+        self.assertLessEqual(asked, {settings.DECOMPOSE_PROMPT, settings.PARAPHRASE_PROMPT, settings.HYDE_PROMPT})
+
+    def test_options_differ_as_their_settings_do(self):
+        with tempfile.TemporaryDirectory() as td:
+            report = self._bench(Path(td), FakeReader(DECOMPOSITIONS, ANSWERS), options=("v14", "v15"))
+        tokens = lambda name: sum(r["tokens"] for r in report["per_question"][name].values())  # noqa: E731
+        self.assertGreater(tokens("v15"), tokens("v14"))
+
+    def test_the_first_option_can_be_held_to_a_versions_rows(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            rows = run_cell(root / "cache", root / "cell.jsonl")
+            target = root / "out" / "ours_dev" / "vX" / "hotpotqa_OURS_dev.jsonl"
+            target.parent.mkdir(parents=True)
+            target.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+            report = self._bench(root, FakeReader(DECOMPOSITIONS, ANSWERS), options=("as_is",), check_rows="vX")
+            rows[1]["metadata"]["packed_ids"] = list(reversed(rows[1]["metadata"]["packed_ids"]))
+            target.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+            other = self._bench(root, FakeReader(DECOMPOSITIONS, ANSWERS), options=("as_is",), check_rows="vX")
+        self.assertEqual(report["same_evidence_as_rows"], {"version": "vX", "same": 2, "rows": 2})
+        self.assertEqual(other["same_evidence_as_rows"], {"version": "vX", "same": 1, "rows": 2})
+
+    def test_a_held_out_bench_refuses_the_banked_cache(self):
+        with mock.patch.dict(os.environ, {"THESIS_CACHE_DIR": ""}), self.assertRaises(SystemExit) as caught:
+            dev_ours.bench("hotpotqa", "a", ["v14"], Path("requirements.lock"))
+        self.assertIn("development cache", str(caught.exception))
+
+    def test_the_options_are_checked_at_the_door(self):
+        argv = ["dev_ours", "bench", "--benchmark", "hotpotqa", "--options", "v14,nonsense"]
+        with mock.patch("sys.argv", argv), self.assertRaises(SystemExit) as caught:
+            dev_ours.main()
+        self.assertIn("nonsense", str(caught.exception))
+
+
+class TestBenchOnMultiHop(unittest.TestCase):
+    """MultiHop has no held-out questions: the bench reads questions and metadata, never a label."""
+
+    def _bench(self, root, warm=True, **kwargs):
+        from src.retrievers.m4_raptor import RaptorSystem
+
+        lock = root / "requirements.lock"
+        lock.write_text("# lock\nnumpy==0.0.0\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"THESIS_OUTPUT_DIR": str(root / "out")}), \
+                mock.patch("src.eval.multihop.MultiHopBenchmark", _NewsUnits), \
+                mock.patch("scripts.pin_environment.check_lockfile", return_value=0), \
+                mock.patch.object(RaptorSystem, "substrate_warm_path", return_value="warm" if warm else None), \
+                ours_fakes(root / "cache", FakeReader({}, {})), \
+                contextlib.redirect_stdout(io.StringIO()):
+            return dev_ours.bench("multihop_rag", "a", ["v15", "v16"], lock, **kwargs)
+
+    def test_it_reads_no_label_and_scores_nothing(self):
+        with tempfile.TemporaryDirectory() as td:
+            report = self._bench(Path(td))
+        self.assertEqual(len(report["per_question"]["v16"]), 6)
+
+    def test_it_shows_what_the_focus_does(self):
+        with tempfile.TemporaryDirectory() as td:
+            report = self._bench(Path(td))
+        before = report["summary"]["v15"]["means"]
+        after = report["summary"]["v16"]["means"]
+        self.assertEqual(after["names_a_source"], 1.0)
+        self.assertEqual(after["every_source_read"], 1.0)
+        self.assertGreaterEqual(after["from_named"], before["from_named"])
+        self.assertGreater(after["from_named"], 0.8)
+
+    def test_it_takes_a_seeded_sample(self):
+        with tempfile.TemporaryDirectory() as td:
+            first = self._bench(Path(td), limit=2)
+        with tempfile.TemporaryDirectory() as td:
+            second = self._bench(Path(td), limit=2)
+        self.assertEqual(len(first["per_question"]["v16"]), 2)
+        self.assertEqual(sorted(first["per_question"]["v16"]), sorted(second["per_question"]["v16"]))
+
+    def test_it_never_builds_a_tree(self):
+        with tempfile.TemporaryDirectory() as td, self.assertRaises(SystemExit) as caught:
+            self._bench(Path(td), warm=False)
+        self.assertIn("banked", str(caught.exception))
+
+    def test_it_has_no_draws(self):
+        with self.assertRaises(SystemExit) as caught:
+            dev_ours.bench("multihop_rag", "b", ["v16"], Path("requirements.lock"))
+        self.assertIn("no draws", str(caught.exception))
+
+    def test_the_numbers_count_what_the_evidence_holds(self):
+        index = SimpleNamespace(chunks=[SimpleNamespace(chunk_id=f"c{i}") for i in range(4)],
+                                source=["A", "A", "B", "C"], date=["d1", "d2", "d3", "d4"])
+        read = lambda *ids: [SimpleNamespace(chunk=SimpleNamespace(chunk_id=i)) for i in ids]  # noqa: E731
+        prepared = SimpleNamespace(retrieved=read("c0", "c3"), extra={
+            "ours_named_sources": ["A", "B"], "ours_named_dates": ["d1", "d3"], "ours_n_chunks_placed": 2})
+        numbers = dev_ours._named_numbers(prepared, index)
+        self.assertEqual(numbers["names_a_source"], 1.0)
+        self.assertEqual(numbers["every_source_read"], 0.0)
+        self.assertEqual(numbers["from_named"], 0.5)
+        self.assertEqual(numbers["dated_read"], 0.5)
+        self.assertEqual(numbers["placed"], 2.0)
+
+    def test_a_question_naming_nothing_counts_for_nothing(self):
+        index = SimpleNamespace(chunks=[SimpleNamespace(chunk_id="c0")], source=["A"], date=["d1"])
+        prepared = SimpleNamespace(retrieved=[SimpleNamespace(chunk=SimpleNamespace(chunk_id="c0"))], extra={
+            "ours_named_sources": [], "ours_named_dates": [], "ours_n_chunks_placed": 0})
+        numbers = dev_ours._named_numbers(prepared, index)
+        self.assertEqual(numbers["names_a_source"], 0.0)
+        for name in ("every_source_read", "from_named", "dated_read"):
+            self.assertIsNone(numbers[name])
+
+
+class TestBestPhrase(unittest.TestCase):
+    def test_the_gold_word_for_word(self):
+        self.assertEqual(dev_ours.best_phrase_f1(["the Eighth Sphere"], "he rises to the eighth sphere and laughs"), 1.0)
+
+    def test_nothing_of_it(self):
+        self.assertEqual(dev_ours.best_phrase_f1(["a car"], "he rises to the eighth sphere"), 0.0)
+
+    def test_part_of_it_and_the_better_gold(self):
+        self.assertAlmostEqual(dev_ours.best_phrase_f1(["stolen money"], "he had some money"), 2 / 3)
+        self.assertEqual(dev_ours.best_phrase_f1(["stolen money", "money"], "he had some money"), 1.0)
+
+
 class TestDevRun(unittest.TestCase):
     """A development run logs its numbers and refuses the banked cache."""
 

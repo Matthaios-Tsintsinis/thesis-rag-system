@@ -7,6 +7,8 @@
   run     one held-out development cell; appends its scores to DEV_LOG.jsonl;
           --no-gold takes each unit's gold paragraphs out, so nothing answers
           the questions: what a refusal is worth, rows kept apart
+  bench   retrieval alone under each option, on the same questions, no reader's
+          answer: which change is worth a full run. On MultiHop label-free only
   replay  the decomposition call alone over a scored benchmark's questions,
           with more room than the scored cap, raw replies saved: why the
           aspect parse fails (reads questions only, never gold or scores)
@@ -664,6 +666,223 @@ def dev_run(benchmark: str, version: str, lockfile: Path, resume: bool,
     return line
 
 
+# --- bench: retrieval alone, option against option -------------------------
+
+_SWITCHES_OFF = {"DOCUMENT_HEADERS": False, "SOURCE_FOCUS": False, "QUESTION_VIEW": False,
+                 "SECOND_EMBEDDER_MODE": "off"}
+_V15 = dict(_SWITCHES_OFF, DOCUMENT_HEADERS=True)
+_V16 = dict(_V15, SOURCE_FOCUS=True)
+_V17 = dict(_V16, QUESTION_VIEW=True)
+# Each option is the settings of one state of the model, so a bench of one process
+# shows each step's effect on retrieval.
+BENCH_OPTIONS = {"as_is": {}, "v14": _SWITCHES_OFF, "v15": _V15, "v16": _V16, "v17": _V17,
+                 "v18_both": dict(_V17, SECOND_EMBEDDER_MODE="both"),
+                 "v18_only": dict(_V17, SECOND_EMBEDDER_MODE="only")}
+# v16 changes nothing where a corpus has no sources; MultiHop has no labels to read,
+# so all it can show there is what v16 is for.
+BENCH_DEFAULTS = {"hotpotqa": ["v14", "v15", "v17", "v18_both", "v18_only"],
+                  "hotpotqa_pooled": ["v14", "v15", "v17", "v18_both", "v18_only"],
+                  "narrativeqa": ["v14", "v17", "v18_both", "v18_only"],
+                  "multihop_rag": ["v15", "v16"]}
+MULTIHOP = "multihop_rag"
+
+
+class _Replies:
+    """The reader's replies to the steps before retrieval: paid for once, kept on disk for a later session."""
+
+    def __init__(self, path: Path, every: float = 600.0) -> None:
+        self.path = path
+        self.every = every
+        self.seen = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        self.saved_at = time.monotonic()
+
+    def save(self) -> None:
+        temporary = self.path.with_name(self.path.name + ".tmp")
+        temporary.write_text(json.dumps(self.seen), encoding="utf-8")
+        temporary.replace(self.path)
+        self.saved_at = time.monotonic()
+
+    def wrapping(self, generate):
+        def generate_once(system_prompt, user_prompt, cfg=None):
+            key = json.dumps([system_prompt, user_prompt, cfg.max_new_tokens if cfg is not None else None])
+            if key not in self.seen:
+                self.seen[key] = generate(system_prompt=system_prompt, user_prompt=user_prompt, cfg=cfg)
+                if time.monotonic() - self.saved_at >= self.every:
+                    self.save()
+            return self.seen[key]
+        return generate_once
+
+
+def best_phrase_f1(golds, text: str) -> float:
+    """The best token F1 any run of the text reaches against a gold, of about the gold's length."""
+    from src.eval.scorers.extractive import normalize_qasper_answer as norm
+
+    tokens = norm(text).split()
+    at: dict = {}
+    for i, token in enumerate(tokens):
+        at.setdefault(token, []).append(i)
+    best = 0.0
+    for gold in golds:
+        want = Counter(norm(gold).split())
+        size = sum(want.values())
+        starts = {max(0, p - k) for token in want for p in at.get(token, ()) for k in range(size + 1)}
+        for start in starts:
+            for length in {max(1, size - 1), size, size + 1}:
+                run = tokens[start: start + length]
+                common = sum((Counter(run) & want).values())
+                if common:
+                    precision, recall = common / len(run), common / size
+                    best = max(best, 2 * precision * recall / (precision + recall))
+    return best
+
+
+def _named_numbers(prepared, index) -> dict:
+    """Label-free: whether the evidence holds what a question names. Reads no gold and no score."""
+    leaf_of = {chunk.chunk_id: leaf for leaf, chunk in enumerate(index.chunks)}
+    leaves = [leaf_of[r.chunk.chunk_id] for r in prepared.retrieved]
+    names = prepared.extra["ours_named_sources"]
+    dates = prepared.extra["ours_named_dates"]
+    read = [index.source[leaf] for leaf in leaves]
+    days = {index.date[leaf] for leaf in leaves}
+    return {"names_a_source": float(bool(names)),
+            "every_source_read": float(all(n in read for n in names)) if names else None,
+            "from_named": sum(s in names for s in read) / len(read) if names and read else None,
+            "dated_read": sum(d in days for d in dates) / len(dates) if dates else None,
+            "placed": float(prepared.extra["ours_n_chunks_placed"])}
+
+
+def bench_numbers(benchmark: str, loader, query, prepared, index) -> dict:
+    """One question's retrieval numbers under one option."""
+    numbers = {"chunks": float(len(prepared.retrieved)), "tokens": float(prepared.evidence_tokens)}
+    if benchmark == MULTIHOP:
+        return {**numbers, **_named_numbers(prepared, index)}
+    if benchmark == "narrativeqa":
+        from scripts.export_comparison import gold_texts
+
+        best = best_phrase_f1(gold_texts(query), " ".join(r.chunk.text for r in prepared.retrieved))
+        return {**numbers, "best_phrase": best, "holds_answer": float(best >= 0.8)}
+    score = loader.score_retrieval(prepared.retrieved, query, scoring_ranking=prepared.scoring_ranking)
+    gold = gold_documents(query)
+    ranking = prepared.extra["ours_doc_ranking"]
+    return {**numbers, "r1": recall_at(ranking, gold, 1), "r5": recall_at(ranking, gold, 5),
+            "r10": recall_at(ranking, gold, 10), "map10": float(score.map_at_k.get(10, 0.0)),
+            "context_recall": float(score.recall)}
+
+
+def bench_summary(results: dict) -> dict:
+    """Each option's means, and its paired difference from the option before, by the grid's bootstrap."""
+    import numpy as np
+
+    from scripts.report_ours import SEED, bootstrap_ci
+
+    rng = np.random.default_rng(SEED)
+    out, before = {}, None
+    for name, rows in results.items():
+        metrics = sorted({m for numbers in rows.values() for m in numbers})
+        entry = {"n": len(rows), "means": {}, "against_previous": {}}
+        for metric in metrics:
+            values = [r[metric] for r in rows.values() if r.get(metric) is not None]
+            entry["means"][metric] = sum(values) / len(values) if values else None
+            if before is None:
+                continue
+            pairs = [(rows[q][metric], results[before][q][metric]) for q in rows
+                     if rows[q].get(metric) is not None and results[before].get(q, {}).get(metric) is not None]
+            if pairs:
+                d = np.asarray([a - b for a, b in pairs], dtype=float)
+                lo, hi = bootstrap_ci(d, rng)
+                entry["against_previous"][metric] = {"delta": float(d.mean()), "ci": [lo, hi]}
+        out[name] = entry
+        before = name
+    return out
+
+
+def bench(benchmark: str, draw: str, options: list, lockfile: Path, limit: int | None = None,
+          check_rows: str | None = None) -> dict:
+    """Retrieval alone under each option, one process, the same questions; no reader's answer."""
+    from unittest import mock
+
+    from ours import model as om
+    from src import models, paths
+    from src.eval.multihop import MultiHopBenchmark
+    from src.eval.runner import assert_environment_pinned
+
+    if benchmark != MULTIHOP and not os.environ.get("THESIS_CACHE_DIR"):
+        raise SystemExit("[bench] REFUSED: set THESIS_CACHE_DIR to a development cache; "
+                         "the banked cache holds only scored-unit trees")
+    if benchmark == MULTIHOP and draw != "a":
+        raise SystemExit("[bench] REFUSED: MultiHop has one set of questions and no draws")
+    assert_environment_pinned(lockfile)
+    out_dir = paths.output_dir() / "ours_bench"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = benchmark if benchmark == MULTIHOP else f"{benchmark}_{draw}"
+    # HotpotQA's two sets share their questions, so they share the replies too.
+    replies = _Replies(out_dir / ("replies_multihop.json" if benchmark == MULTIHOP else f"replies_{draw}.json"))
+    loader = MultiHopBenchmark() if benchmark == MULTIHOP else DRAWS[draw][benchmark]()
+    results: dict = {name: {} for name in options}
+    packed: dict = {}
+    embedded: dict = {}
+    relevance: dict = {}
+    real_embed, real_encoder = models.embed_texts, om.cross_encoder_scores
+
+    def embed_once(texts, model_name=None):
+        key = (model_name, tuple(texts))
+        if key not in embedded:
+            embedded[key] = real_embed(texts, model_name=model_name)
+        return embedded[key]
+
+    def encoder_once(query, passages):
+        missing = [p for p in dict.fromkeys(passages) if (query, p) not in relevance]
+        if missing:
+            relevance.update({(query, p): s for p, s in zip(missing, real_encoder(query, missing))})
+        return [relevance[(query, p)] for p in passages]
+
+    with mock.patch.object(models, "generate", replies.wrapping(models.generate)), \
+            mock.patch.object(models, "embed_texts", embed_once), \
+            mock.patch.object(om, "cross_encoder_scores", encoder_once):
+        system = om.OursSystem(config=llama_config())
+        for unit in loader.iter_eval_units(split="validation"):
+            items = list(unit.corpus)
+            queries = list(unit.queries)
+            if benchmark == MULTIHOP:
+                # MultiHop's tree is banked, and nothing here may add to that cache.
+                if system.tree_for(items)[0].substrate_warm_path(items) is None:
+                    raise SystemExit("[bench] REFUSED: no banked MultiHop tree under this cache")
+            if limit is not None and len(queries) > limit:
+                queries = random.Random(LATER_SEED).sample(queries, limit)
+            system.index_items(items)
+            for name in options:
+                overrides = BENCH_OPTIONS[name]
+                with (mock.patch.multiple(settings, **overrides) if overrides else contextlib.nullcontext()):
+                    system.build_index(items)
+                    for query in queries:
+                        prepared = system.prepare(query.question_text)
+                        qid = str(query.query_id)
+                        results[name][qid] = bench_numbers(benchmark, loader, query, prepared,
+                                                           system._tree_index)
+                        if name == options[0]:
+                            packed[qid] = [r.chunk.chunk_id for r in prepared.packed]
+            embedded.clear()
+            relevance.clear()
+    replies.save()
+    summary = bench_summary(results)
+    report = {"benchmark": benchmark, "draw": draw, "options": options, "summary": summary, "per_question": results}
+    if check_rows:
+        label = check_rows if draw == "a" else f"{check_rows}_{draw}"
+        rows = read_rows(paths.output_dir() / "ours_dev" / label / f"{benchmark}_OURS_dev.jsonl")
+        same = sum(packed.get(str(r["query_id"])) == r["metadata"]["packed_ids"] for r in rows)
+        report["same_evidence_as_rows"] = {"version": check_rows, "same": same, "rows": len(rows)}
+        print(f"[bench] {options[0]} reads the evidence of {check_rows}'s rows on {same} of {len(rows)}")
+    path = out_dir / f"{stem}.json"
+    path.write_text(json.dumps(report), encoding="utf-8")
+    for name, entry in summary.items():
+        print(f"[bench] {stem} {name} n={entry['n']}: " + ", ".join(
+            f"{m} {v:.4f}" for m, v in entry["means"].items() if v is not None))
+        for metric, d in entry["against_previous"].items():
+            print(f"[bench]     {metric}: {d['delta']:+.4f} [{d['ci'][0]:+.4f}, {d['ci'][1]:+.4f}]")
+    print(f"[bench] saved {path}")
+    return report
+
+
 # --- decomposition replay -------------------------------------------------
 
 REPLAY_CAP = 512
@@ -843,6 +1062,14 @@ def main() -> None:
     v.add_argument("--a", required=True, help="The earlier version.")
     v.add_argument("--b", required=True, help="The later version.")
     v.add_argument("--draw", default="a", choices=sorted(DRAWS))
+    b = sub.add_parser("bench", help="Retrieval alone under each option, on the same questions.")
+    b.add_argument("--benchmark", required=True, choices=sorted(BENCH_DEFAULTS))
+    b.add_argument("--draw", default="a", choices=sorted(DRAWS))
+    b.add_argument("--options", default=None, help="Comma-separated, in order. Default by benchmark.")
+    b.add_argument("--limit", type=int, default=None, help="A seeded sample of each unit's questions.")
+    b.add_argument("--check-rows", default=None,
+                   help="A version whose rows the first option should reproduce, evidence for evidence.")
+    b.add_argument("--lockfile", type=Path, default=Path("requirements.lock"))
     p = sub.add_parser("replay", help="Decomposition replies over a scored benchmark's questions.")
     p.add_argument("--benchmark", required=True, choices=SCORED_BENCHMARKS)
     p.add_argument("--banked", type=Path, default=None,
@@ -853,6 +1080,13 @@ def main() -> None:
     p.add_argument("--lockfile", type=Path, default=Path("requirements.lock"))
     p.add_argument("--resume", action="store_true")
     args = ap.parse_args()
+    if args.command == "bench":
+        chosen = args.options.split(",") if args.options else BENCH_DEFAULTS[args.benchmark]
+        unknown = [name for name in chosen if name not in BENCH_OPTIONS]
+        if unknown:
+            raise SystemExit(f"[bench] REFUSED: unknown options {unknown}; there are {sorted(BENCH_OPTIONS)}")
+        bench(args.benchmark, args.draw, chosen, args.lockfile, limit=args.limit, check_rows=args.check_rows)
+        return
     if args.command == "replay":
         replay(args.benchmark, args.lockfile, args.banked, args.out, args.resume, args.cap)
         return
