@@ -68,6 +68,11 @@ MIN_ASPECT_IMPORTANCE = 0.25
 DECOMPOSE_MAX_TOKENS = 220
 PARAPHRASE_MAX_TOKENS = 80
 HYDE_MAX_TOKENS = 160
+# Each aspect also searches under its own words: the untouched question, when there is
+# one aspect (development v17). Until now the 13 aspect slots came only from the paraphrase
+# and the HyDE passage, which can lose a name or invent one, and the question itself searched
+# only for the 2 global slots. No call: the text is there.
+QUESTION_VIEW = True
 
 # --- Step 2: aspect scores ------------------------------------------------
 

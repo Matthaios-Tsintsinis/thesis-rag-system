@@ -1292,10 +1292,14 @@ class OursSystem(BaseSystem):
         allocate_budgets(aspects)
 
         # Steps 4-5: each aspect's views, pooled and reranked against the aspect.
+        own_vectors = (models.embed_texts([a.text for a in aspects], model_name=settings.EMBEDDER)
+                       if settings.QUESTION_VIEW else None)
         rankings = []
-        for a, vecs in zip(aspects, view_vectors):
+        for n, (a, vecs) in enumerate(zip(aspects, view_vectors)):
             views = [view_candidates(index, text, vec, a.text, a.focus)
                      for text, vec in zip(a.views, vecs)]
+            if settings.QUESTION_VIEW:
+                views.append(view_candidates(index, a.text, own_vectors[n], a.text, a.focus))
             pool = aspect_pool(index, views)
             rankings.append(rerank(index, a.text, [leaf for leaf, _ in pool]))
 
@@ -1384,7 +1388,7 @@ class OursSystem(BaseSystem):
             user_prompt=user_prompt,
             evidence_tokens=count_tokens(context),
             n_input_tokens=count_tokens(settings.READER_PROMPT + "\n" + user_prompt),
-            n_retrieval_calls=2 * len(aspects) + 1,
+            n_retrieval_calls=(3 if settings.QUESTION_VIEW else 2) * len(aspects) + 1,
             prepare_s=self._now() - t0,
             extra=extra,
         )
