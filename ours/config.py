@@ -14,6 +14,14 @@ READER_REVISION = "0e9e39f249a16976918f6564b8830bc894c89659"
 EMBEDDER = "sentence-transformers/multi-qa-mpnet-base-cos-v1"
 EMBEDDER_REVISION = "d51b22a1dfa8184e9258074e56e2875e50612dca"
 
+# The design's embedder, over the nodes of M4's tree (development v18). "both": its ranking
+# joins the collapsed search's fusion, beside M4's vectors and BM25. "only": its vectors
+# stand in for M4's in every search. "off": as v17. The tree's clusters and summaries stay
+# M4's in every mode, and its vectors are made as a unit is indexed, in no cache.
+SECOND_EMBEDDER = "BAAI/bge-m3"
+SECOND_EMBEDDER_REVISION = "5617a9f61b028005a4858fdac845db406aefb181"
+SECOND_EMBEDDER_MODE = "both"
+
 RERANKER = "BAAI/bge-reranker-v2-m3"
 RERANKER_REVISION = "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e"
 RERANK_BATCH = 32

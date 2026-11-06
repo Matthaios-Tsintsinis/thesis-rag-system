@@ -120,7 +120,8 @@ class TestGates(unittest.TestCase):
             return api
 
         pinned = {settings.READER: settings.READER_REVISION,
-                  settings.EMBEDDER: settings.EMBEDDER_REVISION}
+                  settings.EMBEDDER: settings.EMBEDDER_REVISION,
+                  settings.SECOND_EMBEDDER: settings.SECOND_EMBEDDER_REVISION}
         with mock.patch("huggingface_hub.HfApi", return_value=info_for(pinned)):
             om.check_model_revisions()
         moved = dict(pinned, **{settings.READER: "0" * 40})

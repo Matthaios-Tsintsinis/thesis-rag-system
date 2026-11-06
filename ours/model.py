@@ -75,6 +75,7 @@ class TreeIndex:
     source: list                      # leaf -> its document's source, or ""
     date: list                        # leaf -> its document's date in words, or ""
     source_names: list                # the unit's sources, longest first
+    second_vectors: object = None     # one row per searchable node, in the second embedder
 
 
 def build_tree_index(chunks, leaf_vectors, tree, docs, headers=None, fields=None) -> TreeIndex:
@@ -161,6 +162,36 @@ def build_tree_index(chunks, leaf_vectors, tree, docs, headers=None, fields=None
         date=[date for _, date in known],
         source_names=sorted({source for source, _ in known if source}, key=lambda s: (-len(s), s)),
     )
+
+
+def add_second_vectors(index) -> None:
+    """The second embedder over the index's nodes, as the settings' mode wants them."""
+    mode = settings.SECOND_EMBEDDER_MODE
+    if mode not in ("off", "both", "only"):
+        raise ValueError(f"unknown SECOND_EMBEDDER_MODE {mode!r}")
+    if mode == "off":
+        return
+    # Leaves as the chunks read, with no document's name: as M4's vectors were made.
+    n_leaves = len(index.chunks)
+    texts = ([chunk.text for chunk in index.chunks]
+             + [index.text[node] for node in index.node_ids[n_leaves:]])
+    vectors = np.asarray(models.embed_texts(texts, model_name=settings.SECOND_EMBEDDER),
+                         dtype=np.float32)
+    if mode == "both":
+        index.second_vectors = vectors
+        return
+    index.leaf_vectors = vectors[:n_leaves]
+    index.node_vectors = vectors
+    index.vector_of = dict(zip(index.node_ids, vectors))
+
+
+def embed_query(texts):
+    """A question's texts in the embedders searching: (the main vectors, the second's or None)."""
+    mode = settings.SECOND_EMBEDDER_MODE
+    main = settings.SECOND_EMBEDDER if mode == "only" else settings.EMBEDDER
+    vectors = models.embed_texts(texts, model_name=main)
+    second = models.embed_texts(texts, model_name=settings.SECOND_EMBEDDER) if mode == "both" else None
+    return vectors, second
 
 
 def _headed(name, text):
@@ -426,10 +457,11 @@ def add_views(aspects, ask):
 # =========================================================================
 
 
-def preliminary_confidence(index, aspect, paraphrase_vector):
+def preliminary_confidence(index, aspect, paraphrase_vector, second_vector=None):
     """Top cross-encoder score over the paraphrase view's first ten hits."""
     hits = collapsed_candidates(index, paraphrase_vector,
-                                bm25_scores(index, aspect.views[0], aspect.focus), aspect.focus)
+                                bm25_scores(index, aspect.views[0], aspect.focus), aspect.focus,
+                                second_vector)
     top = [leaf for leaf, _ in hits[: settings.PRELIMINARY_RERANK_TOP_K]]
     return max((score for _, score in rerank(index, aspect.text, top)), default=0.0)
 
@@ -482,10 +514,10 @@ def allocate_budgets(aspects):
 # =========================================================================
 
 
-def view_candidates(index, view_text, view_vector, aspect_text, focus=None):
+def view_candidates(index, view_text, view_vector, aspect_text, focus=None, second_vector=None):
     """Collapsed and multi-branch rankings fused by RRF, then the structural step."""
     view_bm25 = bm25_scores(index, view_text, focus)
-    collapsed = collapsed_candidates(index, view_vector, view_bm25, focus)
+    collapsed = collapsed_candidates(index, view_vector, view_bm25, focus, second_vector)
     branches = multi_branch_candidates(index, view_vector, view_bm25, focus)
     merged = rrf([[leaf for leaf, _ in collapsed], [leaf for leaf, _ in branches]])
     return apply_structure(index, merged, aspect_text)
@@ -494,14 +526,17 @@ def view_candidates(index, view_text, view_vector, aspect_text, focus=None):
 # --- 4a. Collapsed retrieval and summary expansion ------------------------
 
 
-def collapsed_candidates(index, view_vector, view_bm25, focus=None):
+def collapsed_candidates(index, view_vector, view_bm25, focus=None, second_vector=None):
     """Dense search over every node and BM25 over the leaves, fused; summaries expand to leaves."""
     depth = settings.FLAT_TREE_TOP_K_PER_VIEW
     dense = _dense_ranking(index.node_vectors, view_vector, depth, focus)
     # BM25 covers leaves only, and leaf i is search position i.
     sparse = [i for i in _best(view_bm25, depth) if view_bm25[i] > 0]
+    rankings = [dense, sparse]
+    if second_vector is not None:
+        rankings.append(_dense_ranking(index.second_vectors, second_vector, depth, focus))
     best: dict = {}
-    for position, score in rrf([dense, sparse])[:depth]:
+    for position, score in rrf(rankings)[:depth]:
         node = index.node_ids[position]
         leaves = ([position] if index.layer[node] == 0
                   else expand_summary(index, node, view_vector, focus=focus))
@@ -1086,13 +1121,15 @@ CODE_FINGERPRINT = code_fingerprint()
 
 
 def check_model_revisions():
-    """Refuse unless the hub still serves the pinned reader and embedder."""
+    """Refuse unless the hub still serves the pinned reader and embedders."""
     # The harness loads both by name, which means the hub's current revision.
     from huggingface_hub import HfApi
 
     api = HfApi()
-    for model_id, pinned in ((settings.READER, settings.READER_REVISION),
-                             (settings.EMBEDDER, settings.EMBEDDER_REVISION)):
+    pins = [(settings.READER, settings.READER_REVISION), (settings.EMBEDDER, settings.EMBEDDER_REVISION)]
+    if settings.SECOND_EMBEDDER_MODE != "off":
+        pins.append((settings.SECOND_EMBEDDER, settings.SECOND_EMBEDDER_REVISION))
+    for model_id, pinned in pins:
         served = api.model_info(model_id).sha
         if served != pinned:
             raise SystemExit(
@@ -1193,6 +1230,7 @@ class OursSystem(BaseSystem):
             self.chunks, self._tree_system.chunk_embeddings, self._tree_system._tree,
             documents_of(items, self.chunks), document_headers(items, self.chunks),
             document_fields(items, self.chunks))
+        add_second_vectors(self._tree_index)
 
     def tree_for(self, items):
         """The system holding a unit's tree, M4 unless its filter would leave a document out, and that count."""
@@ -1274,9 +1312,12 @@ class OursSystem(BaseSystem):
         aspects, parse_failed = decompose(query, ask)
         add_views(aspects, ask)
         texts = [view for a in aspects for view in a.views] + [query]
-        vectors = models.embed_texts(texts, model_name=settings.EMBEDDER)
+        vectors, seconds = embed_query(texts)
         view_vectors = [vectors[2 * i: 2 * i + 2] for i in range(len(aspects))]
         question_vector = vectors[-1]
+        view_seconds = [seconds[2 * i: 2 * i + 2] if seconds is not None else (None, None)
+                        for i in range(len(aspects))]
+        question_second = seconds[-1] if seconds is not None else None
 
         # Each aspect searches the sources it names, or else the question's.
         question_focus = source_focus(index, query)
@@ -1284,27 +1325,29 @@ class OursSystem(BaseSystem):
             a.focus = source_focus(index, a.text) or question_focus
 
         # Step 2: aspect scores.
-        for a, (paraphrase_vector, _) in zip(aspects, view_vectors):
-            a.confidence = preliminary_confidence(index, a, paraphrase_vector)
+        for a, (paraphrase_vector, _), (paraphrase_second, _) in zip(aspects, view_vectors, view_seconds):
+            a.confidence = preliminary_confidence(index, a, paraphrase_vector, paraphrase_second)
         score_aspects(aspects)
 
         # Step 3: budgets.
         allocate_budgets(aspects)
 
         # Steps 4-5: each aspect's views, pooled and reranked against the aspect.
-        own_vectors = (models.embed_texts([a.text for a in aspects], model_name=settings.EMBEDDER)
-                       if settings.QUESTION_VIEW else None)
+        own_vectors, own_seconds = (embed_query([a.text for a in aspects])
+                                    if settings.QUESTION_VIEW else (None, None))
         rankings = []
-        for n, (a, vecs) in enumerate(zip(aspects, view_vectors)):
-            views = [view_candidates(index, text, vec, a.text, a.focus)
-                     for text, vec in zip(a.views, vecs)]
+        for n, (a, vecs, secs) in enumerate(zip(aspects, view_vectors, view_seconds)):
+            views = [view_candidates(index, text, vec, a.text, a.focus, second_vector=sec)
+                     for text, vec, sec in zip(a.views, vecs, secs)]
             if settings.QUESTION_VIEW:
-                views.append(view_candidates(index, a.text, own_vectors[n], a.text, a.focus))
+                views.append(view_candidates(index, a.text, own_vectors[n], a.text, a.focus,
+                                             second_vector=None if own_seconds is None else own_seconds[n]))
             pool = aspect_pool(index, views)
             rankings.append(rerank(index, a.text, [leaf for leaf, _ in pool]))
 
         # Step 6: the untouched question as the protected global view.
-        pool = aspect_pool(index, [view_candidates(index, query, question_vector, query)])
+        pool = aspect_pool(index, [view_candidates(index, query, question_vector, query,
+                                                   second_vector=question_second)])
         rankings.append(rerank(index, query, [leaf for leaf, _ in pool]))
 
         # Step 7: merge and backfill.
@@ -1314,7 +1357,8 @@ class OursSystem(BaseSystem):
         # Some of every article the question dates and every source it names.
         def search_target(leaves):
             focus = focus_on(index, leaves)
-            found = aspect_pool(index, [view_candidates(index, query, question_vector, query, focus)])
+            found = aspect_pool(index, [view_candidates(index, query, question_vector, query, focus,
+                                                        second_vector=question_second)])
             return rerank(index, query, [leaf for leaf, _ in found])
 
         n_placed = cover_targets(groups, search_targets(index, query), search_target)
