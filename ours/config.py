@@ -16,11 +16,13 @@ EMBEDDER_REVISION = "d51b22a1dfa8184e9258074e56e2875e50612dca"
 
 # The design's embedder, over the nodes of M4's tree (development v18). "both": its ranking
 # joins the collapsed search's fusion, beside M4's vectors and BM25. "only": its vectors
-# stand in for M4's in every search. "off": as v17. The tree's clusters and summaries stay
-# M4's in every mode, and its vectors are made as a unit is indexed, in no cache.
+# stand in for M4's in every search. "off": no second embedder. The tree's clusters and
+# summaries stay M4's in every mode, and its vectors are made as a unit is indexed, in no cache.
+# The bench of 2026-11-07 chose "only", by the rule written before it ran: no measure of
+# "only" fell below "both", and it beat v17 on HotpotQA's MAP@10.
 SECOND_EMBEDDER = "BAAI/bge-m3"
 SECOND_EMBEDDER_REVISION = "5617a9f61b028005a4858fdac845db406aefb181"
-SECOND_EMBEDDER_MODE = "both"
+SECOND_EMBEDDER_MODE = "only"
 
 RERANKER = "BAAI/bge-reranker-v2-m3"
 RERANKER_REVISION = "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e"
@@ -79,8 +81,9 @@ HYDE_MAX_TOKENS = 160
 # Each aspect also searches under its own words: the untouched question, when there is
 # one aspect (development v17). Until now the 13 aspect slots came only from the paraphrase
 # and the HyDE passage, which can lose a name or invent one, and the question itself searched
-# only for the 2 global slots. No call: the text is there.
-QUESTION_VIEW = True
+# only for the 2 global slots. No call: the text is there. Rejected by the bench of
+# 2026-11-07, by the rule written before it ran: no retrieval measure moved on any set.
+QUESTION_VIEW = False
 
 # --- Step 2: aspect scores ------------------------------------------------
 
