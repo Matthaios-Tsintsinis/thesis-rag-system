@@ -252,6 +252,21 @@ REASON_LINE = (
 READER_PROMPT = ANSWER_PROMPT + " " + REASON_LINE
 READER_REASK_PROMPT = REASK_PROMPT + " " + REASON_LINE
 
+# A reply with no "Answer:" line goes on whole (development v19). With the gold
+# paragraphs taken out of held-out questions, 39 / 54 such replies ended by saying
+# they had nothing, and the reasoning itself became the final answer on 28 / 38 rows;
+# MultiHop's null questions credit only the refusal. So a last reply with no Answer
+# line whose last line says it has nothing, or a final answer of at most
+# SHORT_NOTHING_WORDS words that says it has nothing, is the refusal. It is read
+# last, after the cut, so no call changes.
+READ_UNREAD_REFUSALS = True
+SHORT_NOTHING_WORDS = 12
+NOTHING_SAID = (
+    r"\b(no (answer|information|mention|evidence|relevant)|not (mentioned|stated|provided|available|specified|given)"
+    r"|does not (say|state|mention|provide|contain|specify)|do not (say|state|mention|provide|contain|specify)"
+    r"|cannot be (determined|found|answered)|unknown|insufficient)\b"
+)
+
 # One more call cuts the reader's answer to its shortest answering phrase
 # (development v7). Development (round 2, v4) found the gold inside a longer
 # answer for 77 / 82 of the answered held-out HotpotQA questions: answers of

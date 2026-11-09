@@ -983,11 +983,29 @@ def doc_ranking(chunks):
 # asked once more there (v8), and this cuts the answer down (v7).
 
 
+ANSWER_LINE = r"(?im)^\W*(?:final\s+)?answer\s*:"
+
+
 def final_answer(reply):
     """What the reader's last "Answer:" line says; the whole reply when it has none."""
-    marks = list(re.finditer(r"(?im)^\W*(?:final\s+)?answer\s*:", reply))
+    marks = list(re.finditer(ANSWER_LINE, reply))
     tail = reply[marks[-1].end():].strip().strip("*").strip() if marks else ""
     return tail.splitlines()[0].strip() if tail else reply
+
+
+def unread_refusal(reasoning, final):
+    """True when the reader has nothing but did not say it in the refusal's words: its
+    last reply has no "Answer:" line and ends by saying it has nothing, or the final
+    answer is a few words that say so. Never for an answer that already refuses."""
+    final = final or ""
+    if is_abstention(final):
+        return False
+    reply = (reasoning or "").strip()
+    last = (reply.splitlines() or [""])[-1]
+    says_nothing = re.compile(settings.NOTHING_SAID, re.IGNORECASE)
+    ends_empty = re.search(ANSWER_LINE, reply) is None and says_nothing.search(last) is not None
+    short = len(final.split()) <= settings.SHORT_NOTHING_WORDS and says_nothing.search(final) is not None
+    return ends_empty or short
 
 
 def asks_for_a_number(question):
@@ -1282,6 +1300,8 @@ class OursSystem(BaseSystem):
         if settings.SHORT_ANSWER and not is_abstention(reply) and not asks_for_a_reason(query):
             final = shorten_answer(query, reply, self._ask)
             more_calls += 1
+        if settings.READ_UNREAD_REFUSALS and unread_refusal(reasoning, final):
+            final = settings.REFUSAL
         result = self.finish(prepared, final)
         result.extra["ours_n_llm_calls"] += more_calls
         result.extra["ours_first_answer"] = first
