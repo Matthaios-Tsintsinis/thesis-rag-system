@@ -73,10 +73,11 @@ class TestPublishedDate(unittest.TestCase):
 
 
 class TestDocumentHeaders(unittest.TestCase):
-    def _headers(self, unit):
+    def _headers(self, unit, on=True):
         chunks = [mock.Mock(doc_id=f"{item.parent_id}.txt", gold_provenance=((item.parent_id, "x"),))
                   for item in unit.corpus]
-        return om.document_headers(unit.corpus, chunks), chunks
+        with mock.patch.object(settings, "DOCUMENT_HEADERS", on):
+            return om.document_headers(unit.corpus, chunks), chunks
 
     def test_an_article_gives_its_source_date_and_title(self):
         headers, chunks = self._headers(news_unit())
@@ -91,9 +92,12 @@ class TestDocumentHeaders(unittest.TestCase):
         self.assertEqual(headers, {})
 
     def test_switched_off(self):
-        with mock.patch.object(settings, "DOCUMENT_HEADERS", False):
-            headers, _ = self._headers(news_unit())
+        headers, _ = self._headers(news_unit(), on=False)
         self.assertEqual(headers, {})
+
+    def test_shipped_off_after_its_rejection(self):
+        # v15 was rejected on 2026-11-09; the shipped state reads no names.
+        self.assertFalse(settings.DOCUMENT_HEADERS)
 
 
 class TestWhereTheNameGoes(unittest.TestCase):

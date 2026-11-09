@@ -516,7 +516,10 @@ def smoke() -> None:
     assert m4_paths[1] == warm_paths[1], "M4 does not find the tree of a unit it reads whole"
     assert all(r["metadata"]["ours_plain_answer"] for r in cold), "no plain answer on a row"
     reader_prompts = [u for s, u in reader.prompts if s == settings.READER_PROMPT]
-    assert all("Chunk 1: [" in u for u in reader_prompts), "a chunk under no document's name"
+    if settings.DOCUMENT_HEADERS:
+        assert all("Chunk 1: [" in u for u in reader_prompts), "a chunk under no document's name"
+    else:
+        assert not any("Chunk 1: [" in u for u in reader_prompts), "a name with v15's switch off"
     assert cold[0]["metadata"]["ours_n_short_documents"] > 0, cold[0]["metadata"]
     assert cold[1]["metadata"]["ours_n_short_documents"] == 0, cold[1]["metadata"]
     assert [r["metadata"]["ours_tree_cache_hit"] for r in cold] == [False, False]

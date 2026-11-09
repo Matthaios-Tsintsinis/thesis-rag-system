@@ -53,7 +53,10 @@ TOKEN_COUNTER_MODEL = "gpt-4o-mini"
 # pooled R@5 from 0.675 to 0.745; 91 % of MultiHop's questions name a source, and only 35 %
 # of its articles hold theirs in their text. A one-document unit has nothing to tell apart,
 # so NarrativeQA stays as it was. M4's tree and vectors do not see the name.
-DOCUMENT_HEADERS = True
+# Rejected 2026-11-09 by v5's rule on draw a: retrieval rose (MAP@10 +0.018 / +0.012) but F1
+# did not (-0.017 [-0.048, +0.014] / +0.000 [-0.037, +0.038] / exactly 0). Off, as its rule
+# says; the code stays behind the switch. v16 reads sources and dates without it.
+DOCUMENT_HEADERS = False
 
 # A question naming a source or a date steers retrieval (development v16). 2,331 of
 # MultiHop's 2,556 questions name a source as the corpus writes it, which leaves about 94
