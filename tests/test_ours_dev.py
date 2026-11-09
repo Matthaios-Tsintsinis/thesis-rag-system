@@ -385,6 +385,61 @@ class TestCensus(unittest.TestCase):
         self.assertIn("hotpotqa: 0 units warm, 2 to build", text)
 
 
+class _ShortUnits(TwoHotpotUnits):
+    """The smoke test's two units, each with one more document under M4's filter."""
+
+    def __init__(self) -> None:
+        from tests.test_ours_short_documents import unit_with_short_document
+
+        super().__init__()
+        self.units = [unit_with_short_document(0), unit_with_short_document(1)]
+
+
+class TestCensusOursTrees(unittest.TestCase):
+    """The census also counts the trees ours builds for itself, and builds none."""
+
+    def test_counts_ours_own_trees(self):
+        from ours import config as settings
+        from ours.model import OursSystem
+
+        with tempfile.TemporaryDirectory() as td:
+            p11, cache = Path(td) / "p11", Path(td) / "cache"
+            p11.mkdir()
+            (p11 / "hotpotqa_M4_validation.summary.json").write_text(
+                json.dumps({"tree_build_env": "test-env", "model_revisions": {"revisions": {}}}),
+                encoding="utf-8")
+            # Ours' own tree for the first unit only, as a scored cell would build it.
+            with ours_fakes(cache, FakeReader(DECOMPOSITIONS, ANSWERS)):
+                OursSystem(config=dev_ours.llama_config()).index_items(_ShortUnits().units[0].corpus)
+            files_before = sorted(cache.rglob("*"))
+            out = io.StringIO()
+            with mock.patch.dict("src.eval.runner.BENCHMARK_REGISTRY", {"hotpotqa": _ShortUnits}), \
+                    mock.patch("src.paths.cache_dir", return_value=cache), \
+                    mock.patch.object(settings, "TREE_BUILD_ENV", "test-env"), \
+                    contextlib.redirect_stdout(out):
+                dev_ours.census(p11, benchmarks=("hotpotqa",))
+            self.assertEqual(sorted(cache.rglob("*")), files_before)
+        text = out.getvalue()
+        self.assertIn("hotpotqa: 0 units warm, 2 to build", text)
+        self.assertIn("hotpotqa: ours' own tree on 2 units (2 documents under M4's filter): "
+                      "1 warm, 1 to build", text)
+
+    def test_a_unit_with_none_reads_m4s_tree_and_is_not_counted(self):
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as td:
+            p11 = Path(td) / "p11"
+            p11.mkdir()
+            (p11 / "hotpotqa_M4_validation.summary.json").write_text(
+                json.dumps({"tree_build_env": "e", "model_revisions": {"revisions": {}}}),
+                encoding="utf-8")
+            with mock.patch.dict("src.eval.runner.BENCHMARK_REGISTRY", {"hotpotqa": TwoHotpotUnits}), \
+                    mock.patch("src.paths.cache_dir", return_value=Path(td) / "cache"), \
+                    contextlib.redirect_stdout(out):
+                dev_ours.census(p11, benchmarks=("hotpotqa",))
+        self.assertIn("hotpotqa: ours' own tree on 0 units (0 documents under M4's filter): "
+                      "0 warm, 0 to build", out.getvalue())
+
+
 class _TwoUnitsNoGold(dev_ours._NoGold, TwoHotpotUnits):
     """The smoke test's units through the real filter."""
 

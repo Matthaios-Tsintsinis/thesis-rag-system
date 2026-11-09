@@ -398,7 +398,7 @@ def read_rows(path: Path) -> list[dict]:
 
 
 def census(p11: Path, benchmarks=SCORED_BENCHMARKS) -> str:
-    """Count warm Llama trees for the scored units; read only. Returns the topology string."""
+    """Count warm Llama trees for the scored units, M4's and ours' own; read only. Returns the topology string."""
     from src.eval.runner import BENCHMARK_REGISTRY
     from src.retrievers.m4_raptor import RaptorSystem
 
@@ -437,6 +437,22 @@ def census(p11: Path, benchmarks=SCORED_BENCHMARKS) -> str:
             print(f"[census] {b}: e.g. {first} summary_model="
                   f"{manifest['extra']['m4']['summary_model']} "
                   f"build_env={manifest['extra'].get('build_env')}")
+
+    # A unit holding a document under M4's filter is read from ours' own tree (v12),
+    # which a scored cell builds where it is missing.
+    from ours.model import OursSystem
+
+    ours = OursSystem(config=llama_config())
+    for b in benchmarks:
+        own, warm, n_short = 0, 0, 0
+        for unit in BENCHMARK_REGISTRY[b]().iter_eval_units(split="validation"):
+            tree, short = ours.tree_for(unit.corpus)
+            if short:
+                own += 1
+                n_short += short
+                warm += bool(tree.substrate_warm_path(unit.corpus))
+        print(f"[census] {b}: ours' own tree on {own} units ({n_short} documents under "
+              f"M4's filter): {warm} warm, {own - warm} to build")
     return env
 
 
@@ -1043,7 +1059,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="command", required=True)
-    c = sub.add_parser("census", help="Count warm Llama trees; print the pins.")
+    c = sub.add_parser("census", help="Count warm Llama trees, M4's and ours' own; print the pins.")
     c.add_argument("--p11", type=Path, required=True)
     sub.add_parser("smoke", help="Two held-out HotpotQA units on a CPU, reader faked.")
     r = sub.add_parser("run", help="One held-out development cell.")
