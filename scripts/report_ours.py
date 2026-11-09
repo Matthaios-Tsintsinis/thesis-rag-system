@@ -5,7 +5,9 @@
   table  COMPARISON_OURS.{csv,md} into a scored round's bank (outputs/ours/
          for round 1, outputs/ours_v<version>/ after): F1 | EM | R@5 per benchmark,
          Llama M1-M4 through the existing exporter's functions (checked
-         against outputs/COMPARISON.csv) plus ours, and ours' mechanics
+         against outputs/COMPARISON.csv) plus ours, ours' mechanics, and
+         ours' final answer beside its plain answer (the baselines' prompt on
+         ours' evidence) where the rows hold one
   stats  Family O (the three declared comparisons, Holm, m = 3) and Family
          O-x (ours against M1-M4 on the grid's seven families, Holm, m = 28)
 """
@@ -68,7 +70,8 @@ FAMILY_O = (("multihop_rag", "retrieval", "M3"),
 # The code fingerprint every row of a bank must carry; None while the round's
 # version is still in development. Round 1, outputs/ours/: development v2,
 # frozen 2026-10-27 at 26a28e3, the model v2's held-out rows measured.
-FROZEN_CODE: dict = {"ours": "d975038e7513cf11", "ours_v4": None}
+# Round 2, outputs/ours_v20/: development v20, frozen 2026-11-09 at 13a0ebd.
+FROZEN_CODE: dict = {"ours": "d975038e7513cf11", "ours_v20": "e77ef1d48101c109"}
 # Credited refusals per bank and cell: recorded at the bank's first export,
 # then gated. HotpotQA cells credit nothing: the yes/no guard scores a refusal
 # 0. Round 1's MultiHop and NarrativeQA recorded 2026-10-29 from the scored
@@ -77,7 +80,7 @@ FROZEN_CODE: dict = {"ours": "d975038e7513cf11", "ours_v4": None}
 RECORDED_OURS: dict = {
     "ours": {"hotpotqa": (0, 0.0), "hotpotqa_pooled": (0, 0.0),
              "multihop_rag": (418, 209.0), "narrativeqa": (4, 1.04)},
-    "ours_v4": {"hotpotqa": (0, 0.0), "hotpotqa_pooled": (0, 0.0)},
+    "ours_v20": {"hotpotqa": (0, 0.0), "hotpotqa_pooled": (0, 0.0)},
 }
 
 # The grid's constants (significance_diagnostic at the tag).
@@ -249,6 +252,59 @@ def recorded_battery(bank, benchmark, rows, recorded=RECORDED_OURS) -> tuple[int
     return recorded[bank][benchmark]
 
 
+def queries_of(benchmark) -> dict:
+    """Every scored query per query id, from a loader's units."""
+    return {str(q.query_id): q for unit in benchmark.iter_eval_units(split="validation")
+            for q in unit.queries}
+
+
+def plain_numbers(rows, benchmark, queries, golds) -> dict:
+    """Ours' final answer beside its plain answer (the baselines' prompt, asked once
+    on ours' own evidence, saved as ours_plain_answer), both scored by the cell's
+    scorer. Descriptive: the gap is ours' answer step, not its retrieval."""
+    from src.eval.scorers.extractive import normalize_qasper_answer
+
+    def mean(values):
+        values = list(values)
+        return sum(values) / len(values) if values else None
+
+    def em(answer, qid):
+        return max((int(normalize_qasper_answer(answer) == normalize_qasper_answer(g))
+                    for g in golds[qid]), default=0)
+
+    def refused(score):
+        return int(bool((score.metadata or {}).get("abstained")))
+
+    scored = {"answerable": [], "null": []}
+    for r in rows:
+        qid = str(r["query_id"])
+        plain = r["metadata"].get("ours_plain_answer")
+        if plain is None:
+            _fail(f"ours/{qid}: no ours_plain_answer on the row")
+        query = queries[qid]
+        final = benchmark.score_answer(r.get("predicted_answer") or "", query)
+        # The scorer must give the row's own score back before it scores the plain answer.
+        if abs(float(final.value) - float(r["answer"]["value"])) > 1e-12:
+            _fail(f"ours/{qid}: rescoring the final answer gives {final.value}, "
+                  f"the row holds {r['answer']['value']}")
+        kind = "null" if r["answer"]["method"] == NULL_METHOD else "answerable"
+        scored[kind].append((qid, r.get("predicted_answer") or "", final, plain,
+                             benchmark.score_answer(plain, query)))
+    answerable, null = scored["answerable"], scored["null"]
+    return {
+        "n_answerable": len(answerable),
+        "n_null": len(null),
+        "final_f1": mean(float(f.value) for _, _, f, _, _ in answerable),
+        "plain_f1": mean(float(p.value) for _, _, _, _, p in answerable),
+        "final_em": mean(em(a, q) for q, a, _, _, _ in answerable),
+        "plain_em": mean(em(pa, q) for q, _, _, pa, _ in answerable),
+        "final_refused": mean(refused(f) for _, _, f, _, _ in answerable),
+        "plain_refused": mean(refused(p) for _, _, _, _, p in answerable),
+        "final_null": mean(float(f.value) for _, _, f, _, _ in null),
+        "plain_null": mean(float(p.value) for _, _, _, _, p in null),
+    }
+
+
 def frozen_code_of(ours_dir: Path) -> str:
     """The frozen fingerprint of a scored round's bank; refuse any other directory."""
     if ours_dir.name not in FROZEN_CODE:
@@ -325,7 +381,7 @@ def table(p11: Path, ours_dir: Path, comparison: Path) -> None:
                  for r in csv.DictReader(comparison.open(encoding="utf-8"))
                  if r["generator"] == LLAMA}
     gold_maps = _gold_maps_from_loaders()
-    rows_out, mechanics, cells = [], {}, {}
+    rows_out, mechanics, cells, plains = [], {}, {}, {}
     for benchmark in BENCHMARKS:
         for label, system in ROW_ORDER:
             row = llama_row(p11, benchmark, system, label, gold_maps[benchmark])
@@ -334,15 +390,20 @@ def table(p11: Path, ours_dir: Path, comparison: Path) -> None:
             rows_out.append(row)
         rows = read_rows(ours_dir / f"{benchmark}_OURS_validation.jsonl")
         cells[benchmark] = rows
-        golds, docs = golds_of(BENCHMARK_REGISTRY[benchmark]())
+        loader = BENCHMARK_REGISTRY[benchmark]()
+        golds, docs = golds_of(loader)
         rows_out.append(ours_row(ours_dir, benchmark, gold_maps[benchmark], docs, rows))
         mechanics[benchmark] = ours_numbers(rows, golds, docs)
+        # From v14 every row holds a plain answer; round 1's (v2) hold none.
+        if any("ours_plain_answer" in r["metadata"] for r in rows):
+            plains[benchmark] = plain_numbers(rows, loader, queries_of(loader), golds)
     check_code(cells, frozen)
-    write_outputs(rows_out, mechanics, ours_dir)
+    write_outputs(rows_out, mechanics, ours_dir, plains)
 
 
-def write_outputs(rows, mechanics, out_dir: Path) -> None:
-    """The CSV holds every column; the markdown shows F1 | EM | R@5 and ours' mechanics."""
+def write_outputs(rows, mechanics, out_dir: Path, plains=None) -> None:
+    """The CSV holds every column; the markdown shows F1 | EM | R@5, ours' mechanics,
+    and ours' final answer beside its plain answer where the rows hold one."""
     with (out_dir / "COMPARISON_OURS.csv").open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
         writer.writeheader()
@@ -380,6 +441,23 @@ def write_outputs(rows, mechanics, out_dir: Path) -> None:
                      f"{m['low_confidence_share']:.1%} | {m['mean_evidence_chunks']:.1f} | "
                      f"{m['mean_evidence_tokens']:.0f} | {m['tree_cache_hit_share']:.1%} | "
                      f"{detectors} |")
+    if plains:
+        lines += ["", "## Ours' answer step: final answer / plain answer (descriptive)", "",
+                  "Each row also asked the baselines' answer prompt once, on ours' own evidence "
+                  "(`ours_plain_answer`), scored here by the cell's scorer after it rescored "
+                  "the row's final answer to the row's own score. The gap between the two is "
+                  "ours' answer step (the reasoning reader, the cut, the second asking, notes "
+                  "read as a refusal), not its retrieval. Answerable rows; the null score is "
+                  "over MultiHop's null questions.", "",
+                  "| benchmark | answerable | F1 | EM | refused | null score |",
+                  "|---|---|---|---|---|---|"]
+        for benchmark, p in plains.items():
+            null = ("n/a" if p["final_null"] is None
+                    else f"{p['final_null']:.4f} / {p['plain_null']:.4f} ({p['n_null']})")
+            lines.append(f"| {DATASET_LABEL[benchmark]} | {p['n_answerable']} | "
+                         f"{p['final_f1']:.4f} / {p['plain_f1']:.4f} | "
+                         f"{p['final_em']:.4f} / {p['plain_em']:.4f} | "
+                         f"{p['final_refused']:.1%} / {p['plain_refused']:.1%} | {null} |")
     (out_dir / "COMPARISON_OURS.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"[report] wrote {out_dir / 'COMPARISON_OURS.csv'} and .md")
 

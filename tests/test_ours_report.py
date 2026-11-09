@@ -134,9 +134,87 @@ class TestOursCellGates(unittest.TestCase):
                  "answer": {"value": 0.5, "method": "token_f1",
                             "metadata": {"abstained": True}}}]
         self.assertEqual(ro.credited(rows), (1, 0.5))
-        with self.assertRaisesRegex(SystemExit, r"\['ours_v4'\]\['multihop_rag'\] = \(1, 0\.5\)"):
-            ro.recorded_battery("ours_v4", "multihop_rag", rows, recorded={})
+        with self.assertRaisesRegex(SystemExit, r"\['ours_v20'\]\['multihop_rag'\] = \(1, 0\.5\)"):
+            ro.recorded_battery("ours_v20", "multihop_rag", rows, recorded={})
         self.assertEqual(ro.recorded_battery("ours", "multihop_rag", rows), (418, 209.0))
+
+    def test_round_two_is_v20_frozen(self):
+        self.assertEqual(list(ro.FROZEN_CODE), ["ours", "ours_v20"])
+        self.assertEqual(ro.frozen_code_of(Path("outputs/ours_v20")), "e77ef1d48101c109")
+        self.assertEqual(ro.RECORDED_OURS["ours_v20"],
+                         {"hotpotqa": (0, 0.0), "hotpotqa_pooled": (0, 0.0)})
+
+
+class _Scorer:
+    """An exact-match scorer: a null query scores the refusal 1, as the null rule does."""
+
+    def score_answer(self, predicted, query):
+        from src.eval.types import AnswerScore
+
+        abstained = predicted == "No answer available."
+        if query == "null":
+            return AnswerScore(float(abstained), ro.NULL_METHOD, metadata={"abstained": abstained})
+        return AnswerScore(float(predicted == query), "token_f1", metadata={"abstained": abstained})
+
+
+def _answered(qid, final, plain, value, method="token_f1"):
+    row = _row(qid, value, meta={"ours_plain_answer": plain})
+    row["predicted_answer"], row["answer"]["method"] = final, method
+    return row
+
+
+class TestPlainAnswer(unittest.TestCase):
+    """Ours' final answer beside the baselines' prompt on ours' own evidence."""
+
+    QUERIES = {"q0": "Paris", "q1": "Rome", "q2": "null"}
+    GOLDS = {"q0": ["Paris"], "q1": ["Rome"], "q2": []}
+
+    def rows(self):
+        return [_answered("q0", "Paris", "Paris is the capital", 1.0),
+                _answered("q1", "No answer available.", "Rome", 0.0),
+                _answered("q2", "Lyon", "No answer available.", 0.0, ro.NULL_METHOD)]
+
+    def test_both_answers_scored_by_the_cells_scorer(self):
+        got = ro.plain_numbers(self.rows(), _Scorer(), self.QUERIES, self.GOLDS)
+        self.assertEqual(got, {"n_answerable": 2, "n_null": 1,
+                               "final_f1": 0.5, "plain_f1": 0.5,
+                               "final_em": 0.5, "plain_em": 0.5,
+                               "final_refused": 0.5, "plain_refused": 0.0,
+                               "final_null": 0.0, "plain_null": 1.0})
+
+    def test_the_scorer_must_give_the_rows_own_score_back(self):
+        rows = self.rows()
+        rows[0]["answer"]["value"] = 0.9
+        with self.assertRaisesRegex(SystemExit, "rescoring the final answer"):
+            ro.plain_numbers(rows, _Scorer(), self.QUERIES, self.GOLDS)
+
+    def test_a_row_without_its_plain_answer_refuses(self):
+        rows = self.rows()
+        del rows[1]["metadata"]["ours_plain_answer"]
+        with self.assertRaisesRegex(SystemExit, "no ours_plain_answer"):
+            ro.plain_numbers(rows, _Scorer(), self.QUERIES, self.GOLDS)
+
+    def test_no_null_question_no_null_score(self):
+        got = ro.plain_numbers(self.rows()[:2], _Scorer(), self.QUERIES, self.GOLDS)
+        self.assertIsNone(got["final_null"])
+        self.assertIsNone(got["plain_null"])
+
+    def test_the_markdown_shows_both(self):
+        mechanics = {"multihop_rag": {
+            "parse_failure_rate": 0.0, "mean_llm_calls": 7.0, "mean_aspects": 2.0,
+            "low_confidence_share": 0.1, "mean_evidence_chunks": 15.0,
+            "mean_evidence_tokens": 1500.0, "tree_cache_hit_share": 1.0,
+            "section_detector_share": {"fixed": 1.0}}}
+        plains = {"multihop_rag": ro.plain_numbers(self.rows(), _Scorer(), self.QUERIES, self.GOLDS)}
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(ro, "checksum_line", return_value="checksum"):
+                ro.write_outputs([], mechanics, Path(td), plains)
+                text = (Path(td) / "COMPARISON_OURS.md").read_text(encoding="utf-8")
+                ro.write_outputs([], mechanics, Path(td))
+                without = (Path(td) / "COMPARISON_OURS.md").read_text(encoding="utf-8")
+        self.assertIn("| MHR | 2 | 0.5000 / 0.5000 | 0.5000 / 0.5000 | 50.0% / 0.0% | "
+                      "0.0000 / 1.0000 (1) |", text)
+        self.assertNotIn("plain answer", without)
 
 
 class TestOursRowEndToEnd(unittest.TestCase):
@@ -153,10 +231,16 @@ class TestOursRowEndToEnd(unittest.TestCase):
             ours_dir = case.dir / "ours"
             case._main(ours_dir / "hotpotqa_OURS_validation.jsonl")
             rows = ro.read_rows(ours_dir / "hotpotqa_OURS_validation.jsonl")
-            golds, docs = golds_of(TwoHotpotUnits())
+            loader = TwoHotpotUnits()
+            golds, docs = golds_of(loader)
             row = ro.ours_row(ours_dir, "hotpotqa", golds, docs, rows)
+            # The real HotpotQA scorer gives each runner row its own score back.
+            plain = ro.plain_numbers(rows, loader, ro.queries_of(loader), golds)
         finally:
             case.tearDown()
+        self.assertEqual((plain["n_answerable"], plain["n_null"]), (2, 0))
+        self.assertAlmostEqual(plain["final_f1"],
+                               sum(float(r["answer"]["value"]) for r in rows) / 2)
         self.assertEqual((row["system"], row["label"], row["n_rank_population"]),
                          ("OURS", "ours", 2))
         self.assertEqual(row["em"], repr(0.5))
