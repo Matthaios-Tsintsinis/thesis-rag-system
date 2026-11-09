@@ -685,6 +685,53 @@ def dev_run(benchmark: str, version: str, lockfile: Path, resume: bool,
     return line
 
 
+# --- scored cells: a frozen round, through the runner ----------------------
+
+
+def scored_cell(benchmark: str, bank: Path, local_dir: Path | None = None, run=None) -> None:
+    """One scored cell of a frozen round: the runner's own command (OURS, validation, the
+    reader, --resume) into the round's bank, on the VM's disk with Drive copies when
+    local_dir is given. A finished cell is skipped, never run again; MultiHop runs last;
+    the model in the tree must be the round's frozen one."""
+    import subprocess
+
+    from ours.model import CODE_FINGERPRINT
+    from scripts.report_ours import FROZEN_CODE
+
+    frozen = FROZEN_CODE.get(bank.name)
+    if frozen is None:
+        rounds = ", ".join(name for name, code in FROZEN_CODE.items() if code)
+        raise SystemExit(f"[scored] REFUSED: {bank} is not a frozen round's bank ({rounds})")
+    if frozen != CODE_FINGERPRINT:
+        raise SystemExit(f"[scored] REFUSED: the model in this tree is {CODE_FINGERPRINT}; "
+                         f"round {bank.name} is frozen at {frozen}. Check out its commit.")
+    out = bank / f"{benchmark}_OURS_validation.jsonl"
+    summary = out.with_suffix(".summary.json")
+    if summary.exists():
+        print(f"[scored] {benchmark}: complete, {summary}; a scored cell runs once")
+        return
+    if benchmark == MULTIHOP:
+        missing = [b for b in SCORED_BENCHMARKS if b != MULTIHOP
+                   and not (bank / f"{b}_OURS_validation.summary.json").exists()]
+        if missing:
+            raise SystemExit(f"[scored] REFUSED: MultiHop runs last; not complete: {', '.join(missing)}")
+    run = run or subprocess.run
+    bank.mkdir(parents=True, exist_ok=True)
+    with kept_on_drive(out, local_dir) as rows_path:
+        refuse_other_code(rows_path, CODE_FINGERPRINT)
+        command = [sys.executable, "-m", "src.eval.runner", "--system", "OURS",
+                   "--benchmark", benchmark, "--split", "validation",
+                   "--generator", settings.READER, "--output", str(rows_path), "--resume"]
+        print("[scored] " + " ".join(command), flush=True)
+        code = run(command, cwd=str(Path(__file__).resolve().parents[1])).returncode
+        if code:
+            raise SystemExit(f"[scored] {benchmark}: the runner exited {code}; the rows so far "
+                             f"are kept for --resume")
+    if rows_path != out:
+        _copy_whole(rows_path.with_suffix(".summary.json"), summary)
+    print(f"[scored] {benchmark}: complete, rows and summary in {bank}")
+
+
 # --- bench: retrieval alone, option against option -------------------------
 
 _SWITCHES_OFF = {"DOCUMENT_HEADERS": False, "SOURCE_FOCUS": False, "QUESTION_VIEW": False,
@@ -1073,6 +1120,12 @@ def main() -> None:
                    help="Which held-out questions; rows of b or c go to <version>_<draw>.")
     r.add_argument("--local-dir", type=Path, default=None,
                    help="Write rows here and copy them to Drive every 5 minutes (for a cell that may outlive a session).")
+    s = sub.add_parser("scored", help="One scored cell of a frozen round, through the runner.")
+    s.add_argument("--benchmark", required=True, choices=SCORED_BENCHMARKS)
+    s.add_argument("--bank", type=Path, required=True,
+                   help="The round's bank, named by its version (for example .../outputs/ours_v20).")
+    s.add_argument("--local-dir", type=Path, default=None,
+                   help="Write rows here and copy them to Drive every 5 minutes (a cell that may outlive a session).")
     i = sub.add_parser("inspect", help="Answer-side breakdown of a development cell.")
     i.add_argument("--benchmark", required=True, choices=sorted(HELD_OUT))
     i.add_argument("--version", required=True)
@@ -1118,6 +1171,9 @@ def main() -> None:
                              / f"{args.benchmark}_OURS_dev.jsonl")
         golds, _ = golds_of(DRAWS[args.draw][args.benchmark]())
         print(json.dumps(compare_versions(rows_of(args.a), rows_of(args.b), golds), indent=2))
+        return
+    if args.command == "scored":
+        scored_cell(args.benchmark, args.bank, args.local_dir)
         return
     if args.command == "census":
         census(args.p11)

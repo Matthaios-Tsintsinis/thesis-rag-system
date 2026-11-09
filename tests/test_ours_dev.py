@@ -440,6 +440,105 @@ class TestCensusOursTrees(unittest.TestCase):
                       "0 warm, 0 to build", out.getvalue())
 
 
+class TestScoredCell(unittest.TestCase):
+    """A scored cell: the runner's command into a frozen round's bank, on the VM's disk with
+    Drive copies; a finished cell is never run again; MultiHop last; the frozen model only."""
+
+    def setUp(self):
+        from ours.model import CODE_FINGERPRINT
+
+        self.td = tempfile.TemporaryDirectory()
+        root = Path(self.td.name)
+        self.bank, self.local = root / "drive" / "ours_v99", root / "local"
+        self.code = CODE_FINGERPRINT
+        self.frozen = mock.patch.dict("scripts.report_ours.FROZEN_CODE", {"ours_v99": self.code})
+        self.frozen.start()
+        self.commands = []
+
+    def tearDown(self):
+        self.frozen.stop()
+        self.td.cleanup()
+
+    def _runner(self, returncode=0, rows=2):
+        """Writes rows (and a summary, when it succeeds) where the command says, as the runner does."""
+        def run(command, cwd):
+            self.commands.append(command)
+            out = Path(command[command.index("--output") + 1])
+            with out.open("a", encoding="utf-8") as f:
+                for i in range(rows):
+                    f.write(json.dumps({"query_id": f"q{i}", "metadata": {"ours_code": self.code}}) + "\n")
+            if not returncode:
+                out.with_suffix(".summary.json").write_text("{}", encoding="utf-8")
+            return SimpleNamespace(returncode=returncode)
+        return run
+
+    def _cell(self, benchmark="hotpotqa", local=True, **kw):
+        dev_ours.scored_cell(benchmark, self.bank, self.local if local else None, run=self._runner(**kw))
+
+    def test_the_runners_own_command_on_the_vms_disk(self):
+        self._cell()
+        command = self.commands[0]
+        self.assertEqual(command[1:9], ["-m", "src.eval.runner", "--system", "OURS",
+                                        "--benchmark", "hotpotqa", "--split", "validation"])
+        self.assertEqual(command[command.index("--generator") + 1], dev_ours.settings.READER)
+        self.assertEqual(command[-1], "--resume")
+        self.assertEqual(Path(command[command.index("--output") + 1]),
+                         self.local / "ours_v99" / "hotpotqa_OURS_validation.jsonl")
+        self.assertEqual(sorted(p.name for p in self.bank.iterdir()),
+                         ["hotpotqa_OURS_validation.jsonl", "hotpotqa_OURS_validation.summary.json"])
+
+    def test_without_a_local_dir_it_writes_to_the_bank(self):
+        self._cell(local=False)
+        self.assertEqual(Path(self.commands[0][self.commands[0].index("--output") + 1]),
+                         self.bank / "hotpotqa_OURS_validation.jsonl")
+        self.assertTrue((self.bank / "hotpotqa_OURS_validation.summary.json").exists())
+
+    def test_a_finished_cell_is_not_run_again(self):
+        self._cell()
+        self._cell()
+        self.assertEqual(len(self.commands), 1)
+
+    def test_a_failed_runner_leaves_its_rows_for_resume_and_no_summary(self):
+        with self.assertRaisesRegex(SystemExit, "exited 1"):
+            self._cell(returncode=1)
+        names = sorted(p.name for p in self.bank.iterdir())
+        self.assertEqual(names, ["hotpotqa_OURS_validation.jsonl.bak"])
+        # A new session (its local disk empty) starts from the copy and resumes.
+        for p in self.local.rglob("*"):
+            if p.is_file():
+                p.unlink()
+        self._cell(rows=1)
+        rows = dev_ours.read_rows(self.bank / "hotpotqa_OURS_validation.jsonl")
+        self.assertEqual(len(rows), 3)
+        self.assertFalse((self.bank / "hotpotqa_OURS_validation.jsonl.bak").exists())
+
+    def test_multihop_runs_last(self):
+        with self.assertRaisesRegex(SystemExit, "MultiHop runs last"):
+            self._cell("multihop_rag")
+        self.assertEqual(self.commands, [])
+        for b in ("hotpotqa", "hotpotqa_pooled", "narrativeqa"):
+            self._cell(b)
+        self._cell("multihop_rag")
+        self.assertEqual(len(self.commands), 4)
+
+    def test_only_a_frozen_round_and_its_own_model(self):
+        with mock.patch.dict("scripts.report_ours.FROZEN_CODE", {"ours_v99": None}):
+            with self.assertRaisesRegex(SystemExit, "not a frozen round"):
+                self._cell()
+        with mock.patch.dict("scripts.report_ours.FROZEN_CODE", {"ours_v99": "0" * 16}):
+            with self.assertRaisesRegex(SystemExit, "Check out its commit"):
+                self._cell()
+        self.assertEqual(self.commands, [])
+
+    def test_rows_of_another_model_are_not_resumed_over(self):
+        self.bank.mkdir(parents=True)
+        (self.bank / "hotpotqa_OURS_validation.jsonl.bak").write_text(
+            json.dumps({"query_id": "q0", "metadata": {"ours_code": "0" * 16}}) + "\n", encoding="utf-8")
+        with self.assertRaisesRegex(SystemExit, "holds rows of code"):
+            self._cell()
+        self.assertEqual(self.commands, [])
+
+
 class _TwoUnitsNoGold(dev_ours._NoGold, TwoHotpotUnits):
     """The smoke test's units through the real filter."""
 
