@@ -1,5 +1,6 @@
 """Pins v19: a reader that has nothing but does not say it in the refusal's words is
-read as the refusal, last, after the cut, so no call is added, dropped or changed."""
+read as the refusal, last, after the cut, so no call is added, dropped or changed.
+Rejected 2026-11-09 and shipped off; the path tests switch it on themselves."""
 
 from __future__ import annotations
 
@@ -53,13 +54,18 @@ class TestUnreadRefusal(unittest.TestCase):
         # Declared in the version log: the words are the 6 Nov replay's, unchanged.
         self.assertTrue(om.unread_refusal("Facts.\nAnswer: Unknown Pleasures", "Unknown Pleasures"))
 
-    def test_shipped_on(self):
-        self.assertTrue(settings.READ_UNREAD_REFUSALS)
+    def test_shipped_off_after_its_rejection(self):
+        self.assertFalse(settings.READ_UNREAD_REFUSALS)
+
+
+def run_on(reader):
+    with mock.patch.object(settings, "READ_UNREAD_REFUSALS", True):
+        return run(reader)
 
 
 class TestTheAnswerPath(unittest.TestCase):
     def test_a_reply_that_has_nothing_is_the_refusal(self):
-        result = run(ReasoningReader(reasoned=EMPTY))
+        result = run_on(ReasoningReader(reasoned=EMPTY))
         self.assertEqual(result.answer, settings.REFUSAL)
         self.assertFalse(result.extra["ours_reasked"])
         self.assertEqual(result.extra["ours_reader_answer"], EMPTY)
@@ -74,7 +80,7 @@ class TestTheAnswerPath(unittest.TestCase):
 
     def test_no_call_changes(self):
         on_reader, off_reader = ReasoningReader(reasoned=EMPTY), ReasoningReader(reasoned=EMPTY)
-        on = run(on_reader)
+        on = run_on(on_reader)
         with mock.patch.object(settings, "READ_UNREAD_REFUSALS", False):
             off = run(off_reader)
         self.assertEqual(on_reader.prompts, off_reader.prompts)
@@ -85,13 +91,13 @@ class TestTheAnswerPath(unittest.TestCase):
         # A cut that leaves only "No information." is taken; the cut itself was still asked.
         reader = ReasoningReader(reasoned="Facts.\nAnswer: No information about the river.",
                                  cuts={"No information about the river.": "No information."})
-        result = run(reader)
+        result = run_on(reader)
         self.assertEqual(result.answer, settings.REFUSAL)
         self.assertTrue(any(s == settings.SHORT_ANSWER_PROMPT for s, _ in reader.prompts))
 
     def test_an_answer_goes_on_as_before(self):
         reader = ReasoningReader(cuts={"the river in the north": "the river"})
-        self.assertEqual(run(reader).answer, "the river")
+        self.assertEqual(run_on(reader).answer, "the river")
 
 
 if __name__ == "__main__":

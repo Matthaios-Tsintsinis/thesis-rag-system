@@ -259,7 +259,10 @@ READER_REASK_PROMPT = REASK_PROMPT + " " + REASON_LINE
 # line whose last line says it has nothing, or a final answer of at most
 # SHORT_NOTHING_WORDS words that says it has nothing, is the refusal. It is read
 # last, after the cut, so no call changes.
-READ_UNREAD_REFUSALS = True
+# Rejected 2026-11-09 by its rule, on v18's saved rows: no-gold refusals rose (18.0 -> 31.3,
+# 19.0 -> 37.0 %) but pooled F1 fell -0.005 [-0.013, -0.0001], two right answers among the
+# rows it took. Off, as its rule says; the code stays behind the switch.
+READ_UNREAD_REFUSALS = False
 SHORT_NOTHING_WORDS = 12
 NOTHING_SAID = (
     r"\b(no (answer|information|mention|evidence|relevant)|not (mentioned|stated|provided|available|specified|given)"
