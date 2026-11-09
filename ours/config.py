@@ -270,6 +270,12 @@ NOTHING_SAID = (
     r"|cannot be (determined|found|answered)|unknown|insufficient)\b"
 )
 
+# A final answer of several lines is the reader's notes gone on whole (development
+# v20): every path that shortens gives one line. With the gold paragraphs taken out,
+# the reasoning text was the final answer on 28 / 38 no-gold rows. It is the refusal,
+# read last, after the cut, so no call changes.
+NOTES_ARE_REFUSALS = True
+
 # One more call cuts the reader's answer to its shortest answering phrase
 # (development v7). Development (round 2, v4) found the gold inside a longer
 # answer for 77 / 82 of the answered held-out HotpotQA questions: answers of

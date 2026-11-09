@@ -1008,6 +1008,13 @@ def unread_refusal(reasoning, final):
     return ends_empty or short
 
 
+def is_notes(final):
+    """True when the final answer spans more than one line: the reader's notes, gone on
+    whole with no "Answer:" line the cut could shorten. Never for a refusal."""
+    final = (final or "").strip()
+    return "\n" in final and not is_abstention(final)
+
+
 def asks_for_a_number(question):
     """True when the question's own words ask for a number or a date."""
     return re.search(settings.NUMBER_QUESTION, question, re.IGNORECASE) is not None
@@ -1301,6 +1308,8 @@ class OursSystem(BaseSystem):
             final = shorten_answer(query, reply, self._ask)
             more_calls += 1
         if settings.READ_UNREAD_REFUSALS and unread_refusal(reasoning, final):
+            final = settings.REFUSAL
+        if settings.NOTES_ARE_REFUSALS and is_notes(final):
             final = settings.REFUSAL
         result = self.finish(prepared, final)
         result.extra["ours_n_llm_calls"] += more_calls
