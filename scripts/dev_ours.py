@@ -732,6 +732,45 @@ def scored_cell(benchmark: str, bank: Path, local_dir: Path | None = None, run=N
     print(f"[scored] {benchmark}: complete, rows and summary in {bank}")
 
 
+def build_own_trees(benchmark: str, lockfile: Path = Path("requirements.lock"), check_env=None) -> dict:
+    """Build ours' own trees for a scored benchmark's units holding a document under M4's
+    filter, where the scored cell will read them, in a process holding only what M4's
+    builder loads (the reader as summariser, and mpnet). A scored cell builds the same tree
+    with bge-m3 and the reranker already on the GPU, which a large pooled shard's summary
+    batches do not fit beside. Same builder, settings and cache key as the cell's (the
+    batches follow the prompts' lengths, not free memory), so the cell then reads them warm."""
+    from ours.model import OursSystem, check_model_revisions
+    from src import paths
+    from src.eval.runner import BENCHMARK_REGISTRY, assert_environment_pinned
+
+    (check_env or assert_environment_pinned)(lockfile)
+    if settings.TREE_BUILD_ENV is None:
+        raise SystemExit("[trees] REFUSED: ours/config.py TREE_BUILD_ENV is unset")
+    check_model_revisions()
+    print(f"[trees] {benchmark}: cache {paths.cache_dir()}", flush=True)
+    ours = OursSystem(config=llama_config())
+    counts = {"units": 0, "warm": 0, "built": 0}
+    for unit in BENCHMARK_REGISTRY[benchmark]().iter_eval_units(split="validation"):
+        tree, n_short = ours.tree_for(unit.corpus)
+        if not n_short:
+            continue
+        counts["units"] += 1
+        if tree.substrate_warm_path(unit.corpus):
+            counts["warm"] += 1
+            continue
+        t0 = time.perf_counter()
+        tree.index_items(unit.corpus)
+        # The scored cell must find this very tree warm.
+        if not tree.substrate_warm_path(unit.corpus):
+            raise SystemExit(f"[trees] REFUSED: {unit.corpus_id}: built, but not found warm")
+        counts["built"] += 1
+        print(f"[trees] {unit.corpus_id}: built, {n_short} short documents, "
+              f"{len(tree.chunks)} leaves, {time.perf_counter() - t0:.0f} s", flush=True)
+    print(f"[trees] {benchmark}: ours' own tree on {counts['units']} units: "
+          f"{counts['warm']} already warm, {counts['built']} built", flush=True)
+    return counts
+
+
 # --- bench: retrieval alone, option against option -------------------------
 
 _SWITCHES_OFF = {"DOCUMENT_HEADERS": False, "SOURCE_FOCUS": False, "QUESTION_VIEW": False,
@@ -1126,6 +1165,9 @@ def main() -> None:
                    help="The round's bank, named by its version (for example .../outputs/ours_v20).")
     s.add_argument("--local-dir", type=Path, default=None,
                    help="Write rows here and copy them to Drive every 5 minutes (a cell that may outlive a session).")
+    t = sub.add_parser("trees", help="Build ours' own trees for a scored benchmark, reader and mpnet only.")
+    t.add_argument("--benchmark", required=True, choices=SCORED_BENCHMARKS)
+    t.add_argument("--lockfile", type=Path, default=Path("requirements.lock"))
     i = sub.add_parser("inspect", help="Answer-side breakdown of a development cell.")
     i.add_argument("--benchmark", required=True, choices=sorted(HELD_OUT))
     i.add_argument("--version", required=True)
@@ -1171,6 +1213,9 @@ def main() -> None:
                              / f"{args.benchmark}_OURS_dev.jsonl")
         golds, _ = golds_of(DRAWS[args.draw][args.benchmark]())
         print(json.dumps(compare_versions(rows_of(args.a), rows_of(args.b), golds), indent=2))
+        return
+    if args.command == "trees":
+        build_own_trees(args.benchmark, args.lockfile)
         return
     if args.command == "scored":
         scored_cell(args.benchmark, args.bank, args.local_dir)

@@ -440,6 +440,53 @@ class TestCensusOursTrees(unittest.TestCase):
                       "0 warm, 0 to build", out.getvalue())
 
 
+class TestOwnTrees(unittest.TestCase):
+    """Ours' own trees built ahead of a scored cell, with nothing but M4's builder loaded,
+    are the trees the cell then reads warm."""
+
+    def test_built_with_the_builder_alone_and_read_warm_by_the_cell(self):
+        from ours.model import OursSystem
+
+        def never(*args, **kwargs):
+            raise AssertionError("bge-m3 or the reranker loaded while building trees")
+
+        with tempfile.TemporaryDirectory() as td:
+            cache = Path(td) / "cache"
+            with ours_fakes(cache, FakeReader(DECOMPOSITIONS, ANSWERS)), \
+                    mock.patch.dict("src.eval.runner.BENCHMARK_REGISTRY", {"hotpotqa": _ShortUnits}), \
+                    mock.patch("ours.model.add_second_vectors", never), \
+                    mock.patch("ours.model.cross_encoder_scores", never), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                first = dev_ours.build_own_trees("hotpotqa", check_env=lambda lockfile: None)
+                again = dev_ours.build_own_trees("hotpotqa", check_env=lambda lockfile: None)
+            self.assertEqual(first, {"units": 2, "warm": 0, "built": 2})
+            self.assertEqual(again, {"units": 2, "warm": 2, "built": 0})
+            # Nothing of M4's namespace: these units take ours' own tree.
+            self.assertFalse(any("M4_RAPTOR" in str(p) for p in cache.rglob("*")))
+            with ours_fakes(cache, FakeReader(DECOMPOSITIONS, ANSWERS)):
+                system = OursSystem(config=dev_ours.llama_config())
+                for unit in _ShortUnits().units:
+                    system.index_items(unit.corpus)
+                    self.assertTrue(system.tree_cache_hit)
+
+    def test_a_unit_with_no_short_document_is_left_to_m4s_tree(self):
+        with tempfile.TemporaryDirectory() as td:
+            cache = Path(td) / "cache"
+            with ours_fakes(cache, FakeReader(DECOMPOSITIONS, ANSWERS)), \
+                    mock.patch.dict("src.eval.runner.BENCHMARK_REGISTRY", {"hotpotqa": TwoHotpotUnits}), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                counts = dev_ours.build_own_trees("hotpotqa", check_env=lambda lockfile: None)
+            self.assertEqual(counts, {"units": 0, "warm": 0, "built": 0})
+            self.assertEqual(list(cache.rglob("*.json")), [])
+
+    def test_the_environment_is_checked_first(self):
+        def refuse(lockfile):
+            raise SystemExit("[pin] REFUSED")
+
+        with self.assertRaisesRegex(SystemExit, "pin"):
+            dev_ours.build_own_trees("hotpotqa", check_env=refuse)
+
+
 class TestScoredCell(unittest.TestCase):
     """A scored cell: the runner's command into a frozen round's bank, on the VM's disk with
     Drive copies; a finished cell is never run again; MultiHop last; the frozen model only."""
