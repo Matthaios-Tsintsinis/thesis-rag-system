@@ -142,7 +142,12 @@ class TestOursCellGates(unittest.TestCase):
         self.assertEqual(list(ro.FROZEN_CODE), ["ours", "ours_v20"])
         self.assertEqual(ro.frozen_code_of(Path("outputs/ours_v20")), "e77ef1d48101c109")
         self.assertEqual(ro.RECORDED_OURS["ours_v20"],
-                         {"hotpotqa": (0, 0.0), "hotpotqa_pooled": (0, 0.0)})
+                         {"hotpotqa": (0, 0.0), "hotpotqa_pooled": (0, 0.0),
+                          "multihop_rag": (45, 22.5), "narrativeqa": (0, 0.0)})
+
+    def test_every_scored_cell_of_a_round_has_a_battery(self):
+        for bank, cells in ro.RECORDED_OURS.items():
+            self.assertEqual(sorted(cells), sorted(ro.BENCHMARKS), bank)
 
 
 class _Scorer:

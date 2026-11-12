@@ -76,11 +76,13 @@ FROZEN_CODE: dict = {"ours": "d975038e7513cf11", "ours_v20": "e77ef1d48101c109"}
 # then gated. HotpotQA cells credit nothing: the yes/no guard scores a refusal
 # 0. Round 1's MultiHop and NarrativeQA recorded 2026-10-29 from the scored
 # cells at 616abc8; the NarrativeQA mass (1.0357...) is rounded to 2 dp like
-# the bank's.
+# the bank's. Round 2's MultiHop and NarrativeQA recorded 2026-11-12 from the
+# scored cells at 9311005 (every row e77ef1d48101c109); both masses are exact.
 RECORDED_OURS: dict = {
     "ours": {"hotpotqa": (0, 0.0), "hotpotqa_pooled": (0, 0.0),
              "multihop_rag": (418, 209.0), "narrativeqa": (4, 1.04)},
-    "ours_v20": {"hotpotqa": (0, 0.0), "hotpotqa_pooled": (0, 0.0)},
+    "ours_v20": {"hotpotqa": (0, 0.0), "hotpotqa_pooled": (0, 0.0),
+                 "multihop_rag": (45, 22.5), "narrativeqa": (0, 0.0)},
 }
 
 # The grid's constants (significance_diagnostic at the tag).
