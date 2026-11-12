@@ -84,6 +84,22 @@ class TestTests(unittest.TestCase):
                              np.random.default_rng(3), directional=True)
         self.assertTrue(rows[0]["below_bar"])
 
+    def test_each_comparison_is_held_to_its_own_bar(self):
+        """A family's later bar must not stand in for an earlier one's: round 2's
+        MultiHop retrieval (|delta| 0.0214, bar 0.0103) was flagged against the
+        pooled bar (0.0240) by a loop variable left over from the first loop."""
+        base = {f"q{i}": 0.5 + 0.1 * (i % 2) for i in range(400)}
+        down = {k: v - 0.0214 for k, v in base.items()}
+        up = {k: v + 0.2312 for k, v in base.items()}
+        rows = ro.run_family([("retrieval", base, down, 0.0103), ("map10", base, up, 0.0240)],
+                             np.random.default_rng(4), directional=True)
+        self.assertEqual([r["bar"] for r in rows], [0.0103, 0.0240])
+        self.assertEqual([r["below_bar"] for r in rows], [False, False])
+        tiny = {k: v + 0.005 for k, v in base.items()}
+        rows = ro.run_family([("small", base, tiny, 0.0103), ("last", base, up, None)],
+                             np.random.default_rng(5), directional=True)
+        self.assertEqual([r["below_bar"] for r in rows], [True, False])
+
 
 class TestOursCellGates(unittest.TestCase):
     """The report refuses ours' cells that are not what the plan says."""

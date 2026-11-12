@@ -198,7 +198,9 @@ def run_family(tests, rng, *, directional: bool) -> list[dict]:
             row["verdict"] = ("SUPPORTED" if significant and excludes
                               else "marginal" if excludes or abs(row["delta"]) >= row["mde"]
                               else "NOT SUPPORTED")
-        row["below_bar"] = bar is not None and abs(row["delta"]) < bar
+        # Each comparison against its own bar (not the loop variable above,
+        # which holds the family's last bar by now).
+        row["below_bar"] = row["bar"] is not None and abs(row["delta"]) < row["bar"]
     return rows
 
 
