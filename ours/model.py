@@ -80,8 +80,6 @@ class TreeIndex:
 
 def build_tree_index(chunks, leaf_vectors, tree, docs, headers=None, fields=None) -> TreeIndex:
     """Collect what the query steps need from M4's tree and the unit's documents."""
-    from rank_bm25 import BM25Okapi
-
     nodes = tree.nodes
     n = len(chunks)
     leaf_node = [""] * n
@@ -150,7 +148,7 @@ def build_tree_index(chunks, leaf_vectors, tree, docs, headers=None, fields=None
         leaf_node=leaf_node,
         root=root,
         top_nodes=top_nodes,
-        bm25=BM25Okapi([tokenize(_headed(name, c.text)) for name, c in zip(names, chunks)]),
+        bm25=LeafBM25([tokenize(_headed(name, c.text)) for name, c in zip(names, chunks)]),
         section=section,
         section_title=section_title,
         detector=detector,
@@ -175,14 +173,45 @@ def add_second_vectors(index) -> None:
     n_leaves = len(index.chunks)
     texts = ([chunk.text for chunk in index.chunks]
              + [index.text[node] for node in index.node_ids[n_leaves:]])
-    vectors = np.asarray(models.embed_texts(texts, model_name=settings.SECOND_EMBEDDER),
-                         dtype=np.float32)
+    vectors = second_vectors_of(texts)
     if mode == "both":
         index.second_vectors = vectors
         return
     index.leaf_vectors = vectors[:n_leaves]
     index.node_vectors = vectors
     index.vector_of = dict(zip(index.node_ids, vectors))
+
+
+def second_vectors_path(texts):
+    """Where ours' cache keeps the second embedder's vectors of exactly these texts."""
+    digest = hashlib.sha256()
+    for part in (settings.SECOND_EMBEDDER, settings.SECOND_EMBEDDER_REVISION, *texts):
+        digest.update(part.encode("utf-8"))
+        digest.update(b"\0")
+    return paths.cache_dir() / settings.SECOND_VECTORS_NAMESPACE / f"{digest.hexdigest()[:32]}.npy"
+
+
+def second_vectors_of(texts):
+    """The second embedder's vectors of a unit's texts (v20.1). A large unit's are kept in
+    ours' own cache and read back when it is indexed again, as a resumed cell does: the
+    float32 values the embedder gave, unchanged. A small unit is cheaper to embed again."""
+    if len(texts) < settings.SECOND_VECTORS_CACHE_MIN_TEXTS:
+        return np.asarray(models.embed_texts(texts, model_name=settings.SECOND_EMBEDDER),
+                          dtype=np.float32)
+    path = second_vectors_path(texts)
+    if path.is_file():
+        kept = np.load(path)
+        if kept.dtype == np.float32 and kept.ndim == 2 and kept.shape[0] == len(texts):
+            return kept
+    vectors = np.asarray(models.embed_texts(texts, model_name=settings.SECOND_EMBEDDER),
+                         dtype=np.float32)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Written whole, then renamed: a session that dies mid-write leaves no file to read.
+    partial = path.with_name(path.name + ".partial")
+    with partial.open("wb") as f:
+        np.save(f, vectors)
+    partial.replace(path)
+    return vectors
 
 
 def embed_query(texts):
@@ -457,11 +486,17 @@ def add_views(aspects, ask):
 # =========================================================================
 
 
-def preliminary_confidence(index, aspect, paraphrase_vector, second_vector=None):
+def paraphrase_search(index, aspect, paraphrase_vector, second_vector=None):
+    """The paraphrase view's BM25 scores and collapsed hits, which steps 2 and 4 both read
+    (v20.1: computed once; v20 computed the same search in each step)."""
+    view_bm25 = bm25_scores(index, aspect.views[0], aspect.focus)
+    return view_bm25, collapsed_candidates(index, paraphrase_vector, view_bm25, aspect.focus,
+                                           second_vector)
+
+
+def preliminary_confidence(index, aspect, paraphrase_vector, second_vector=None, searched=None):
     """Top cross-encoder score over the paraphrase view's first ten hits."""
-    hits = collapsed_candidates(index, paraphrase_vector,
-                                bm25_scores(index, aspect.views[0], aspect.focus), aspect.focus,
-                                second_vector)
+    _, hits = searched or paraphrase_search(index, aspect, paraphrase_vector, second_vector)
     top = [leaf for leaf, _ in hits[: settings.PRELIMINARY_RERANK_TOP_K]]
     return max((score for _, score in rerank(index, aspect.text, top)), default=0.0)
 
@@ -514,10 +549,15 @@ def allocate_budgets(aspects):
 # =========================================================================
 
 
-def view_candidates(index, view_text, view_vector, aspect_text, focus=None, second_vector=None):
-    """Collapsed and multi-branch rankings fused by RRF, then the structural step."""
-    view_bm25 = bm25_scores(index, view_text, focus)
-    collapsed = collapsed_candidates(index, view_vector, view_bm25, focus, second_vector)
+def view_candidates(index, view_text, view_vector, aspect_text, focus=None, second_vector=None,
+                    searched=None):
+    """Collapsed and multi-branch rankings fused by RRF, then the structural step. searched:
+    this view's (BM25 scores, collapsed hits), when step 2 already computed them."""
+    if searched is None:
+        view_bm25 = bm25_scores(index, view_text, focus)
+        collapsed = collapsed_candidates(index, view_vector, view_bm25, focus, second_vector)
+    else:
+        view_bm25, collapsed = searched
     branches = multi_branch_candidates(index, view_vector, view_bm25, focus)
     merged = rrf([[leaf for leaf, _ in collapsed], [leaf for leaf, _ in branches]])
     return apply_structure(index, merged, aspect_text)
@@ -628,6 +668,44 @@ def _hybrid_nodes(index, nodes, view_vector, view_bm25):
 def tokenize(text):
     """Lower-case \\w+ tokens, the same split M3's BM25 uses."""
     return re.findall(r"\w+", text.lower())
+
+
+class LeafBM25:
+    """rank_bm25's BM25Okapi over the leaves, scored from a postings table (v20.1).
+
+    get_scores is BM25Okapi.get_scores term for term: the same idf, k1, b and average
+    length, the same int64 term counts, the same float64 operations in the same order,
+    one query token after another, so the same scores to the last bit. Only the counts
+    are read from each token's postings instead of a Python loop over every leaf."""
+
+    def __init__(self, corpus):
+        from rank_bm25 import BM25Okapi
+
+        self._okapi = okapi = BM25Okapi(corpus)
+        postings: dict = {}
+        for leaf, counts in enumerate(okapi.doc_freqs):
+            for term, count in counts.items():
+                postings.setdefault(term, ([], []))
+                postings[term][0].append(leaf)
+                postings[term][1].append(count)
+        self._postings = {term: (np.asarray(leaves, dtype=np.intp), np.asarray(counts, dtype=np.int64))
+                          for term, (leaves, counts) in postings.items()}
+        # The length term BM25Okapi recomputes for every query token, computed once.
+        doc_len = np.array(okapi.doc_len)
+        self._length_term = okapi.k1 * (1 - okapi.b + okapi.b * doc_len / okapi.avgdl)
+
+    def get_scores(self, query):
+        """BM25 score of every leaf for a tokenised query, as BM25Okapi.get_scores gives it."""
+        okapi = self._okapi
+        score = np.zeros(okapi.corpus_size)
+        for q in query:
+            q_freq = np.zeros(okapi.corpus_size, dtype=np.int64)
+            found = self._postings.get(q)
+            if found is not None:
+                q_freq[found[0]] = found[1]
+            score += (okapi.idf.get(q) or 0) * (q_freq * (okapi.k1 + 1) /
+                                                (q_freq + self._length_term))
+        return score
 
 
 def bm25_scores(index, text, focus=None):
@@ -1286,10 +1364,12 @@ class OursSystem(BaseSystem):
         """Steps 1-9, the reader's reasoned answer to their prompt, then step 10."""
         prepared = self.prepare(query, k=k)
         # The baselines' own prompt on the same evidence: for the report, never
-        # the answer, and not one of the system's calls.
-        plain = models.generate(system_prompt=settings.ANSWER_PROMPT,
-                                user_prompt=prepared.user_prompt,
-                                cfg=self.config.generation)
+        # the answer, and not one of the system's calls; asked only with
+        # PLAIN_ANSWER on (off from v20.1). It shares no state with the calls below.
+        plain = (models.generate(system_prompt=settings.ANSWER_PROMPT,
+                                 user_prompt=prepared.user_prompt,
+                                 cfg=self.config.generation)
+                 if settings.PLAIN_ANSWER else None)
         # The reader's call, as BaseSystem.answer makes it.
         reasoning = models.generate(system_prompt=prepared.system_prompt,
                                     user_prompt=prepared.user_prompt,
@@ -1317,7 +1397,8 @@ class OursSystem(BaseSystem):
         result.extra["ours_reasked"] = reasked
         result.extra["ours_reader_answer"] = reply
         result.extra["ours_reasoning"] = reasoning
-        result.extra["ours_plain_answer"] = plain
+        if plain is not None:
+            result.extra["ours_plain_answer"] = plain
         return result
 
     def _ask(self, system_prompt, user_prompt, max_tokens):
@@ -1353,9 +1434,13 @@ class OursSystem(BaseSystem):
         for a in aspects:
             a.focus = source_focus(index, a.text) or question_focus
 
-        # Step 2: aspect scores.
+        # Step 2: aspect scores. The paraphrase view is searched here once; step 4 reads
+        # the same search (v20.1).
+        searched = []
         for a, (paraphrase_vector, _), (paraphrase_second, _) in zip(aspects, view_vectors, view_seconds):
-            a.confidence = preliminary_confidence(index, a, paraphrase_vector, paraphrase_second)
+            searched.append(paraphrase_search(index, a, paraphrase_vector, paraphrase_second))
+            a.confidence = preliminary_confidence(index, a, paraphrase_vector, paraphrase_second,
+                                                  searched=searched[-1])
         score_aspects(aspects)
 
         # Step 3: budgets.
@@ -1365,9 +1450,11 @@ class OursSystem(BaseSystem):
         own_vectors, own_seconds = (embed_query([a.text for a in aspects])
                                     if settings.QUESTION_VIEW else (None, None))
         rankings = []
-        for n, (a, vecs, secs) in enumerate(zip(aspects, view_vectors, view_seconds)):
-            views = [view_candidates(index, text, vec, a.text, a.focus, second_vector=sec)
-                     for text, vec, sec in zip(a.views, vecs, secs)]
+        for n, (a, vecs, secs, found) in enumerate(zip(aspects, view_vectors, view_seconds, searched)):
+            # View 0 is the paraphrase, already searched in step 2.
+            views = [view_candidates(index, text, vec, a.text, a.focus, second_vector=sec,
+                                     searched=found if v == 0 else None)
+                     for v, (text, vec, sec) in enumerate(zip(a.views, vecs, secs))]
             if settings.QUESTION_VIEW:
                 views.append(view_candidates(index, a.text, own_vectors[n], a.text, a.focus,
                                              second_vector=None if own_seconds is None else own_seconds[n]))

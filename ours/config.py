@@ -17,12 +17,20 @@ EMBEDDER_REVISION = "d51b22a1dfa8184e9258074e56e2875e50612dca"
 # The design's embedder, over the nodes of M4's tree (development v18). "both": its ranking
 # joins the collapsed search's fusion, beside M4's vectors and BM25. "only": its vectors
 # stand in for M4's in every search. "off": no second embedder. The tree's clusters and
-# summaries stay M4's in every mode, and its vectors are made as a unit is indexed, in no cache.
+# summaries stay M4's in every mode. Its vectors are made as a unit is indexed; a large unit's
+# are kept in ours' own cache (below).
 # The bench of 2026-11-07 chose "only", by the rule written before it ran: no measure of
 # "only" fell below "both", and it beat v17 on HotpotQA's MAP@10.
 SECOND_EMBEDDER = "BAAI/bge-m3"
 SECOND_EMBEDDER_REVISION = "5617a9f61b028005a4858fdac845db406aefb181"
 SECOND_EMBEDDER_MODE = "only"
+
+# v20.1, speed only: the second embedder's vectors of a unit of at least this many texts
+# (MultiHop's corpus, a pooled shard) are kept under this namespace of the cache and read
+# back when the unit is indexed again, as a resumed cell does. Smaller units, each embedded
+# in well under a second, are embedded again.
+SECOND_VECTORS_NAMESPACE = "OURS_SECOND_VECTORS"
+SECOND_VECTORS_CACHE_MIN_TEXTS = 1000
 
 RERANKER = "BAAI/bge-reranker-v2-m3"
 RERANKER_REVISION = "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e"
@@ -236,9 +244,9 @@ REASK_PROMPT = (
 # context and no gold in the reader's answer on 67 / 65 held-out HotpotQA rows,
 # 32 / 31 % of all F1 lost, and 81 % of HotpotQA's questions are bridge questions:
 # it found the actor and stopped ("Daniel Henney", for what 2007 film he is known
-# for). ANSWER_PROMPT stays as it was: it is asked once on the same evidence,
-# saved for the report as the plain answer, never the answer. The example is
-# invented.
+# for). ANSWER_PROMPT stays as it was: with PLAIN_ANSWER on it is asked once on
+# the same evidence, saved for the report as the plain answer, never the answer.
+# The example is invented.
 REASON_LINE = (
     "Before answering, work step by step: write the facts from the evidence that "
     "bear on the question, and how they connect. A question may need two or more "
@@ -251,6 +259,12 @@ REASON_LINE = (
 )
 READER_PROMPT = ANSWER_PROMPT + " " + REASON_LINE
 READER_REASK_PROMPT = REASK_PROMPT + " " + REASON_LINE
+
+# The plain answer (development v14): the baselines' answer prompt, asked once on ours'
+# evidence and saved as ours_plain_answer for the report's answer-step table; never the
+# answer and not counted as a call. Off from v20.1 (2026-11-18): round 2's rows hold it,
+# and it costs about 6 % of a round. Turn it on to measure the answer step again.
+PLAIN_ANSWER = False
 
 # A reply with no "Answer:" line goes on whole (development v19). With the gold
 # paragraphs taken out of held-out questions, 39 / 54 such replies ended by saying

@@ -246,10 +246,13 @@ class TestOursSmoke(unittest.TestCase):
             self.assertEqual(row["n_packed"], row["n_retrieved"] + n_orient)
 
     def test_answer_prompt_and_refusal(self):
-        """The reader sees the approved prompt; the refusal is detected."""
+        """The reader sees its prompt once per question; the refusal is detected. The
+        baselines' plain prompt is not asked with PLAIN_ANSWER off (v20.1)."""
         answer_calls = [p for p in self.reader.prompts
-                        if p[0] == settings.ANSWER_PROMPT]
+                        if p[0] == settings.READER_PROMPT]
         self.assertEqual(len(answer_calls), 2)
+        self.assertFalse(any(p[0] == settings.ANSWER_PROMPT for p in self.reader.prompts))
+        self.assertFalse(any("ours_plain_answer" in r["metadata"] for r in self.cold))
         self.assertTrue(self.cold[1]["answer"]["metadata"]["abstained"])
         self.assertEqual(self.cold[0]["answer"]["value"], 1.0)
 
@@ -263,7 +266,7 @@ class TestOursSmoke(unittest.TestCase):
 
     def test_a_refusal_is_asked_once_more_on_the_same_evidence(self):
         first = [u for s, u in self.reader.prompts
-                 if s == settings.ANSWER_PROMPT and u.endswith(Q1)]
+                 if s == settings.READER_PROMPT and u.endswith(Q1)]
         again = [u for s, u in self.reader.prompts if s == settings.READER_REASK_PROMPT]
         self.assertEqual(again, first)
         self.assertTrue(self.cold[1]["metadata"]["ours_reasked"])

@@ -72,6 +72,12 @@ FAMILY_O = (("multihop_rag", "retrieval", "M3"),
 # frozen 2026-10-27 at 26a28e3, the model v2's held-out rows measured.
 # Round 2, outputs/ours_v20/: development v20, frozen 2026-11-09 at 13a0ebd.
 FROZEN_CODE: dict = {"ours": "d975038e7513cf11", "ours_v20": "e77ef1d48101c109"}
+# Code changed for speed alone, proven to give a frozen model's answers and evidence bit for
+# bit, keyed by its fingerprint: the frozen fingerprint whose outputs it gives. A round's rows
+# still carry the fingerprint frozen for it. v20.1 (2026-11-18, OURS_VERSIONS "v20.1"): BM25
+# from a postings table, the paraphrase view searched once, a large unit's bge-m3 vectors
+# cached, and the report-only plain answer behind PLAIN_ANSWER, off (on, the rows are v20's).
+SAME_OUTPUTS: dict = {"4fa3bb8d36c3ddb7": "e77ef1d48101c109"}
 # Credited refusals per bank and cell: recorded at the bank's first export,
 # then gated. HotpotQA cells credit nothing: the yes/no guard scores a refusal
 # 0. Round 1's MultiHop and NarrativeQA recorded 2026-10-29 from the scored

@@ -108,9 +108,9 @@ class TestBoth(unittest.TestCase):
         seen = []
         real = om.view_candidates
 
-        def recording(index, view_text, view_vector, aspect_text, focus=None, second_vector=None):
+        def recording(index, view_text, view_vector, aspect_text, focus=None, second_vector=None, **kwargs):
             seen.append((view_text, second_vector))
-            return real(index, view_text, view_vector, aspect_text, focus, second_vector)
+            return real(index, view_text, view_vector, aspect_text, focus, second_vector, **kwargs)
 
         with mock.patch("ours.model.view_candidates", recording):
             run("both")

@@ -1,11 +1,14 @@
 """Pins that the reader reasons before it answers: only its last "Answer:" line goes on
-to step 10, a refusal is read from that line, and the baselines' plain prompt is asked
-once on the same evidence, saved for the report, never the answer and never counted."""
+to step 10, a refusal is read from that line, and the baselines' plain prompt, when
+PLAIN_ANSWER is on, is asked once on the same evidence, saved for the report, never the
+answer and never counted. Off from v20.1, which changes nothing else."""
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
+from unittest import mock
 
 from ours import config as settings
 from ours import model as om
@@ -82,13 +85,35 @@ class TestTheAnswerPath(unittest.TestCase):
         self.assertEqual(cuts, [f"Question: {Q0}\nAnswer: the river in the north"])
 
     def test_the_plain_answer_is_saved_and_is_not_the_answer(self):
-        result = run(ReasoningReader())
+        with mock.patch.object(settings, "PLAIN_ANSWER", True):
+            result = run(ReasoningReader())
         self.assertEqual(result.extra["ours_plain_answer"], PLAIN)
         self.assertNotEqual(result.answer, PLAIN)
 
-    def test_the_plain_call_reads_the_same_evidence_and_is_not_counted(self):
+    def test_the_plain_answer_is_off_by_default(self):
+        self.assertFalse(settings.PLAIN_ANSWER)
         reader = ReasoningReader()
         result = run(reader)
+        self.assertNotIn("ours_plain_answer", result.extra)
+        self.assertFalse(any(s == settings.ANSWER_PROMPT for s, _ in reader.prompts))
+
+    def test_turning_it_on_changes_nothing_but_the_plain_answer(self):
+        off_reader, on_reader = ReasoningReader(), ReasoningReader()
+        off = run(off_reader)
+        with mock.patch.object(settings, "PLAIN_ANSWER", True):
+            on = run(on_reader)
+        self.assertEqual(on.answer, off.answer)
+        self.assertEqual([r.chunk.chunk_id for r in on.retrieved], [r.chunk.chunk_id for r in off.retrieved])
+        on_extra = {k: v for k, v in on.extra.items() if k != "ours_plain_answer"}
+        self.assertEqual(json.dumps(on_extra, sort_keys=True, default=str),
+                         json.dumps(off.extra, sort_keys=True, default=str))
+        # The same reader calls, in the same order, but for the plain one.
+        self.assertEqual([p for p in on_reader.prompts if p[0] != settings.ANSWER_PROMPT], off_reader.prompts)
+
+    def test_the_plain_call_reads_the_same_evidence_and_is_not_counted(self):
+        reader = ReasoningReader()
+        with mock.patch.object(settings, "PLAIN_ANSWER", True):
+            result = run(reader)
         prompts = dict(reader.prompts)
         self.assertEqual(prompts[settings.ANSWER_PROMPT], prompts[settings.READER_PROMPT])
         plain = [s for s, _ in reader.prompts if s == settings.ANSWER_PROMPT]

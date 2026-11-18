@@ -124,13 +124,22 @@ class TestOursCellGates(unittest.TestCase):
             ro.check_code({"x": self._rows()}, frozen="c9")
 
     def test_frozen_code_is_the_model_in_the_tree(self):
-        """The latest round's freeze names the model as it stands; a later edit
-        to ours/ fails here. A round still in development has no freeze yet."""
+        """The latest round's freeze names the model as it stands, or code registered as
+        giving its outputs bit for bit (speed only); any other edit to ours/ fails here.
+        A round still in development has no freeze yet."""
         from ours.model import CODE_FINGERPRINT
         latest = list(ro.FROZEN_CODE.values())[-1]
         if latest is None:
             self.skipTest("the latest round's version is in development")
-        self.assertEqual(latest, CODE_FINGERPRINT)
+        self.assertEqual(ro.SAME_OUTPUTS.get(CODE_FINGERPRINT, CODE_FINGERPRINT), latest)
+
+    def test_speed_only_code_answers_to_a_frozen_round(self):
+        self.assertEqual(ro.SAME_OUTPUTS, {"4fa3bb8d36c3ddb7": "e77ef1d48101c109"})
+        self.assertLessEqual(set(ro.SAME_OUTPUTS.values()), set(ro.FROZEN_CODE.values()))
+        # A round's rows still carry the fingerprint frozen for it, not the faster code's.
+        rows = {"multihop_rag": [{"metadata": {"ours_code": "4fa3bb8d36c3ddb7"}}]}
+        with self.assertRaisesRegex(SystemExit, "frozen"):
+            ro.check_code(rows, "e77ef1d48101c109")
 
     def test_every_round_has_its_batteries_and_round_one_stays_frozen(self):
         self.assertEqual(list(ro.RECORDED_OURS), list(ro.FROZEN_CODE))
@@ -246,11 +255,19 @@ class TestOursRowEndToEnd(unittest.TestCase):
         from tests.test_ours_registry import TestRegistry
         from tests.test_ours_smoke import TwoHotpotUnits
 
+        from ours import config as settings
+
         case = TestRegistry("test_registry_resolves_ours")
         case.setUp()
         try:
             ours_dir = case.dir / "ours"
-            case._main(ours_dir / "hotpotqa_OURS_validation.jsonl")
+            # A cell with the plain answer off holds none, so the report writes no plain table.
+            case._main(ours_dir / "off.jsonl")
+            self.assertFalse(any("ours_plain_answer" in r["metadata"]
+                                 for r in ro.read_rows(ours_dir / "off.jsonl")))
+            # On, every row holds one, and the report scores it.
+            with mock.patch.object(settings, "PLAIN_ANSWER", True):
+                case._main(ours_dir / "hotpotqa_OURS_validation.jsonl")
             rows = ro.read_rows(ours_dir / "hotpotqa_OURS_validation.jsonl")
             loader = TwoHotpotUnits()
             golds, docs = golds_of(loader)
