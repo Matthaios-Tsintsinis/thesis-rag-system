@@ -9,6 +9,23 @@ held-out data; the scored cells run with the values frozen here."""
 READER = "meta-llama/Llama-3.1-8B-Instruct"
 READER_REVISION = "0e9e39f249a16976918f6564b8830bc894c89659"
 
+# The generator sweep (v20.2, asked for by the supervisor on 2026-11-19): v20 with each of
+# these as its one model in place of READER, reader and tree summariser alike, on NarrativeQA
+# and MultiHop. Each builds its own trees with M4's builder, in ours' own cache (below), so
+# M4's bank keeps only the trees M4's cells built. Smallest first (billions of parameters:
+# 1.24, 1.54, 3.09, 3.21, 3.84, 7.62, 14.77), each at the revision the hub served on
+# 2026-11-19. READER stays the model of every scored round.
+SWEEP_GENERATORS = {
+    "meta-llama/Llama-3.2-1B-Instruct": "9213176726f574b556790deb65791e0c5aa438b6",
+    "Qwen/Qwen2.5-1.5B-Instruct": "989aa7980e4cf806f80c7fef2b1adb7bc71aa306",
+    "Qwen/Qwen2.5-3B-Instruct": "aa8e72537993ba99e69dfaafa59ed015b17504d1",
+    "meta-llama/Llama-3.2-3B-Instruct": "0cb88a4f764b7a12671c53f0838cd831a0843b95",
+    "microsoft/Phi-4-mini-instruct": "cfbefacb99257ffa30c83adab238a50856ac3083",
+    "Qwen/Qwen2.5-7B-Instruct": "a09a35458c702b33eeacc393d103063234e8bc28",
+    "Qwen/Qwen2.5-14B-Instruct": "cf98f3b3bbb457ad9e2bb7baf9a0125b6b88caa8",
+}
+SWEEP_TREE_NAMESPACE = "OURS_SWEEP_TREES"
+
 # M4's leaf embedder. Questions and views are embedded with it too, so they
 # land in the same space as the tree.
 EMBEDDER = "sentence-transformers/multi-qa-mpnet-base-cos-v1"

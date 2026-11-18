@@ -4,7 +4,8 @@ The design is docs/three_axis_pipeline.pdf, section 4. This file follows its
 steps 1-9 in order, then the answer (step 10, from development v7); the class
 the runner calls is at the bottom. The tree,
 its 100-token leaves and their vectors are M4's own, except that a unit holding a
-document under M4's filter gets its own tree from M4's builder (development v12).
+document under M4's filter gets its own tree from M4's builder (development v12),
+and a sweep generator builds every tree it reads with M4's builder (v20.2).
 """
 
 from __future__ import annotations
@@ -1223,13 +1224,17 @@ def code_fingerprint():
 CODE_FINGERPRINT = code_fingerprint()
 
 
-def check_model_revisions():
-    """Refuse unless the hub still serves the pinned reader and embedders."""
+def check_model_revisions(generator=None):
+    """Refuse unless the hub still serves the run's generator (the reader unless named) and
+    the embedders at their pins."""
     # The harness loads both by name, which means the hub's current revision.
     from huggingface_hub import HfApi
 
+    generator = generator or settings.READER
+    revision = (settings.READER_REVISION if generator == settings.READER
+                else settings.SWEEP_GENERATORS[generator])
     api = HfApi()
-    pins = [(settings.READER, settings.READER_REVISION), (settings.EMBEDDER, settings.EMBEDDER_REVISION)]
+    pins = [(generator, revision), (settings.EMBEDDER, settings.EMBEDDER_REVISION)]
     if settings.SECOND_EMBEDDER_MODE != "off":
         pins.append((settings.SECOND_EMBEDDER, settings.SECOND_EMBEDDER_REVISION))
     for model_id, pinned in pins:
@@ -1262,6 +1267,18 @@ class WholeCorpusTree(RaptorSystem):
                         super()._cache_dir(corpus_hash).cache_key)
 
 
+class SweepTree(RaptorSystem):
+    """M4's builder and cache key, the tree kept in ours' own cache: a sweep generator's tree
+    for a unit M4's filter leaves whole (v20.2), so M4's bank holds only trees M4 built."""
+
+    system_id = "OURS_TREE"
+
+    def _cache_dir(self, corpus_hash):
+        """M4's key under the sweep's namespace."""
+        return CacheDir(paths.cache_dir(), settings.SWEEP_TREE_NAMESPACE,
+                        super()._cache_dir(corpus_hash).cache_key)
+
+
 def short_documents(items, m4):
     """How many of a unit's documents M4's filter leaves out, laid out and judged as M4 does."""
     with tempfile.TemporaryDirectory(prefix="OURS_short_") as td:
@@ -1282,10 +1299,11 @@ class OursSystem(BaseSystem):
 
     def __init__(self, config) -> None:
         super().__init__(config)
+        generator = config.generation.model
         problems = []
-        if config.generation.model != settings.READER:
-            problems.append(f"reader {config.generation.model!r}")
-        if config.m4.summary_model != settings.READER:
+        if generator != settings.READER and generator not in settings.SWEEP_GENERATORS:
+            problems.append(f"reader {generator!r}")
+        if config.m4.summary_model != generator:
             problems.append(f"tree summariser {config.m4.summary_model!r}")
         if config.m4.embedder != settings.EMBEDDER:
             problems.append(f"embedder {config.m4.embedder!r}")
@@ -1294,9 +1312,11 @@ class OursSystem(BaseSystem):
         if problems:
             raise SystemExit(
                 "OURS REFUSED: " + ", ".join(problems) + f". Ours runs with one "
-                f"model, {settings.READER}, greedy, on M4's tree: pass "
-                f"--generator {settings.READER} and keep M4's defaults.")
-        self._m4 = RaptorSystem(config)
+                f"model as reader and tree summariser, greedy, on M4's tree: pass "
+                f"--generator {settings.READER} (or one of ours/config.py "
+                "SWEEP_GENERATORS) and keep M4's defaults.")
+        # The reader reads M4's banked trees; a sweep generator builds its own.
+        self._m4 = RaptorSystem(config) if generator == settings.READER else SweepTree(config)
         self._whole = WholeCorpusTree(config)
         # The one holding the current unit's tree.
         self._tree_system = self._m4
@@ -1317,7 +1337,7 @@ class OursSystem(BaseSystem):
                 "OURS REFUSED: ours/config.py TREE_BUILD_ENV is unset. Run "
                 "`python -m scripts.dev_ours census` and pin the value it prints.")
         if not self._revisions_checked:
-            check_model_revisions()
+            check_model_revisions(self.config.generation.model)
             self._revisions_checked = True
         self._tree_system, self._n_short_documents = self.tree_for(items)
         # (a) M4's own code: lays out the corpus, computes its cache key, and
@@ -1336,11 +1356,12 @@ class OursSystem(BaseSystem):
         add_second_vectors(self._tree_index)
 
     def tree_for(self, items):
-        """The system holding a unit's tree, M4 unless its filter would leave a document out, and that count."""
+        """The system holding a unit's tree, M4's (or a sweep generator's own) unless M4's
+        filter would leave a document out, and that count."""
         n_short = short_documents(items, self._m4)
         tree = self._whole if n_short else self._m4
         # The banked Llama trees were built under this topology stack, and
-        # M4's cache key folds it in.
+        # M4's cache key folds it in; the lockfile pins the same stack for a new build.
         tree.topology_env_override = settings.TREE_BUILD_ENV
         return tree, n_short
 

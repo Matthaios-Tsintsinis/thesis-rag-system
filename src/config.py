@@ -110,7 +110,16 @@ GEN_TOP_P = 1.0
 # 20GiB of the L4's 22.03GiB admits the ~14.2GB fp16 weights with
 # headroom for the KV cache and activations.
 # harness choice: sized to the L4, the matrix's GPU class
+# THESIS_GENERATOR_MAX_MEMORY (e.g. "36GiB") raises the GPU's share for a model the L4
+# cannot hold, on a larger GPU (models.generator_max_memory); unset, it is this.
 GENERATOR_MAX_MEMORY = {0: "20GiB", "cpu": "0GiB"}
+
+# The date every chat prompt is rendered with (the templates' date_string). Llama 3.2's
+# template prints today's date when given none, so a cell's prompts would change at
+# midnight and a resumed cell would read others; Llama 3.1's prints this date when given
+# none, so its prompts are the ones it always read. Templates without a date ignore it.
+# harness choice: one fixed date, Llama 3.1's own
+CHAT_TEMPLATE_DATE = "26 Jul 2024"
 
 
 # --- Prompts --------------------------------------------------------------

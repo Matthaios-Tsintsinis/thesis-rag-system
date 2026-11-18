@@ -134,7 +134,9 @@ class TestOursCellGates(unittest.TestCase):
         self.assertEqual(ro.SAME_OUTPUTS.get(CODE_FINGERPRINT, CODE_FINGERPRINT), latest)
 
     def test_speed_only_code_answers_to_a_frozen_round(self):
-        self.assertEqual(ro.SAME_OUTPUTS, {"4fa3bb8d36c3ddb7": "e77ef1d48101c109"})
+        # v20.1 (speed), then v20.2 (the generator sweep, the reader's path unchanged).
+        self.assertEqual(ro.SAME_OUTPUTS, {"4fa3bb8d36c3ddb7": "e77ef1d48101c109",
+                                           "c3a2b90fd8db1fcb": "e77ef1d48101c109"})
         self.assertLessEqual(set(ro.SAME_OUTPUTS.values()), set(ro.FROZEN_CODE.values()))
         # A round's rows still carry the fingerprint frozen for it, not the faster code's.
         rows = {"multihop_rag": [{"metadata": {"ours_code": "4fa3bb8d36c3ddb7"}}]}

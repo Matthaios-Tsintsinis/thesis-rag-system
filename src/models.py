@@ -19,6 +19,7 @@ from typing import Any
 import numpy as np
 
 from .config import (
+    CHAT_TEMPLATE_DATE,
     EMBEDDER_MODEL,
     GENERATOR_MAX_MEMORY,
     GENERATOR_MODEL,
@@ -163,6 +164,33 @@ def assert_generator_fully_resident(
     )
 
 
+def generator_max_memory() -> dict:
+    """The placement budget: GENERATOR_MAX_MEMORY, its GPU share raised by
+    THESIS_GENERATOR_MAX_MEMORY when set; nothing ever spills to the CPU."""
+    import re
+
+    cap = os.environ.get("THESIS_GENERATOR_MAX_MEMORY")
+    if cap is None:
+        return dict(GENERATOR_MAX_MEMORY)
+    if not re.fullmatch(r"[1-9]\d*GiB", cap):
+        raise ValueError(
+            f"THESIS_GENERATOR_MAX_MEMORY={cap!r}: give the GPU's share in whole GiB, "
+            "for example 36GiB."
+        )
+    return {0: cap, "cpu": "0GiB"}
+
+
+def chat_text(tokenizer: Any, system_prompt: str, user_prompt: str) -> str:
+    """One system and one user turn through the model's chat template, on the fixed date."""
+    return tokenizer.apply_chat_template(
+        [{"role": "system", "content": system_prompt},
+         {"role": "user", "content": user_prompt}],
+        tokenize=False,
+        add_generation_prompt=True,
+        date_string=CHAT_TEMPLATE_DATE,
+    )
+
+
 def _load_generator_impl(model_name: str) -> Any:
     """Load tokenizer and model, fp16 on the GPU, and check what arrived."""
     # Every local load passes through here, and this is the last moment
@@ -180,7 +208,7 @@ def _load_generator_impl(model_name: str) -> Any:
     if torch.cuda.is_available():
         kwargs["torch_dtype"] = torch.float16
         kwargs["device_map"] = "auto"
-        kwargs["max_memory"] = dict(GENERATOR_MAX_MEMORY)
+        kwargs["max_memory"] = generator_max_memory()
     else:
         kwargs["torch_dtype"] = torch.float32  # CPU-only hosts
 
@@ -260,13 +288,7 @@ def _generate_local(
     tokenizer, model = load_generator(cfg.model)
 
     # Build the chat prompt and generate the continuation.
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
-    prompt_text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
+    prompt_text = chat_text(tokenizer, system_prompt, user_prompt)
     inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
     with torch.no_grad():
         out = model.generate(
@@ -537,14 +559,7 @@ def generate_batch(
     tokenizer, model = load_generator(cfg.model)
 
     # Render every prompt through the chat template.
-    texts = [
-        tokenizer.apply_chat_template(
-            [{"role": "system", "content": s}, {"role": "user", "content": u}],
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-        for s, u in zip(system_prompts, user_prompts)
-    ]
+    texts = [chat_text(tokenizer, s, u) for s, u in zip(system_prompts, user_prompts)]
 
     # Choose the processing order: a stable length sort, or input order.
     # Only the forward permutation is needed; results are written back by

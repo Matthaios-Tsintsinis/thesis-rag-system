@@ -84,9 +84,14 @@ class TestGates(unittest.TestCase):
     """Ours refuses what it was not built for, before any work."""
 
     def test_another_reader_is_refused(self):
+        # The harness default (Qwen2.5-7B) is one of the sweep's generators from v20.2;
+        # a model that is neither the reader nor one of them is refused.
         from src.config import DEFAULT_CONFIG
+        other = "Qwen/Qwen2.5-0.5B-Instruct"
+        cfg = replace(DEFAULT_CONFIG, generation=replace(DEFAULT_CONFIG.generation, model=other),
+                      m4=replace(DEFAULT_CONFIG.m4, summary_model=other))
         with self.assertRaises(SystemExit):
-            om.OursSystem(config=DEFAULT_CONFIG)
+            om.OursSystem(config=cfg)
 
     def test_sampling_is_refused(self):
         cfg = llama_config()
@@ -103,7 +108,7 @@ class TestGates(unittest.TestCase):
     def test_no_tree_env_is_refused_before_indexing(self):
         system = om.OursSystem(config=llama_config())
         with mock.patch.object(settings, "TREE_BUILD_ENV", None), \
-                mock.patch("ours.model.check_model_revisions", lambda: None), \
+                mock.patch("ours.model.check_model_revisions", lambda *generator: None), \
                 mock.patch.object(system._m4, "index_items") as m4_index:
             with self.assertRaises(SystemExit):
                 system.index_items(hotpot_unit(0).corpus)

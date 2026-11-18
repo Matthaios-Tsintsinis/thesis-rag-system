@@ -106,7 +106,7 @@ def ours_fakes(cache_dir, reader):
             mock.patch("src.models.generate", reader), \
             mock.patch("src.models.generate_batch", fake_generate_batch), \
             mock.patch("ours.model.cross_encoder_scores", fake_cross_encoder), \
-            mock.patch("ours.model.check_model_revisions", lambda: None), \
+            mock.patch("ours.model.check_model_revisions", lambda *generator: None), \
             mock.patch.object(settings, "TREE_BUILD_ENV", "test-env"), \
             mock.patch("src.paths.cache_dir", return_value=Path(cache_dir)):
         yield

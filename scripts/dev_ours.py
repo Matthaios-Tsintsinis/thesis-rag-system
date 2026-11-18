@@ -12,6 +12,12 @@
   replay  the decomposition call alone over a scored benchmark's questions,
           with more room than the scored cap, raw replies saved: why the
           aspect parse fails (reads questions only, never gold or scores)
+  templates  the reader's and each sweep generator's chat template and shipped
+          generation settings, from the hub (tokenizer files only); the reader's
+          prompt must not move with the harness's fixed date
+
+The generator sweep (v20.2): `trees` and `scored` with --generator, one of
+ours/config.py SWEEP_GENERATORS, into the sweep's directory (ours_v20_generators).
 
 Held-out data: HotpotQA validation questions outside the registered 1,000
 (both variants) and NarrativeQA validation stories outside the registered 40.
@@ -61,16 +67,36 @@ LATER_SEED = 20261106
 N_LATER_QUESTIONS = {"b": 1200, "c": 1000}
 N_LATER_STORIES = {"b": 40, "c": 25}
 SCORED_BENCHMARKS = ("multihop_rag", "narrativeqa", "hotpotqa", "hotpotqa_pooled")
+# The generator sweep (v20.2): these two, in this order, for each generator.
+SWEEP_BENCHMARKS = ("narrativeqa", "multihop_rag")
 
 
-def llama_config():
-    """The runner's config under --generator Llama."""
+def generator_config(generator: str):
+    """The runner's config under --generator: the reader and M4's summariser both the generator."""
     from src.config import DEFAULT_CONFIG
 
     return replace(
         DEFAULT_CONFIG,
-        generation=replace(DEFAULT_CONFIG.generation, model=settings.READER),
-        m4=replace(DEFAULT_CONFIG.m4, summary_model=settings.READER))
+        generation=replace(DEFAULT_CONFIG.generation, model=generator),
+        m4=replace(DEFAULT_CONFIG.m4, summary_model=generator))
+
+
+def llama_config():
+    """The runner's config under --generator Llama."""
+    return generator_config(settings.READER)
+
+
+def sweep_generator(generator: str) -> str:
+    """The generator, if it is one of the sweep's; refuse any other."""
+    if generator not in settings.SWEEP_GENERATORS:
+        raise SystemExit(f"[sweep] REFUSED: {generator} is not one of the sweep's generators "
+                         f"(ours/config.py SWEEP_GENERATORS: {', '.join(settings.SWEEP_GENERATORS)})")
+    return generator
+
+
+def sweep_bank(sweep: Path, generator: str) -> Path:
+    """A generator's own bank under the sweep's directory, named after the model."""
+    return Path(sweep) / generator.split("/")[-1]
 
 
 # --- held-out loaders -----------------------------------------------------
@@ -689,40 +715,62 @@ def dev_run(benchmark: str, version: str, lockfile: Path, resume: bool,
 # --- scored cells: a frozen round, through the runner ----------------------
 
 
-def scored_cell(benchmark: str, bank: Path, local_dir: Path | None = None, run=None) -> None:
+def scored_cell(benchmark: str, bank: Path, local_dir: Path | None = None, run=None,
+                generator: str | None = None) -> None:
     """One scored cell of a frozen round: the runner's own command (OURS, validation, the
     reader, --resume) into the round's bank, on the VM's disk with Drive copies when
     local_dir is given. A finished cell is skipped, never run again; MultiHop runs last;
-    the model in the tree must be the round's frozen one."""
+    the model in the tree must be the round's frozen one.
+
+    With a generator, a cell of the generator sweep (v20.2): bank is the sweep's directory and
+    the cell goes into the generator's own bank under it, NarrativeQA then MultiHop; the code
+    in the tree must give the sweep's frozen model with the reader (FROZEN_CODE or SAME_OUTPUTS)."""
     import subprocess
 
     from ours.model import CODE_FINGERPRINT
-    from scripts.report_ours import FROZEN_CODE
+    from scripts.report_ours import FROZEN_CODE, SAME_OUTPUTS
 
-    frozen = FROZEN_CODE.get(bank.name)
-    if frozen is None:
-        rounds = ", ".join(name for name, code in FROZEN_CODE.items() if code)
-        raise SystemExit(f"[scored] REFUSED: {bank} is not a frozen round's bank ({rounds})")
-    if frozen != CODE_FINGERPRINT:
-        raise SystemExit(f"[scored] REFUSED: the model in this tree is {CODE_FINGERPRINT}; "
-                         f"round {bank.name} is frozen at {frozen}. Check out its commit.")
-    out = bank / f"{benchmark}_OURS_validation.jsonl"
+    if generator is None:
+        frozen = FROZEN_CODE.get(bank.name)
+        if frozen is None:
+            rounds = ", ".join(name for name, code in FROZEN_CODE.items() if code)
+            raise SystemExit(f"[scored] REFUSED: {bank} is not a frozen round's bank ({rounds})")
+        if frozen != CODE_FINGERPRINT:
+            raise SystemExit(f"[scored] REFUSED: the model in this tree is {CODE_FINGERPRINT}; "
+                             f"round {bank.name} is frozen at {frozen}. Check out its commit.")
+        cell_bank, model, order = bank, settings.READER, SCORED_BENCHMARKS
+    else:
+        from scripts.report_generators import SWEEP_CODE
+
+        sweep_generator(generator)
+        if benchmark not in SWEEP_BENCHMARKS:
+            raise SystemExit(f"[scored] REFUSED: the sweep runs {' and '.join(SWEEP_BENCHMARKS)}, "
+                             f"not {benchmark}")
+        frozen = SWEEP_CODE.get(bank.name)
+        if frozen is None:
+            raise SystemExit(f"[scored] REFUSED: {bank} is not a registered sweep "
+                             f"({', '.join(SWEEP_CODE) or 'none'})")
+        if SAME_OUTPUTS.get(CODE_FINGERPRINT, CODE_FINGERPRINT) != frozen:
+            raise SystemExit(f"[scored] REFUSED: the model in this tree is {CODE_FINGERPRINT}; "
+                             f"the sweep {bank.name} runs {frozen}. Check out its commit.")
+        cell_bank, model, order = sweep_bank(bank, generator), generator, SWEEP_BENCHMARKS
+    out = cell_bank / f"{benchmark}_OURS_validation.jsonl"
     summary = out.with_suffix(".summary.json")
     if summary.exists():
         print(f"[scored] {benchmark}: complete, {summary}; a scored cell runs once")
         return
     if benchmark == MULTIHOP:
-        missing = [b for b in SCORED_BENCHMARKS if b != MULTIHOP
-                   and not (bank / f"{b}_OURS_validation.summary.json").exists()]
+        missing = [b for b in order if b != MULTIHOP
+                   and not (cell_bank / f"{b}_OURS_validation.summary.json").exists()]
         if missing:
             raise SystemExit(f"[scored] REFUSED: MultiHop runs last; not complete: {', '.join(missing)}")
     run = run or subprocess.run
-    bank.mkdir(parents=True, exist_ok=True)
+    cell_bank.mkdir(parents=True, exist_ok=True)
     with kept_on_drive(out, local_dir) as rows_path:
         refuse_other_code(rows_path, CODE_FINGERPRINT)
         command = [sys.executable, "-m", "src.eval.runner", "--system", "OURS",
                    "--benchmark", benchmark, "--split", "validation",
-                   "--generator", settings.READER, "--output", str(rows_path), "--resume"]
+                   "--generator", model, "--output", str(rows_path), "--resume"]
         print("[scored] " + " ".join(command), flush=True)
         code = run(command, cwd=str(Path(__file__).resolve().parents[1])).returncode
         if code:
@@ -730,30 +778,36 @@ def scored_cell(benchmark: str, bank: Path, local_dir: Path | None = None, run=N
                              f"are kept for --resume")
     if rows_path != out:
         _copy_whole(rows_path.with_suffix(".summary.json"), summary)
-    print(f"[scored] {benchmark}: complete, rows and summary in {bank}")
+    print(f"[scored] {benchmark}: complete, rows and summary in {cell_bank}")
 
 
-def build_own_trees(benchmark: str, lockfile: Path = Path("requirements.lock"), check_env=None) -> dict:
+def build_own_trees(benchmark: str, lockfile: Path = Path("requirements.lock"), check_env=None,
+                    generator: str | None = None) -> dict:
     """Build ours' own trees for a scored benchmark's units holding a document under M4's
     filter, where the scored cell will read them, in a process holding only what M4's
     builder loads (the reader as summariser, and mpnet). A scored cell builds the same tree
     with bge-m3 and the reranker already on the GPU, which a large pooled shard's summary
     batches do not fit beside. Same builder, settings and cache key as the cell's (the
-    batches follow the prompts' lengths, not free memory), so the cell then reads them warm."""
+    batches follow the prompts' lengths, not free memory), so the cell then reads them warm.
+
+    With a sweep generator (v20.2), every unit's tree, as its sweep cell will read it: each
+    is the generator's own (M4's builder, in ours' cache), and none is banked."""
     from ours.model import OursSystem, check_model_revisions
     from src import paths
     from src.eval.runner import BENCHMARK_REGISTRY, assert_environment_pinned
 
+    model = settings.READER if generator is None else sweep_generator(generator)
     (check_env or assert_environment_pinned)(lockfile)
     if settings.TREE_BUILD_ENV is None:
         raise SystemExit("[trees] REFUSED: ours/config.py TREE_BUILD_ENV is unset")
-    check_model_revisions()
-    print(f"[trees] {benchmark}: cache {paths.cache_dir()}", flush=True)
-    ours = OursSystem(config=llama_config())
+    check_model_revisions(model)
+    print(f"[trees] {benchmark}: {model}, cache {paths.cache_dir()}", flush=True)
+    ours = OursSystem(config=generator_config(model))
     counts = {"units": 0, "warm": 0, "built": 0}
     for unit in BENCHMARK_REGISTRY[benchmark]().iter_eval_units(split="validation"):
         tree, n_short = ours.tree_for(unit.corpus)
-        if not n_short:
+        # The reader's other units read M4's banked trees, which ours never builds.
+        if not n_short and model == settings.READER:
             continue
         counts["units"] += 1
         if tree.substrate_warm_path(unit.corpus):
@@ -767,9 +821,57 @@ def build_own_trees(benchmark: str, lockfile: Path = Path("requirements.lock"), 
         counts["built"] += 1
         print(f"[trees] {unit.corpus_id}: built, {n_short} short documents, "
               f"{len(tree.chunks)} leaves, {time.perf_counter() - t0:.0f} s", flush=True)
+        # One of the summariser's own texts, to read before a cell spends hours on it.
+        summary = next((n.text for n in tree._tree.nodes.values() if n.layer > 0), None)
+        if summary is not None:
+            print(f"[trees]   a summary: {summary[:300]!r}", flush=True)
     print(f"[trees] {benchmark}: ours' own tree on {counts['units']} units: "
           f"{counts['warm']} already warm, {counts['built']} built", flush=True)
     return counts
+
+
+def _hub_tokenizer(model: str, revision: str):
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(model, revision=revision)
+
+
+def _hub_generation(model: str, revision: str) -> dict:
+    from transformers import GenerationConfig
+
+    try:
+        return GenerationConfig.from_pretrained(model, revision=revision).to_diff_dict()
+    except OSError:
+        return {}
+
+
+def check_templates(load_tokenizer=_hub_tokenizer, load_generation=_hub_generation) -> list[dict]:
+    """The reader's and each sweep generator's chat template, at its pin: a prompt as the harness
+    renders it (on the fixed date) against the template left to itself, and the generation
+    settings the model ships, which greedy decoding keeps apart from sampling (a repetition
+    penalty, the stop tokens). The reader's prompt must not change with the fixed date. Reads
+    tokenizer and config files only; a gated model must be open to the session's token."""
+    from src.models import chat_text
+
+    out = []
+    for model, revision in ((settings.READER, settings.READER_REVISION),
+                            *settings.SWEEP_GENERATORS.items()):
+        tokenizer = load_tokenizer(model, revision)
+        given = chat_text(tokenizer, "SYSTEM", "USER")
+        alone = tokenizer.apply_chat_template(
+            [{"role": "system", "content": "SYSTEM"}, {"role": "user", "content": "USER"}],
+            tokenize=False, add_generation_prompt=True)
+        if model == settings.READER and given != alone:
+            raise SystemExit(f"[templates] REFUSED: {model}'s prompt changes with the fixed date; "
+                             "the reader would no longer read the prompts of its rounds")
+        generation = load_generation(model, revision)
+        kept = {k: generation[k] for k in ("eos_token_id", "repetition_penalty") if k in generation}
+        line = {"model": model, "date_replaced": given != alone, "prompt": given, "generation": kept}
+        out.append(line)
+        print(f"[templates] {model}: "
+              f"{'its own date replaced by the fixed one' if line['date_replaced'] else 'unchanged'}; "
+              f"ships {kept}\n    {given!r}", flush=True)
+    return out
 
 
 # --- bench: retrieval alone, option against option -------------------------
@@ -1163,12 +1265,19 @@ def main() -> None:
     s = sub.add_parser("scored", help="One scored cell of a frozen round, through the runner.")
     s.add_argument("--benchmark", required=True, choices=SCORED_BENCHMARKS)
     s.add_argument("--bank", type=Path, required=True,
-                   help="The round's bank, named by its version (for example .../outputs/ours_v20).")
+                   help="The round's bank, named by its version (for example .../outputs/ours_v20); "
+                        "with --generator, the sweep's directory (.../outputs/ours_v20_generators).")
     s.add_argument("--local-dir", type=Path, default=None,
                    help="Write rows here and copy them to Drive every 5 minutes (a cell that may outlive a session).")
-    t = sub.add_parser("trees", help="Build ours' own trees for a scored benchmark, reader and mpnet only.")
+    s.add_argument("--generator", default=None,
+                   help="A cell of the generator sweep: one of ours/config.py SWEEP_GENERATORS.")
+    t = sub.add_parser("trees", help="Build ours' own trees for a scored benchmark, summariser and mpnet only.")
     t.add_argument("--benchmark", required=True, choices=SCORED_BENCHMARKS)
     t.add_argument("--lockfile", type=Path, default=Path("requirements.lock"))
+    t.add_argument("--generator", default=None,
+                   help="A sweep generator: every tree its sweep cell will read.")
+    sub.add_parser("templates", help="The reader's and each sweep generator's chat template and "
+                                     "generation settings, from the hub; tokenizer files only.")
     i = sub.add_parser("inspect", help="Answer-side breakdown of a development cell.")
     i.add_argument("--benchmark", required=True, choices=sorted(HELD_OUT))
     i.add_argument("--version", required=True)
@@ -1216,10 +1325,13 @@ def main() -> None:
         print(json.dumps(compare_versions(rows_of(args.a), rows_of(args.b), golds), indent=2))
         return
     if args.command == "trees":
-        build_own_trees(args.benchmark, args.lockfile)
+        build_own_trees(args.benchmark, args.lockfile, generator=args.generator)
         return
     if args.command == "scored":
-        scored_cell(args.benchmark, args.bank, args.local_dir)
+        scored_cell(args.benchmark, args.bank, args.local_dir, generator=args.generator)
+        return
+    if args.command == "templates":
+        check_templates()
         return
     if args.command == "census":
         census(args.p11)

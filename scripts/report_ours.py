@@ -77,7 +77,9 @@ FROZEN_CODE: dict = {"ours": "d975038e7513cf11", "ours_v20": "e77ef1d48101c109"}
 # still carry the fingerprint frozen for it. v20.1 (2026-11-18, OURS_VERSIONS "v20.1"): BM25
 # from a postings table, the paraphrase view searched once, a large unit's bge-m3 vectors
 # cached, and the report-only plain answer behind PLAIN_ANSWER, off (on, the rows are v20's).
-SAME_OUTPUTS: dict = {"4fa3bb8d36c3ddb7": "e77ef1d48101c109"}
+# v20.2 (2026-11-19, OURS_VERSIONS "v20.2"): v20.1 plus the generator sweep; with the reader,
+# the same classes, pins and prompts (the fixed template date is the one Llama 3.1's prints).
+SAME_OUTPUTS: dict = {"4fa3bb8d36c3ddb7": "e77ef1d48101c109", "c3a2b90fd8db1fcb": "e77ef1d48101c109"}
 # Credited refusals per bank and cell: recorded at the bank's first export,
 # then gated. HotpotQA cells credit nothing: the yes/no guard scores a refusal
 # 0. Round 1's MultiHop and NarrativeQA recorded 2026-10-29 from the scored
