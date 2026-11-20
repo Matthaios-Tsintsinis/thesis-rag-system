@@ -76,8 +76,9 @@ FAMILY_O = (("multihop_rag", "retrieval", "M3"),
 # Round 2, outputs/ours_v20/: development v20, frozen 2026-11-09 at 13a0ebd.
 FROZEN_CODE: dict = {"ours": "d975038e7513cf11", "ours_v20": "e77ef1d48101c109"}
 # The full round (2026-11-20, OURS_VERSIONS "Full splits"), keyed by its bank: round 2's model
-# on every question of NarrativeQA's test split and of HotpotQA's dev set, both variants, in
-# place of the registered samples. Ours runs first, building every tree in its own cache.
+# on every question of NarrativeQA's test split and of HotpotQA's dev set (distractor), in
+# place of the registered samples; pooled HotpotQA is not in it. Ours runs first, building
+# every tree in its own cache.
 FULL_CODE: dict = {"ours_v20_full": "e77ef1d48101c109"}
 # Code changed for speed alone, proven to give a frozen model's answers and evidence bit for
 # bit, keyed by its fingerprint: the frozen fingerprint whose outputs it gives. A round's rows
@@ -239,7 +240,7 @@ def judge(rows, *, directional: bool) -> list[dict]:
 # corpus for all) have no such groups and keep the per-question tests.
 
 LEVEL = {"narrativeqa": "story", "narrativeqa_test": "story",
-         "hotpotqa_pooled": "shard", "hotpotqa_pooled_full": "shard"}
+         "hotpotqa_pooled": "shard"}
 # Fewer clusters than this and the interval rests on too few draws to rely on (round 2's
 # pooled has 10 shards); the row says so.
 MIN_CLUSTERS = 30

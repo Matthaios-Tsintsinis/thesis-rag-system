@@ -24,7 +24,6 @@ from .hotpotqa import (
     HotpotQABenchmark,
     HotpotQAFullBenchmark,
     HotpotQAPooledBenchmark,
-    HotpotQAPooledFullBenchmark,
 )
 from .multihop import MultiHopBenchmark
 from .narrativeqa import NarrativeQABenchmark, NarrativeQATestBenchmark
@@ -48,10 +47,9 @@ BENCHMARK_REGISTRY: dict[str, type] = {
     # harness choice: our construction, not comparable to published HotpotQA (METHODS §B.4)
     "hotpotqa_pooled": HotpotQAPooledBenchmark,
     # The full round: every story of NarrativeQA's test split (run with --split test) and
-    # every HotpotQA dev question, both variants, in place of the registered samples.
+    # every HotpotQA dev question (distractor), in place of the registered samples.
     "narrativeqa_test": NarrativeQATestBenchmark,
     "hotpotqa_full": HotpotQAFullBenchmark,
-    "hotpotqa_pooled_full": HotpotQAPooledFullBenchmark,
 }
 
 

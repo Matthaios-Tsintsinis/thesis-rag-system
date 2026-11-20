@@ -1,5 +1,6 @@
 """The full round (OURS_VERSIONS "Full splits"): round 2's model on every question of
-NarrativeQA's test split and HotpotQA's dev set (both variants), ours first.
+NarrativeQA's test split and HotpotQA's dev set (distractor), ours first. Pooled HotpotQA is
+not in it (the operator, 2026-11-20).
 
 The three full benchmarks read every story or question, never a draw, and declare the counts
 the runner checks. Ours' cells run them into the full round's bank; ours builds every tree
@@ -98,31 +99,20 @@ def hf_rows(rows):
 
 
 class TestHotpotQAFull(unittest.TestCase):
-    """Every dev question, both variants; the registered loaders still draw their 1,000."""
+    """Every dev question, distractor setting; the registered loader still draws its 1,000."""
 
     def test_every_question_not_the_draw(self):
         rows = _fake_rows(1200)
         with hf_rows(rows):
             self.assertEqual(len(hq.HotpotQAFullBenchmark()._load()), 1200)
             self.assertEqual(len(hq.HotpotQABenchmark()._load()), hq.PREREGISTERED_Q)
-            self.assertEqual(len(hq.HotpotQAPooledFullBenchmark()._load()), 1200)
-
-    def test_pooled_shards_of_a_hundred_in_dataset_order(self):
-        with hf_rows(_fake_rows(250)):
-            bench = hq.HotpotQAPooledFullBenchmark()
-            with contextlib.redirect_stdout(io.StringIO()):
-                units = list(bench.iter_eval_units(split="validation"))
-        self.assertEqual([len(u.queries) for u in units], [100, 100, 50])
-        self.assertEqual([q.query_id for q in units[1].queries][:2], ["q100", "q101"])
+            self.assertEqual(len(hq.HotpotQAPooledBenchmark()._load()), hq.PREREGISTERED_Q)
 
     def test_they_declare_the_dev_sets_counts(self):
         self.assertEqual((hq.HotpotQAFullBenchmark.name, hq.HotpotQAFullBenchmark().cell_units),
                          ("hotpotqa_full", 7405))
-        self.assertEqual((hq.HotpotQAPooledFullBenchmark.name,
-                          hq.HotpotQAPooledFullBenchmark().cell_units),
-                         ("hotpotqa_pooled_full", 75))
-        self.assertEqual(hq.HotpotQAPooledFullBenchmark().variant, "pooled")
         self.assertEqual(hq.HotpotQAFullBenchmark().variant, "distractor")
+        self.assertFalse(hasattr(hq, "HotpotQAPooledFullBenchmark"))
 
 
 class TestRegistry(unittest.TestCase):
@@ -131,14 +121,13 @@ class TestRegistry(unittest.TestCase):
 
         self.assertIs(BENCHMARK_REGISTRY["narrativeqa_test"], nq.NarrativeQATestBenchmark)
         self.assertIs(BENCHMARK_REGISTRY["hotpotqa_full"], hq.HotpotQAFullBenchmark)
-        self.assertIs(BENCHMARK_REGISTRY["hotpotqa_pooled_full"], hq.HotpotQAPooledFullBenchmark)
+        self.assertNotIn("hotpotqa_pooled_full", BENCHMARK_REGISTRY)
         self.assertIs(BENCHMARK_REGISTRY["narrativeqa"], nq.NarrativeQABenchmark)
 
     def test_the_full_rounds_benchmarks_and_splits(self):
-        self.assertEqual(dev_ours.FULL_BENCHMARKS,
-                         ("narrativeqa_test", "hotpotqa_full", "hotpotqa_pooled_full"))
+        self.assertEqual(dev_ours.FULL_BENCHMARKS, ("narrativeqa_test", "hotpotqa_full"))
         self.assertEqual([dev_ours.split_of(b) for b in dev_ours.FULL_BENCHMARKS],
-                         ["test", "validation", "validation"])
+                         ["test", "validation"])
         self.assertEqual({dev_ours.split_of(b) for b in dev_ours.SCORED_BENCHMARKS}, {"validation"})
 
     def test_the_full_round_runs_round_twos_model(self):
@@ -199,9 +188,9 @@ class TestFullCell(unittest.TestCase):
                          ["narrativeqa_test_OURS_test.jsonl", "narrativeqa_test_OURS_test.summary.json"])
 
     def test_hotpotqa_reads_the_dev_set_in_any_order(self):
-        self._cell("hotpotqa_pooled_full")
         self._cell("hotpotqa_full")
-        self.assertEqual([c[c.index("--split") + 1] for c in self.commands], ["validation"] * 2)
+        self._cell("narrativeqa_test")
+        self.assertEqual([c[c.index("--split") + 1] for c in self.commands], ["validation", "test"])
         self.assertIn("hotpotqa_full_OURS_validation.summary.json",
                       [p.name for p in self.bank.iterdir()])
 
@@ -297,7 +286,7 @@ class TestFullTrees(unittest.TestCase):
     def test_hotpotqa_full_reads_validation(self):
         _SplitUnits.asked = []
         with tempfile.TemporaryDirectory() as td:
-            self._build(Path(td) / "cache_ours_full", benchmark="hotpotqa_pooled_full")
+            self._build(Path(td) / "cache_ours_full", benchmark="hotpotqa_full")
         self.assertEqual(_SplitUnits.asked, ["validation"])
 
     def test_only_in_ours_own_cache_and_with_the_reader(self):
@@ -322,10 +311,16 @@ class TestCli(unittest.TestCase):
         with mock.patch.object(dev_ours, "scored_cell", lambda *a, **k: seen.append(("scored", a[0]))), \
                 mock.patch.object(dev_ours, "build_own_trees", lambda *a, **k: seen.append(("trees", a[0]))):
             for argv in (["scored", "--benchmark", "narrativeqa_test", "--bank", "x/ours_v20_full"],
-                         ["trees", "--benchmark", "hotpotqa_pooled_full"]):
+                         ["trees", "--benchmark", "hotpotqa_full"]):
                 with mock.patch.object(sys, "argv", ["dev_ours", *argv]):
                     dev_ours.main()
-        self.assertEqual(seen, [("scored", "narrativeqa_test"), ("trees", "hotpotqa_pooled_full")])
+        self.assertEqual(seen, [("scored", "narrativeqa_test"), ("trees", "hotpotqa_full")])
+        with mock.patch.object(sys, "argv", ["dev_ours", "scored", "--benchmark", "hotpotqa_pooled_full",
+                                             "--bank", "x/ours_v20_full"]), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as refused:
+            dev_ours.main()
+        # argparse's own refusal: pooled HotpotQA is no choice of the full round.
+        self.assertEqual(refused.exception.code, 2)
 
 
 if __name__ == "__main__":

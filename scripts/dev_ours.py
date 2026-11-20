@@ -19,9 +19,9 @@
 The generator sweep (v20.2): `trees` and `scored` with --generator, one of
 ours/config.py SWEEP_GENERATORS, into the sweep's directory (ours_v20_generators).
 
-The full round: `trees` and `scored` on narrativeqa_test (NarrativeQA's test split),
-hotpotqa_full and hotpotqa_pooled_full (every HotpotQA dev question), into the full
-round's bank (ours_v20_full), every tree in ours' own cache (THESIS_CACHE_DIR ending in
+The full round: `trees` and `scored` on narrativeqa_test (NarrativeQA's test split) and
+hotpotqa_full (every HotpotQA dev question, distractor setting), into the full round's
+bank (ours_v20_full), every tree in ours' own cache (THESIS_CACHE_DIR ending in
 cache_ours_full).
 
 Held-out data: HotpotQA validation questions outside the registered 1,000
@@ -75,9 +75,10 @@ SCORED_BENCHMARKS = ("multihop_rag", "narrativeqa", "hotpotqa", "hotpotqa_pooled
 # The generator sweep (v20.2): these two, in this order, for each generator.
 SWEEP_BENCHMARKS = ("narrativeqa", "multihop_rag")
 # The full round (OURS_VERSIONS "Full splits"): every question, in place of the registered
-# samples. NarrativeQA's test split, never read in development, and HotpotQA's whole dev set,
-# both variants (its 300 development questions among them, reported apart).
-FULL_BENCHMARKS = ("narrativeqa_test", "hotpotqa_full", "hotpotqa_pooled_full")
+# samples. NarrativeQA's test split, never read in development, and HotpotQA's whole dev set
+# in the distractor setting (its 300 development questions among them, reported apart). Pooled
+# HotpotQA is not in it (the operator, 2026-11-20).
+FULL_BENCHMARKS = ("narrativeqa_test", "hotpotqa_full")
 # The split each benchmark is read from; every other benchmark's is validation.
 SPLITS = {"narrativeqa_test": "test"}
 # Ours runs the full round first and builds every tree it reads itself, M4's included, in

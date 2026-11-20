@@ -27,12 +27,11 @@ class TestWhichDocument(unittest.TestCase):
         shards = {"h1": "shard001", "h2": "shard002"}
         for benchmark in ("narrativeqa", "narrativeqa_test"):
             self.assertEqual(ro.clusters_of(benchmark)("s9::q0"), "s9")
-        for benchmark in ("hotpotqa_pooled", "hotpotqa_pooled_full"):
-            self.assertEqual(ro.clusters_of(benchmark, shards)("h2"), "shard002")
+        self.assertEqual(ro.clusters_of("hotpotqa_pooled", shards)("h2"), "shard002")
         for benchmark in ("hotpotqa", "hotpotqa_full", "multihop_rag"):
             self.assertIsNone(ro.clusters_of(benchmark, shards))
         self.assertEqual(ro.LEVEL["narrativeqa_test"], "story")
-        self.assertEqual(ro.LEVEL["hotpotqa_pooled_full"], "shard")
+        self.assertNotIn("hotpotqa_pooled_full", ro.LEVEL)
 
     def test_a_pooled_question_outside_the_shards_is_refused(self):
         with self.assertRaisesRegex(SystemExit, "no shard"):

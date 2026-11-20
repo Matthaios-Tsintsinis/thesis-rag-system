@@ -496,27 +496,11 @@ class HotpotQAFullBenchmark(HotpotQABenchmark):
         return DEV_QUESTIONS
 
 
-class HotpotQAPooledFullBenchmark(HotpotQAPooledBenchmark):
-    """Pooled variant on every dev question, in dataset order, shards of 100 (the full round)."""
-
-    name = "hotpotqa_pooled_full"
-
-    def __init__(self) -> None:
-        """No sample size: every question of the split, the registered shard size."""
-        super().__init__(max_questions=None)
-
-    @property
-    def cell_units(self) -> int:
-        """Every dev question in shards of shard_questions: 75 (the last holds 5)."""
-        return -(-DEV_QUESTIONS // self.shard_questions)
-
-
 __all__ = [
     "DEV_QUESTIONS",
     "HotpotQABenchmark",
     "HotpotQAFullBenchmark",
     "HotpotQAPooledBenchmark",
-    "HotpotQAPooledFullBenchmark",
     "hotpot_token_f1",
     "hotpot_token_f1_prf",
     "SHARD_QUESTIONS",
