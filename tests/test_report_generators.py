@@ -22,8 +22,8 @@ from scripts import report_ours as ro
 V20 = "e77ef1d48101c109"
 FAST = "1234abcd1234abcd"
 TINY, SMALL = "meta-llama/Llama-3.2-1B-Instruct", "Qwen/Qwen2.5-1.5B-Instruct"
-GOLDS = {"n0": ("Paris",), "n1": ("Rome",), "m0": ("Reuters",), "m1": ("BBC",), "m2": ()}
-DOCS = {"n0": frozenset(), "n1": frozenset(), "m0": frozenset({"A"}),
+GOLDS = {"s0::q0": ("Paris",), "s1::q0": ("Rome",), "m0": ("Reuters",), "m1": ("BBC",), "m2": ()}
+DOCS = {"s0::q0": frozenset(), "s1::q0": frozenset(), "m0": frozenset({"A"}),
         "m1": frozenset({"B"}), "m2": frozenset()}
 
 
@@ -68,8 +68,8 @@ def _cell(bank: Path, generator: str, benchmark: str, rows, gpu="NVIDIA L4"):
 
 def narrativeqa(code, right):
     """Two stories' questions; `right` of them answered."""
-    return [_row("n0", 1.0 if right > 0 else 0.0, "Paris" if right > 0 else "Lyon", code),
-            _row("n1", 1.0 if right > 1 else 0.0, "Rome" if right > 1 else "Milan", code)]
+    return [_row("s0::q0", 1.0 if right > 0 else 0.0, "Paris" if right > 0 else "Lyon", code),
+            _row("s1::q0", 1.0 if right > 1 else 0.0, "Rome" if right > 1 else "Milan", code)]
 
 
 def multihop(code, first):
@@ -141,6 +141,36 @@ class TestCollect(unittest.TestCase):
         self.assertEqual(reader["f1"], 0.5)
         self.assertNotIn("answer_delta_vs_reader", reader)
 
+    def test_narrativeqa_also_resamples_whole_stories(self):
+        """Beside the per-question interval, one that resamples stories; MultiHop has none."""
+        with tempfile.TemporaryDirectory() as td, _reading():
+            banks = _Banks(Path(td))
+            rows = rg.collect(banks.sweep, banks.reader, loaders=LOADERS)
+        by = {(r["generator"], r["benchmark"]): r for r in rows}
+        small_nqa = by[(SMALL, "narrativeqa")]
+        self.assertEqual(small_nqa["n_stories"], 2)
+        self.assertLessEqual(small_nqa["answer_story_ci_lo"], small_nqa["answer_delta_vs_reader"])
+        self.assertGreaterEqual(small_nqa["answer_story_ci_hi"], small_nqa["answer_delta_vs_reader"])
+        self.assertNotIn("n_stories", by[(SMALL, "multihop_rag")])
+        for column in ("n_stories", "answer_story_ci_lo", "answer_story_ci_hi"):
+            self.assertIn(column, rg.CSV_COLUMNS)
+
+    def test_the_story_intervals_leave_the_question_intervals_as_they_were(self):
+        """The story-level draws use their own generator, so the per-question intervals do not move."""
+        with tempfile.TemporaryDirectory() as td, _reading():
+            banks = _Banks(Path(td))
+            rows = rg.collect(banks.sweep, banks.reader, loaders=LOADERS)
+            reader = banks.reader / "narrativeqa_OURS_validation.jsonl"
+            tiny = dev_ours.sweep_bank(banks.sweep, TINY) / "narrativeqa_OURS_validation.jsonl"
+            small = dev_ours.sweep_bank(banks.sweep, SMALL) / "narrativeqa_OURS_validation.jsonl"
+            # The generators in run order draw from one generator: the 1B first, then the 1.5B.
+            rng = np.random.default_rng(ro.SEED)
+            rg.against(reader, tiny, "answer", rng)
+            want = rg.against(reader, small, "answer", rng)
+        got = {(r["generator"], r["benchmark"]): r for r in rows}[(SMALL, "narrativeqa")]
+        self.assertEqual((got["n_paired"], got["answer_delta_vs_reader"], got["answer_ci_lo"],
+                          got["answer_ci_hi"]), want)
+
     def test_the_table_shows_what_has_run(self):
         with tempfile.TemporaryDirectory() as td, _reading():
             banks = _Banks(Path(td))
@@ -194,6 +224,9 @@ class TestQwenBaselines(unittest.TestCase):
         self.assertEqual([(g["system"], g["metric"]) for g in got],
                          [(s, "answer") for s in ro.SYSTEMS])
         self.assertTrue(all(abs(g["delta"] - 0.5) < 1e-12 and g["n"] == 2 for g in got))
+        # NarrativeQA's comparisons also resample whole stories.
+        self.assertTrue(all(g["n_stories"] == 2 and g["story_lo"] <= g["delta"] <= g["story_hi"]
+                            for g in got))
 
 
 class _Template:

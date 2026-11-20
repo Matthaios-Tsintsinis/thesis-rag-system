@@ -51,6 +51,9 @@ SHARD_QUESTIONS = 100
 # harness choice: preregistered sample size, drawn under the shared seed (METHODS §B.3)
 PREREGISTERED_Q = 1000
 
+# dataset: hotpotqa/hotpot_qa distractor, validation: every question (the full round)
+DEV_QUESTIONS = 7405
+
 # Rank-aware K grid at title level.
 # harness choice: two gold titles, Hit@2 is the headline (METHODS §B.3)
 RANK_K_VALUES = (1, 2, 5, 10)
@@ -478,9 +481,42 @@ class HotpotQAPooledBenchmark(HotpotQABenchmark):
             )
 
 
+class HotpotQAFullBenchmark(HotpotQABenchmark):
+    """Distractor setting on every dev question, no draw (the full round)."""
+
+    name = "hotpotqa_full"
+
+    def __init__(self) -> None:
+        """No sample size: every question of the split."""
+        super().__init__(max_questions=None)
+
+    @property
+    def cell_units(self) -> int:
+        """One corpus per question, every dev question."""
+        return DEV_QUESTIONS
+
+
+class HotpotQAPooledFullBenchmark(HotpotQAPooledBenchmark):
+    """Pooled variant on every dev question, in dataset order, shards of 100 (the full round)."""
+
+    name = "hotpotqa_pooled_full"
+
+    def __init__(self) -> None:
+        """No sample size: every question of the split, the registered shard size."""
+        super().__init__(max_questions=None)
+
+    @property
+    def cell_units(self) -> int:
+        """Every dev question in shards of shard_questions: 75 (the last holds 5)."""
+        return -(-DEV_QUESTIONS // self.shard_questions)
+
+
 __all__ = [
+    "DEV_QUESTIONS",
     "HotpotQABenchmark",
+    "HotpotQAFullBenchmark",
     "HotpotQAPooledBenchmark",
+    "HotpotQAPooledFullBenchmark",
     "hotpot_token_f1",
     "hotpot_token_f1_prf",
     "SHARD_QUESTIONS",

@@ -39,9 +39,17 @@ VALID_SPLITS = ("train", "validation", "test")
 # harness choice: preregistered seeded draw of 40 (METHODS §B.2)
 CELL_UNITS = 40
 
+# The cap that asks for every story of a split, whatever its size: no draw.
+ALL_UNITS = "all"
 
-def select_units(order: list, max_units: int | None) -> list:
+# dataset: deepmind/narrativeqa test, 355 stories, 10,557 questions (NarrativeQA paper, Table 1)
+TEST_STORIES = 355
+
+
+def select_units(order: list, max_units: int | str | None) -> list:
     """Resolve the seeded story draw; None means the cell, not the split."""
+    if max_units == ALL_UNITS:
+        return list(order)
     # Each n has its own seeded set, so a smaller n is a different draw,
     # not a prefix. Asking for the full split (115) drops nothing.
     effective = CELL_UNITS if max_units is None else max_units
@@ -237,4 +245,28 @@ class NarrativeQABenchmark:
         )
 
 
-__all__ = ["NarrativeQABenchmark"]
+class NarrativeQATestBenchmark(NarrativeQABenchmark):
+    """Every story of NarrativeQA's test split, no draw: the split the papers report.
+
+    The full round (ours' OURS_VERSIONS, "Full splits") runs it; ours' development read
+    validation stories only, so none of these was ever read before."""
+
+    name = "narrativeqa_test"
+    # Population one cell resolves to; the runner aborts on any other count.
+    cell_units = TEST_STORIES
+
+    def iter_eval_units(
+        self,
+        *,
+        split: str,
+        max_units: int | str | None = None,
+    ) -> Iterable[EvalUnit]:
+        """Every story of the test split; any other split is refused."""
+        if split != "test":
+            raise ValueError(
+                f"{self.name} reads NarrativeQA's test split only; got {split!r}")
+        return super().iter_eval_units(
+            split="test", max_units=ALL_UNITS if max_units is None else max_units)
+
+
+__all__ = ["ALL_UNITS", "NarrativeQABenchmark", "NarrativeQATestBenchmark", "TEST_STORIES"]

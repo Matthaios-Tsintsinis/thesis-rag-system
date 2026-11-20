@@ -7,7 +7,8 @@ comparisons, so no family, no Holm and no verdict, only differences and their in
          finished cell (smallest first, the reader last): F1 (MultiHop: answerable, with the
          supplementary beside), EM, the refused share, MultiHop's null score, R@5 and hit@5
          from ours' document ranking, ours' mechanics and seconds per question, and the cell
-         against the reader's on the same questions (mean difference, 95% bootstrap CI).
+         against the reader's on the same questions (mean difference, 95% bootstrap CI;
+         on NarrativeQA also with whole stories resampled).
          With --comparison, the matrix's M1-M4 rows of each generator that has a column
          (Qwen2.5-7B and the reader); with --p10, ours under Qwen2.5-7B against the Qwen
          column's M1-M4 on the same questions.
@@ -35,9 +36,12 @@ from scripts.report_ours import (
     SYSTEMS,
     bootstrap_ci,
     check_doc_ranking,
+    cluster_bootstrap_ci,
     credited,
     paired,
+    paired_keys,
     row_scores,
+    story_of,
 )
 
 # The sweep's directory name -> the frozen model it runs (with the reader, its rows would be
@@ -53,7 +57,8 @@ CSV_COLUMNS = ["generator", "params_b", "benchmark", "n_queries", "f1", "f1_supp
                "refused_pct", "n_credited", "null_score", "recall_at_5", "hit_at_5", "map_at_10",
                "parse_failure_rate", "mean_llm_calls", "mean_aspects", "mean_evidence_tokens",
                "s_per_question", "gpu", "answer_delta_vs_reader", "answer_ci_lo", "answer_ci_hi",
-               "retrieval_delta_vs_reader", "retrieval_ci_lo", "retrieval_ci_hi", "n_paired"]
+               "retrieval_delta_vs_reader", "retrieval_ci_lo", "retrieval_ci_hi", "n_paired",
+               "n_stories", "answer_story_ci_lo", "answer_story_ci_hi"]
 
 
 def short(model: str) -> str:
@@ -112,6 +117,17 @@ def against(base_path: Path, other_path: Path, metric: str, rng) -> tuple:
     return len(d), float(np.mean(d)), lo, hi
 
 
+def against_stories(base_path: Path, other_path: Path, metric: str, rng) -> tuple:
+    """other minus base on NarrativeQA's questions both score, whole stories resampled:
+    (stories, CI low, CI high). A story's questions rise and fall together."""
+    keys, d = paired_keys(row_scores(base_path, metric), row_scores(other_path, metric))
+    if not len(d):
+        return 0, None, None
+    labels = [story_of(k) for k in keys]
+    lo, hi = cluster_bootstrap_ci(d, labels, rng)
+    return len(set(labels)), lo, hi
+
+
 def collect(sweep: Path, reader_bank: Path, loaders=None) -> list[dict]:
     """Every finished cell of the sweep, smallest generator first, then the reader's."""
     from src.eval.runner import BENCHMARK_REGISTRY
@@ -123,6 +139,8 @@ def collect(sweep: Path, reader_bank: Path, loaders=None) -> list[dict]:
         _fail(f"the reader's cells are round 2's bank, {READER_BANK}, frozen at {frozen}")
     loaders = loaders or {b: BENCHMARK_REGISTRY[b]() for b in SWEEP_BENCHMARKS}
     rng = np.random.default_rng(SEED)
+    # The story-level draws have a generator of their own: the per-question intervals stay.
+    story_rng = np.random.default_rng(SEED)
     out = []
     for benchmark in SWEEP_BENCHMARKS:
         golds, docs = golds_of(loaders[benchmark])
@@ -141,7 +159,10 @@ def collect(sweep: Path, reader_bank: Path, loaders=None) -> list[dict]:
             n, row["answer_delta_vs_reader"], row["answer_ci_lo"], row["answer_ci_hi"] = against(
                 reader_path, path, "answer", rng)
             row["n_paired"] = n
-            if benchmark != "narrativeqa":
+            if benchmark == "narrativeqa":
+                (row["n_stories"], row["answer_story_ci_lo"],
+                 row["answer_story_ci_hi"]) = against_stories(reader_path, path, "answer", story_rng)
+            else:
                 (_, row["retrieval_delta_vs_reader"], row["retrieval_ci_lo"],
                  row["retrieval_ci_hi"]) = against(reader_path, path, "retrieval", rng)
             out.append(row)
@@ -152,6 +173,7 @@ def collect(sweep: Path, reader_bank: Path, loaders=None) -> list[dict]:
 def baselines(sweep: Path, p10: Path, rows) -> list[dict]:
     """Ours under Qwen2.5-7B against the Qwen column's M1-M4, paired, where both have run."""
     rng = np.random.default_rng(SEED)
+    story_rng = np.random.default_rng(SEED)
     out = []
     for benchmark in SWEEP_BENCHMARKS:
         if not finished(sweep_bank(sweep, QWEN), benchmark):
@@ -162,9 +184,14 @@ def baselines(sweep: Path, p10: Path, rows) -> list[dict]:
             for metric in metrics:
                 if system == "M1" and metric == "retrieval":
                     continue
-                n, delta, lo, hi = against(p10 / f"{benchmark}_{system}_validation.jsonl", path, metric, rng)
-                out.append({"benchmark": benchmark, "system": system, "metric": metric,
-                            "n": n, "delta": delta, "lo": lo, "hi": hi})
+                base = p10 / f"{benchmark}_{system}_validation.jsonl"
+                n, delta, lo, hi = against(base, path, metric, rng)
+                row = {"benchmark": benchmark, "system": system, "metric": metric,
+                       "n": n, "delta": delta, "lo": lo, "hi": hi}
+                if benchmark == "narrativeqa":
+                    row["n_stories"], row["story_lo"], row["story_hi"] = against_stories(
+                        base, path, metric, story_rng)
+                out.append(row)
     return out
 
 
@@ -179,6 +206,13 @@ def _ci(row, key):
             f"[{row[f'{key}_ci_lo']:+.4f}, {row[f'{key}_ci_hi']:+.4f}]")
 
 
+def _story_ci(row):
+    if row.get("answer_story_ci_lo") is None:
+        return "—"
+    return (f"[{row['answer_story_ci_lo']:+.4f}, {row['answer_story_ci_hi']:+.4f}] "
+            f"({row['n_stories']} stories)")
+
+
 def write_outputs(rows, out_dir: Path, comparison: Path | None = None, paired_baselines=None) -> None:
     with (out_dir / "GENERATORS_OURS.csv").open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS, extrasaction="ignore")
@@ -191,15 +225,17 @@ def write_outputs(rows, out_dir: Path, comparison: Path | None = None, paired_ba
              "Each generator is ours' one model: the reader, every query-side call, and the tree "
              f"summariser, with trees of its own. {reader} is round 2's cells of the same model. "
              "Descriptive: Δ is the generator's cell minus the reader's on the same questions, "
-             "with a 95% bootstrap interval; no test, no verdict. Ours' R@5 ranks only its final "
-             "context (at most 15 chunks).", ""]
+             "with a 95% bootstrap interval; no test, no verdict. On NarrativeQA a second interval "
+             "resamples whole stories, whose questions rise and fall together. Ours' R@5 ranks "
+             "only its final context (at most 15 chunks).", ""]
     for benchmark in SWEEP_BENCHMARKS:
         mhr = benchmark == "multihop_rag"
         lines += [f"## {DATASET_LABEL[benchmark]}", "",
                   "| generator | params (B) | F1 | EM | refused | " + ("null | R@5 | " if mhr else "")
-                  + f"Δ F1 vs {reader} [95% CI] | " + (f"Δ retrieval F1 vs {reader} [95% CI] | " if mhr else "")
+                  + f"Δ F1 vs {reader} [95% CI] | " + (f"Δ retrieval F1 vs {reader} [95% CI] | " if mhr
+                                                     else "stories resampled [95% CI] | ")
                   + "parse failures | evidence tokens | s / question | GPU |",
-                  "|---|---|---|---|---|" + ("---|---|" if mhr else "") + "---|" + ("---|" if mhr else "")
+                  "|---|---|---|---|---|" + ("---|---|" if mhr else "") + "---|---|"
                   + "---|---|---|---|"]
         for r in rows:
             if r["benchmark"] != benchmark:
@@ -215,6 +251,8 @@ def write_outputs(rows, out_dir: Path, comparison: Path | None = None, paired_ba
             cells.append(_ci(r, "answer") if r["generator"] != settings.READER else "(reference)")
             if mhr:
                 cells.append(_ci(r, "retrieval") if r["generator"] != settings.READER else "(reference)")
+            else:
+                cells.append(_story_ci(r) if r["generator"] != settings.READER else "(reference)")
             cells += [f"{r['parse_failure_rate']:.1%}", f"{r['mean_evidence_tokens']:.0f}",
                       _fmt(r["s_per_question"], 1), str(r["gpu"])]
             lines.append("| " + " | ".join(cells) + " |")
@@ -232,12 +270,15 @@ def write_outputs(rows, out_dir: Path, comparison: Path | None = None, paired_ba
         lines.append("")
     if paired_baselines:
         lines += [f"## Ours under {short(QWEN)} against the Qwen column, same questions", "",
-                  "| benchmark | against | measure | n | Δ (ours − baseline) [95% CI] |",
-                  "|---|---|---|---|---|"]
+                  "| benchmark | against | measure | n | Δ (ours − baseline) [95% CI] | "
+                  "stories resampled [95% CI] |",
+                  "|---|---|---|---|---|---|"]
         for p in paired_baselines:
             delta = "—" if p["delta"] is None else f"{p['delta']:+.4f} [{p['lo']:+.4f}, {p['hi']:+.4f}]"
+            stories = ("—" if p.get("story_lo") is None else
+                       f"[{p['story_lo']:+.4f}, {p['story_hi']:+.4f}] ({p['n_stories']} stories)")
             lines.append(f"| {DATASET_LABEL[p['benchmark']]} | {p['system']} | {p['metric']} F1 | "
-                         f"{p['n']} | {delta} |")
+                         f"{p['n']} | {delta} | {stories} |")
         lines.append("")
     (out_dir / "GENERATORS_OURS.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     print(f"[generators] wrote {out_dir / 'GENERATORS_OURS.csv'} and .md")

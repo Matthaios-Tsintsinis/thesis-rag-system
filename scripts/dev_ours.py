@@ -19,6 +19,11 @@
 The generator sweep (v20.2): `trees` and `scored` with --generator, one of
 ours/config.py SWEEP_GENERATORS, into the sweep's directory (ours_v20_generators).
 
+The full round: `trees` and `scored` on narrativeqa_test (NarrativeQA's test split),
+hotpotqa_full and hotpotqa_pooled_full (every HotpotQA dev question), into the full
+round's bank (ours_v20_full), every tree in ours' own cache (THESIS_CACHE_DIR ending in
+cache_ours_full).
+
 Held-out data: HotpotQA validation questions outside the registered 1,000
 (both variants) and NarrativeQA validation stories outside the registered 40.
 Three draws, which never meet: a, the first; b, larger, for development once a
@@ -69,6 +74,16 @@ N_LATER_STORIES = {"b": 40, "c": 25}
 SCORED_BENCHMARKS = ("multihop_rag", "narrativeqa", "hotpotqa", "hotpotqa_pooled")
 # The generator sweep (v20.2): these two, in this order, for each generator.
 SWEEP_BENCHMARKS = ("narrativeqa", "multihop_rag")
+# The full round (OURS_VERSIONS "Full splits"): every question, in place of the registered
+# samples. NarrativeQA's test split, never read in development, and HotpotQA's whole dev set,
+# both variants (its 300 development questions among them, reported apart).
+FULL_BENCHMARKS = ("narrativeqa_test", "hotpotqa_full", "hotpotqa_pooled_full")
+# The split each benchmark is read from; every other benchmark's is validation.
+SPLITS = {"narrativeqa_test": "test"}
+# Ours runs the full round first and builds every tree it reads itself, M4's included, in
+# this cache of its own: M4's banked cache keeps only trees M4 built, and M4's full cells can
+# later build theirs cold, as the cold-tree gate demands.
+FULL_CACHE = "cache_ours_full"
 
 
 def generator_config(generator: str):
@@ -97,6 +112,23 @@ def sweep_generator(generator: str) -> str:
 def sweep_bank(sweep: Path, generator: str) -> Path:
     """A generator's own bank under the sweep's directory, named after the model."""
     return Path(sweep) / generator.split("/")[-1]
+
+
+def split_of(benchmark: str) -> str:
+    """The split a benchmark's cells read."""
+    return SPLITS.get(benchmark, "validation")
+
+
+def full_cache() -> Path:
+    """The cache the full round's trees go into; refuse any other."""
+    from src import paths
+
+    cache = paths.cache_dir()
+    if cache.name != FULL_CACHE:
+        raise SystemExit(f"[full] REFUSED: the cache is {cache}. The full round builds its trees "
+                         f"in ours' own cache: set THESIS_CACHE_DIR to .../thesis_rag/{FULL_CACHE}, "
+                         "so M4's banked cache keeps only trees M4 built")
+    return cache
 
 
 # --- held-out loaders -----------------------------------------------------
@@ -724,17 +756,34 @@ def scored_cell(benchmark: str, bank: Path, local_dir: Path | None = None, run=N
 
     With a generator, a cell of the generator sweep (v20.2): bank is the sweep's directory and
     the cell goes into the generator's own bank under it, NarrativeQA then MultiHop; the code
-    in the tree must give the sweep's frozen model with the reader (FROZEN_CODE or SAME_OUTPUTS)."""
+    in the tree must give the sweep's frozen model with the reader (FROZEN_CODE or SAME_OUTPUTS).
+
+    In the full round's bank (FULL_CODE), a full benchmark, read from its own split (the test
+    split for narrativeqa_test), in any order, in ours' own cache; the code in the tree must
+    give the round's model (SAME_OUTPUTS)."""
     import subprocess
 
     from ours.model import CODE_FINGERPRINT
-    from scripts.report_ours import FROZEN_CODE, SAME_OUTPUTS
+    from scripts.report_ours import FROZEN_CODE, FULL_CODE, SAME_OUTPUTS
 
-    if generator is None:
+    if generator is None and bank.name in FULL_CODE:
+        frozen = FULL_CODE[bank.name]
+        if benchmark not in FULL_BENCHMARKS:
+            raise SystemExit(f"[scored] REFUSED: the full round runs {', '.join(FULL_BENCHMARKS)}, "
+                             f"not {benchmark}")
+        if SAME_OUTPUTS.get(CODE_FINGERPRINT, CODE_FINGERPRINT) != frozen:
+            raise SystemExit(f"[scored] REFUSED: the model in this tree is {CODE_FINGERPRINT}; "
+                             f"the full round {bank.name} runs {frozen}. Check out its commit.")
+        full_cache()
+        cell_bank, model, order = bank, settings.READER, FULL_BENCHMARKS
+    elif generator is None:
         frozen = FROZEN_CODE.get(bank.name)
         if frozen is None:
             rounds = ", ".join(name for name, code in FROZEN_CODE.items() if code)
             raise SystemExit(f"[scored] REFUSED: {bank} is not a frozen round's bank ({rounds})")
+        if benchmark not in SCORED_BENCHMARKS:
+            raise SystemExit(f"[scored] REFUSED: a round runs its registered benchmarks "
+                             f"({', '.join(SCORED_BENCHMARKS)}); {benchmark} is the full round's")
         if frozen != CODE_FINGERPRINT:
             raise SystemExit(f"[scored] REFUSED: the model in this tree is {CODE_FINGERPRINT}; "
                              f"round {bank.name} is frozen at {frozen}. Check out its commit.")
@@ -754,7 +803,8 @@ def scored_cell(benchmark: str, bank: Path, local_dir: Path | None = None, run=N
             raise SystemExit(f"[scored] REFUSED: the model in this tree is {CODE_FINGERPRINT}; "
                              f"the sweep {bank.name} runs {frozen}. Check out its commit.")
         cell_bank, model, order = sweep_bank(bank, generator), generator, SWEEP_BENCHMARKS
-    out = cell_bank / f"{benchmark}_OURS_validation.jsonl"
+    split = split_of(benchmark)
+    out = cell_bank / f"{benchmark}_OURS_{split}.jsonl"
     summary = out.with_suffix(".summary.json")
     if summary.exists():
         print(f"[scored] {benchmark}: complete, {summary}; a scored cell runs once")
@@ -769,7 +819,7 @@ def scored_cell(benchmark: str, bank: Path, local_dir: Path | None = None, run=N
     with kept_on_drive(out, local_dir) as rows_path:
         refuse_other_code(rows_path, CODE_FINGERPRINT)
         command = [sys.executable, "-m", "src.eval.runner", "--system", "OURS",
-                   "--benchmark", benchmark, "--split", "validation",
+                   "--benchmark", benchmark, "--split", split,
                    "--generator", model, "--output", str(rows_path), "--resume"]
         print("[scored] " + " ".join(command), flush=True)
         code = run(command, cwd=str(Path(__file__).resolve().parents[1])).returncode
@@ -791,11 +841,20 @@ def build_own_trees(benchmark: str, lockfile: Path = Path("requirements.lock"), 
     batches follow the prompts' lengths, not free memory), so the cell then reads them warm.
 
     With a sweep generator (v20.2), every unit's tree, as its sweep cell will read it: each
-    is the generator's own (M4's builder, in ours' cache), and none is banked."""
+    is the generator's own (M4's builder, in ours' cache), and none is banked.
+
+    On a full benchmark (the full round), every unit's tree with the reader, M4's included,
+    in ours' own cache (FULL_CACHE), so M4's banked cache keeps only trees M4 built."""
     from ours.model import OursSystem, check_model_revisions
     from src import paths
     from src.eval.runner import BENCHMARK_REGISTRY, assert_environment_pinned
 
+    full = benchmark in FULL_BENCHMARKS
+    if full and generator is not None:
+        raise SystemExit("[trees] REFUSED: the full round runs the reader; the sweep's generators "
+                         f"run {' and '.join(SWEEP_BENCHMARKS)}")
+    if full:
+        full_cache()
     model = settings.READER if generator is None else sweep_generator(generator)
     (check_env or assert_environment_pinned)(lockfile)
     if settings.TREE_BUILD_ENV is None:
@@ -804,10 +863,13 @@ def build_own_trees(benchmark: str, lockfile: Path = Path("requirements.lock"), 
     print(f"[trees] {benchmark}: {model}, cache {paths.cache_dir()}", flush=True)
     ours = OursSystem(config=generator_config(model))
     counts = {"units": 0, "warm": 0, "built": 0}
-    for unit in BENCHMARK_REGISTRY[benchmark]().iter_eval_units(split="validation"):
+    loader, n_seen = BENCHMARK_REGISTRY[benchmark](), 0
+    for unit in loader.iter_eval_units(split=split_of(benchmark)):
+        n_seen += 1
         tree, n_short = ours.tree_for(unit.corpus)
-        # The reader's other units read M4's banked trees, which ours never builds.
-        if not n_short and model == settings.READER:
+        # The reader's other units read M4's banked trees, which ours never builds; in the
+        # full round there are none, and ours builds them in its own cache.
+        if not n_short and model == settings.READER and not full:
             continue
         counts["units"] += 1
         if tree.substrate_warm_path(unit.corpus):
@@ -827,6 +889,12 @@ def build_own_trees(benchmark: str, lockfile: Path = Path("requirements.lock"), 
             print(f"[trees]   a summary: {summary[:300]!r}", flush=True)
     print(f"[trees] {benchmark}: ours' own tree on {counts['units']} units: "
           f"{counts['warm']} already warm, {counts['built']} built", flush=True)
+    # The runner checks the population only after a cell's last question; a full split
+    # that is not the size it declares is caught here, before the cell's hours.
+    declared = getattr(loader, "cell_units", None)
+    if full and declared is not None and n_seen != declared:
+        raise SystemExit(f"[trees] REFUSED: {benchmark} has {n_seen} units, not the {declared} "
+                         "it declares; the trees built are kept, the cell would fail its population check")
     return counts
 
 
@@ -1263,16 +1331,17 @@ def main() -> None:
     r.add_argument("--local-dir", type=Path, default=None,
                    help="Write rows here and copy them to Drive every 5 minutes (for a cell that may outlive a session).")
     s = sub.add_parser("scored", help="One scored cell of a frozen round, through the runner.")
-    s.add_argument("--benchmark", required=True, choices=SCORED_BENCHMARKS)
+    s.add_argument("--benchmark", required=True, choices=SCORED_BENCHMARKS + FULL_BENCHMARKS)
     s.add_argument("--bank", type=Path, required=True,
                    help="The round's bank, named by its version (for example .../outputs/ours_v20); "
+                        "the full round's, .../outputs/ours_v20_full (a full benchmark); "
                         "with --generator, the sweep's directory (.../outputs/ours_v20_generators).")
     s.add_argument("--local-dir", type=Path, default=None,
                    help="Write rows here and copy them to Drive every 5 minutes (a cell that may outlive a session).")
     s.add_argument("--generator", default=None,
                    help="A cell of the generator sweep: one of ours/config.py SWEEP_GENERATORS.")
     t = sub.add_parser("trees", help="Build ours' own trees for a scored benchmark, summariser and mpnet only.")
-    t.add_argument("--benchmark", required=True, choices=SCORED_BENCHMARKS)
+    t.add_argument("--benchmark", required=True, choices=SCORED_BENCHMARKS + FULL_BENCHMARKS)
     t.add_argument("--lockfile", type=Path, default=Path("requirements.lock"))
     t.add_argument("--generator", default=None,
                    help="A sweep generator: every tree its sweep cell will read.")

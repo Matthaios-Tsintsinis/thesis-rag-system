@@ -9,7 +9,10 @@
          ours' final answer beside its plain answer (the baselines' prompt on
          ours' evidence) where the rows hold one
   stats  Family O (the three declared comparisons, Holm, m = 3) and Family
-         O-x (ours against M1-M4 on the grid's seven families, Holm, m = 28)
+         O-x (ours against M1-M4 on the grid's seven families, Holm, m = 28);
+         then both again at story and shard level: NarrativeQA's questions
+         resampled and sign-flipped a story at a time, pooled HotpotQA's a
+         shard at a time (the declared numbers unchanged)
 """
 
 from __future__ import annotations
@@ -72,6 +75,10 @@ FAMILY_O = (("multihop_rag", "retrieval", "M3"),
 # frozen 2026-10-27 at 26a28e3, the model v2's held-out rows measured.
 # Round 2, outputs/ours_v20/: development v20, frozen 2026-11-09 at 13a0ebd.
 FROZEN_CODE: dict = {"ours": "d975038e7513cf11", "ours_v20": "e77ef1d48101c109"}
+# The full round (2026-11-20, OURS_VERSIONS "Full splits"), keyed by its bank: round 2's model
+# on every question of NarrativeQA's test split and of HotpotQA's dev set, both variants, in
+# place of the registered samples. Ours runs first, building every tree in its own cache.
+FULL_CODE: dict = {"ours_v20_full": "e77ef1d48101c109"}
 # Code changed for speed alone, proven to give a frozen model's answers and evidence bit for
 # bit, keyed by its fingerprint: the frozen fingerprint whose outputs it gives. A round's rows
 # still carry the fingerprint frozen for it. v20.1 (2026-11-18, OURS_VERSIONS "v20.1"): BM25
@@ -120,11 +127,16 @@ def row_scores(path: Path, metric: str) -> dict:
     return out
 
 
+def paired_keys(a: dict, b: dict) -> tuple[list, np.ndarray]:
+    """The queries both score, sorted, and b minus a on each."""
+    keys = [k for k in sorted(a.keys() & b.keys())
+            if a[k] is not None and b[k] is not None]
+    return keys, np.asarray([b[k] - a[k] for k in keys], dtype=float)
+
+
 def paired(a: dict, b: dict) -> np.ndarray:
     """b minus a over the queries both score."""
-    keys = sorted(a.keys() & b.keys())
-    return np.asarray([b[k] - a[k] for k in keys
-                       if a[k] is not None and b[k] is not None], dtype=float)
+    return paired_keys(a, b)[1]
 
 
 # --- the Phase-2 target -----------------------------------------------------
@@ -195,6 +207,11 @@ def run_family(tests, rng, *, directional: bool) -> list[dict]:
         rows.append({"name": name, "n": len(d), "delta": float(np.mean(d)),
                      "sd": sd, "mde": MDE_Z * sd / np.sqrt(len(d)), "lo": lo,
                      "hi": hi, "p": permutation_p(d, rng), "bar": bar})
+    return judge(rows, directional=directional)
+
+
+def judge(rows, *, directional: bool) -> list[dict]:
+    """Holm across a family's rows, then each row's verdict and its bar."""
     for row, p_holm in zip(rows, holm([r["p"] for r in rows])):
         row["p_holm"] = p_holm
         significant = p_holm < ALPHA
@@ -210,6 +227,112 @@ def run_family(tests, rng, *, directional: bool) -> list[dict]:
         # which holds the family's last bar by now).
         row["below_bar"] = row["bar"] is not None and abs(row["delta"]) < row["bar"]
     return rows
+
+
+# --- questions that share a document (story or shard) ---------------------------
+# NarrativeQA's questions come about 30 to a story, and a pooled shard's 100 share one
+# corpus, so they are not independent draws: a story that suits a system suits it on most
+# of its questions. The clustered tests resample (bootstrap) and sign-flip (permutation) a
+# whole story or shard at a time, and the standard error is the cluster-robust one. The
+# declared tests above are untouched and keep their own random stream; these draw from a
+# generator of their own. Distractor HotpotQA (a corpus per question) and MultiHop (one
+# corpus for all) have no such groups and keep the per-question tests.
+
+LEVEL = {"narrativeqa": "story", "narrativeqa_test": "story",
+         "hotpotqa_pooled": "shard", "hotpotqa_pooled_full": "shard"}
+# Fewer clusters than this and the interval rests on too few draws to rely on (round 2's
+# pooled has 10 shards); the row says so.
+MIN_CLUSTERS = 30
+
+
+def story_of(query_id: str) -> str:
+    """A NarrativeQA question's story: the loader names each question <story id>::q<n>."""
+    story, sep, _ = str(query_id).partition("::")
+    if not sep or not story:
+        raise ValueError(f"{query_id!r} names no story (<story id>::q<n>)")
+    return story
+
+
+def shards_of(loader, split: str = "validation") -> dict:
+    """query id -> the pooled shard (unit) that holds it, from the loader's own units."""
+    return {str(q.query_id): unit.corpus_id
+            for unit in loader.iter_eval_units(split=split) for q in unit.queries}
+
+
+def clusters_of(benchmark: str, shard_of: dict | None = None):
+    """The function naming each question's cluster on a benchmark, or None (no clusters)."""
+    level = LEVEL.get(benchmark)
+    if level == "story":
+        return story_of
+    if level == "shard":
+        def shard(query_id):
+            if query_id not in shard_of:
+                raise SystemExit(f"[report] REFUSED: {benchmark} question {query_id!r} is in no shard")
+            return shard_of[query_id]
+        return shard
+    return None
+
+
+def cluster_totals(d: np.ndarray, labels) -> tuple[np.ndarray, np.ndarray]:
+    """Each cluster's sum of differences and its size, clusters in first-seen order."""
+    index: dict = {}
+    codes = np.asarray([index.setdefault(label, len(index)) for label in labels])
+    sums = np.bincount(codes, weights=d, minlength=len(index))
+    counts = np.bincount(codes, minlength=len(index))
+    return sums, counts
+
+
+def cluster_se(d: np.ndarray, labels) -> float:
+    """Cluster-robust standard error of the mean difference (CR1: C / (C - 1))."""
+    sums, counts = cluster_totals(d, labels)
+    c = len(sums)
+    residual = sums - counts * float(np.mean(d))
+    return float(np.sqrt(c / (c - 1) * np.sum(residual ** 2)) / len(d))
+
+
+def cluster_bootstrap_ci(d: np.ndarray, labels, rng) -> tuple[float, float]:
+    """Percentile 95% CI on the mean difference, resampling whole clusters."""
+    sums, counts = cluster_totals(d, labels)
+    idx = rng.integers(0, len(sums), size=(N_BOOT, len(sums)))
+    lo, hi = np.percentile(sums[idx].sum(axis=1) / counts[idx].sum(axis=1), [2.5, 97.5])
+    return float(lo), float(hi)
+
+
+def cluster_permutation_p(d: np.ndarray, labels, rng) -> float:
+    """Two-sided paired sign-flip permutation test, one sign per cluster."""
+    sums, _ = cluster_totals(d, labels)
+    obs = abs(float(np.sum(sums)))
+    signs = rng.choice((-1.0, 1.0), size=(N_PERM, len(sums)))
+    null = np.abs(signs @ sums)
+    return float((np.sum(null >= obs) + 1) / (N_PERM + 1))
+
+
+def clustered_family(declared, tests, rng, *, directional: bool) -> list[dict]:
+    """The family again, each comparison whose questions share documents tested on those
+    documents (story or shard); the others as declared; Holm across the family again.
+
+    tests: (name, comparator scores, ours scores, bar, cluster function or None), in the
+    declared family's order."""
+    rows = []
+    for row, (name, comparator, ours, bar, cluster) in zip(declared, tests):
+        if cluster is None:
+            rows.append({**row, "level": "question", "n_clusters": row["n"],
+                         "se": row["sd"] / np.sqrt(row["n"]), "deff": 1.0, "few_clusters": False})
+            continue
+        keys, d = paired_keys(comparator, ours)
+        labels = [cluster(k) for k in keys]
+        sd = float(np.std(d, ddof=1))
+        se = cluster_se(d, labels)
+        lo, hi = cluster_bootstrap_ci(d, labels, rng)
+        n_clusters = len(set(labels))
+        rows.append({"name": name, "n": len(d), "delta": float(np.mean(d)), "sd": sd,
+                     "level": "story" if cluster is story_of else "shard",
+                     "n_clusters": n_clusters, "se": se,
+                     "deff": (se / (sd / np.sqrt(len(d)))) ** 2 if sd else float("nan"),
+                     "mde": MDE_Z * se, "lo": lo, "hi": hi,
+                     "p": cluster_permutation_p(d, labels, rng), "bar": bar,
+                     "few_clusters": n_clusters < MIN_CLUSTERS})
+    return judge(rows, directional=directional)
 
 
 # --- gates on ours' cells -----------------------------------------------------
@@ -477,8 +600,11 @@ def write_outputs(rows, mechanics, out_dir: Path, plains=None) -> None:
 # --- the families ---------------------------------------------------------------
 
 
-def stats(p11: Path, ours_dir: Path) -> list[dict]:
-    """Family O (directional, Holm m = 3), then Family O-x (exploratory, Holm m = 28)."""
+def stats(p11: Path, ours_dir: Path, shard_of: dict | None = None) -> list[dict]:
+    """Family O (directional, Holm m = 3), then Family O-x (exploratory, Holm m = 28), as
+    declared; then both again with NarrativeQA tested by story and pooled by shard.
+
+    shard_of: query id -> pooled shard; read from the pooled loader when not given."""
     if POOLED_MAP10_BAR is None:
         raise SystemExit("[report] REFUSED: POOLED_MAP10_BAR is unset; run `bar` "
                          "and record it before any ours row exists")
@@ -508,10 +634,44 @@ def stats(p11: Path, ours_dir: Path) -> list[dict]:
                          f"{r['mde']:7.4f} [{r['lo']:+.4f},{r['hi']:+.4f}] {r['p']:7.4f} "
                          f"{r['p_holm']:7.4f}  {r['verdict']}{note}")
         lines.append("")
+
+    # The same families with the questions of one story (NarrativeQA) or one shard (pooled)
+    # resampled and sign-flipped together; a generator of their own, so the declared
+    # numbers above are what they were.
+    if shard_of is None:
+        from src.eval.runner import BENCHMARK_REGISTRY
+
+        shard_of = shards_of(BENCHMARK_REGISTRY["hotpotqa_pooled"]())
+    cluster_rng = np.random.default_rng(SEED)
+    clustered_o = clustered_family(
+        family_o, [(f"{b} {m}: ours vs {c}", scores(p11, b, c, m), scores(ours_dir, b, "OURS", m),
+                    bars[(b, m)], clusters_of(b, shard_of)) for b, m, c in FAMILY_O],
+        cluster_rng, directional=True)
+    clustered_x = clustered_family(
+        family_x, [(f"{b} {m}: ours vs {c}", scores(p11, b, c, m), scores(ours_dir, b, "OURS", m),
+                    None, clusters_of(b, shard_of)) for b, m in GRID_FAMILIES for c in SYSTEMS],
+        cluster_rng, directional=False)
+    lines += ["Below, each comparison on NarrativeQA resamples and sign-flips whole stories and "
+              "each on pooled HotpotQA whole shards (SE cluster-robust; deff = (SE / per-question "
+              "SE)^2; MDE = 2.8 x SE); the rest are the declared per-question tests.", ""]
+    for title, rows in (("Family O, story and shard level (Holm m = 3)", clustered_o),
+                        ("Family O-x, story and shard level (Holm m = 28)", clustered_x)):
+        lines += [f"=== {title} ===",
+                  f"{'comparison':40s} {'level':>8s} {'n':>5s} {'groups':>6s} {'delta':>8s} "
+                  f"{'SE':>7s} {'deff':>6s} {'MDE':>7s} {'95% CI':>19s} {'p':>7s} {'p_holm':>7s}  verdict"]
+        for r in rows:
+            note = ("  (below its bar: undetectable at this n)" if r["below_bar"] else "") + (
+                f"  (few clusters: {r['n_clusters']} {r['level']}s, below {MIN_CLUSTERS}; "
+                "a sensitivity check only)" if r["few_clusters"] else "")
+            lines.append(f"{r['name']:40s} {r['level']:>8s} {r['n']:5d} {r['n_clusters']:6d} "
+                         f"{r['delta']:+8.4f} {r['se']:7.4f} {r['deff']:6.2f} {r['mde']:7.4f} "
+                         f"[{r['lo']:+.4f},{r['hi']:+.4f}] {r['p']:7.4f} {r['p_holm']:7.4f}  "
+                         f"{r['verdict']}{note}")
+        lines.append("")
     text = "\n".join(lines)
     print(text)
     (ours_dir / "STATS_OURS.txt").write_text(text, encoding="utf-8")
-    return family_o + family_x
+    return family_o + family_x + clustered_o + clustered_x
 
 
 def main() -> None:

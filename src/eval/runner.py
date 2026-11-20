@@ -20,9 +20,14 @@ from ..retrievers.m3_hybrid import HybridRRFSystem
 from ..retrievers.m4_raptor import RaptorSystem
 from ours.model import OursSystem
 from .base import BenchmarkRunner
-from .hotpotqa import HotpotQABenchmark, HotpotQAPooledBenchmark
+from .hotpotqa import (
+    HotpotQABenchmark,
+    HotpotQAFullBenchmark,
+    HotpotQAPooledBenchmark,
+    HotpotQAPooledFullBenchmark,
+)
 from .multihop import MultiHopBenchmark
-from .narrativeqa import NarrativeQABenchmark
+from .narrativeqa import NarrativeQABenchmark, NarrativeQATestBenchmark
 
 
 SYSTEM_REGISTRY: dict[str, type[BaseSystem]] = {
@@ -42,6 +47,11 @@ BENCHMARK_REGISTRY: dict[str, type] = {
     "hotpotqa": HotpotQABenchmark,
     # harness choice: our construction, not comparable to published HotpotQA (METHODS §B.4)
     "hotpotqa_pooled": HotpotQAPooledBenchmark,
+    # The full round: every story of NarrativeQA's test split (run with --split test) and
+    # every HotpotQA dev question, both variants, in place of the registered samples.
+    "narrativeqa_test": NarrativeQATestBenchmark,
+    "hotpotqa_full": HotpotQAFullBenchmark,
+    "hotpotqa_pooled_full": HotpotQAPooledFullBenchmark,
 }
 
 
@@ -448,7 +458,7 @@ def main() -> None:
     parser.add_argument(
         "--split",
         required=True,
-        help="Dataset split; every matrix cell runs 'validation'.",
+        help="Dataset split; every matrix cell runs 'validation', narrativeqa_test 'test'.",
     )
     parser.add_argument(
         "--output",
