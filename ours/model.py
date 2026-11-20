@@ -1386,7 +1386,8 @@ class OursSystem(BaseSystem):
         prepared = self.prepare(query, k=k)
         # The baselines' own prompt on the same evidence: for the report, never
         # the answer, and not one of the system's calls; asked only with
-        # PLAIN_ANSWER on (off from v20.1). It shares no state with the calls below.
+        # PLAIN_ANSWER on (off in v20.1 and v20.2, on from v20.3). It shares no
+        # state with the calls below.
         plain = (models.generate(system_prompt=settings.ANSWER_PROMPT,
                                  user_prompt=prepared.user_prompt,
                                  cfg=self.config.generation)

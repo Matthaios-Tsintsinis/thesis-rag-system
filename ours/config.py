@@ -279,9 +279,11 @@ READER_REASK_PROMPT = REASK_PROMPT + " " + REASON_LINE
 
 # The plain answer (development v14): the baselines' answer prompt, asked once on ours'
 # evidence and saved as ours_plain_answer for the report's answer-step table; never the
-# answer and not counted as a call. Off from v20.1 (2026-11-18): round 2's rows hold it,
-# and it costs about 6 % of a round. Turn it on to measure the answer step again.
-PLAIN_ANSWER = False
+# answer and not counted as a call. Off in v20.1 and v20.2 (2026-11-18) to save about 6 % of
+# a round; on again from v20.3 (2026-11-20, the operator): the full round's control for
+# better evidence against a better answer step, as round 2's rows hold it. On, the rows are
+# v20's, the plain answer included.
+PLAIN_ANSWER = True
 
 # A reply with no "Answer:" line goes on whole (development v19). With the gold
 # paragraphs taken out of held-out questions, 39 / 54 such replies ended by saying

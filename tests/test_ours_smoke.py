@@ -247,12 +247,14 @@ class TestOursSmoke(unittest.TestCase):
 
     def test_answer_prompt_and_refusal(self):
         """The reader sees its prompt once per question; the refusal is detected. The
-        baselines' plain prompt is not asked with PLAIN_ANSWER off (v20.1)."""
+        baselines' plain prompt is asked once per question too, its reply saved on the row
+        and never scored (on again from v20.3)."""
         answer_calls = [p for p in self.reader.prompts
                         if p[0] == settings.READER_PROMPT]
         self.assertEqual(len(answer_calls), 2)
-        self.assertFalse(any(p[0] == settings.ANSWER_PROMPT for p in self.reader.prompts))
-        self.assertFalse(any("ours_plain_answer" in r["metadata"] for r in self.cold))
+        plain_calls = [p for p in self.reader.prompts if p[0] == settings.ANSWER_PROMPT]
+        self.assertEqual(len(plain_calls), 2)
+        self.assertTrue(all("ours_plain_answer" in r["metadata"] for r in self.cold))
         self.assertTrue(self.cold[1]["answer"]["metadata"]["abstained"])
         self.assertEqual(self.cold[0]["answer"]["value"], 1.0)
 

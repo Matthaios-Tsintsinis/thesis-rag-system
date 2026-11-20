@@ -87,7 +87,10 @@ FULL_CODE: dict = {"ours_v20_full": "e77ef1d48101c109"}
 # cached, and the report-only plain answer behind PLAIN_ANSWER, off (on, the rows are v20's).
 # v20.2 (2026-11-19, OURS_VERSIONS "v20.2"): v20.1 plus the generator sweep; with the reader,
 # the same classes, pins and prompts (the fixed template date is the one Llama 3.1's prints).
-SAME_OUTPUTS: dict = {"4fa3bb8d36c3ddb7": "e77ef1d48101c109", "c3a2b90fd8db1fcb": "e77ef1d48101c109"}
+# v20.3 (2026-11-20, OURS_VERSIONS "v20.3"): v20.2 with PLAIN_ANSWER on again, the full
+# round's answer-step control; on, the rows are v20's, the plain answer included.
+SAME_OUTPUTS: dict = {"4fa3bb8d36c3ddb7": "e77ef1d48101c109", "c3a2b90fd8db1fcb": "e77ef1d48101c109",
+                      "008fc330608cf24c": "e77ef1d48101c109"}
 # Credited refusals per bank and cell: recorded at the bank's first export,
 # then gated. HotpotQA cells credit nothing: the yes/no guard scores a refusal
 # 0. Round 1's MultiHop and NarrativeQA recorded 2026-10-29 from the scored

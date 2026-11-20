@@ -14,6 +14,9 @@ import numpy as np
 
 from scripts import report_ours as ro
 
+# v20.3's fingerprint (ours/model.py + ours/config.py, line endings normalised).
+V20_3 = "008fc330608cf24c"
+
 
 def _row(qid, answer, retr=None, map10=None, hit=None, mrr=0.0, meta=None):
     """A banked row reduced to what the report reads."""
@@ -134,9 +137,11 @@ class TestOursCellGates(unittest.TestCase):
         self.assertEqual(ro.SAME_OUTPUTS.get(CODE_FINGERPRINT, CODE_FINGERPRINT), latest)
 
     def test_speed_only_code_answers_to_a_frozen_round(self):
-        # v20.1 (speed), then v20.2 (the generator sweep, the reader's path unchanged).
+        # v20.1 (speed), v20.2 (the generator sweep, the reader's path unchanged), then v20.3
+        # (the plain answer on again: with it on, the rows are v20's, the plain answer included).
         self.assertEqual(ro.SAME_OUTPUTS, {"4fa3bb8d36c3ddb7": "e77ef1d48101c109",
-                                           "c3a2b90fd8db1fcb": "e77ef1d48101c109"})
+                                           "c3a2b90fd8db1fcb": "e77ef1d48101c109",
+                                           V20_3: "e77ef1d48101c109"})
         self.assertLessEqual(set(ro.SAME_OUTPUTS.values()), set(ro.FROZEN_CODE.values()))
         # A round's rows still carry the fingerprint frozen for it, not the faster code's.
         rows = {"multihop_rag": [{"metadata": {"ours_code": "4fa3bb8d36c3ddb7"}}]}
@@ -264,7 +269,8 @@ class TestOursRowEndToEnd(unittest.TestCase):
         try:
             ours_dir = case.dir / "ours"
             # A cell with the plain answer off holds none, so the report writes no plain table.
-            case._main(ours_dir / "off.jsonl")
+            with mock.patch.object(settings, "PLAIN_ANSWER", False):
+                case._main(ours_dir / "off.jsonl")
             self.assertFalse(any("ours_plain_answer" in r["metadata"]
                                  for r in ro.read_rows(ours_dir / "off.jsonl")))
             # On, every row holds one, and the report scores it.

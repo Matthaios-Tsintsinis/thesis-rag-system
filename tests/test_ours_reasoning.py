@@ -1,7 +1,8 @@
 """Pins that the reader reasons before it answers: only its last "Answer:" line goes on
 to step 10, a refusal is read from that line, and the baselines' plain prompt, when
 PLAIN_ANSWER is on, is asked once on the same evidence, saved for the report, never the
-answer and never counted. Off from v20.1, which changes nothing else."""
+answer and never counted. Off in v20.1 and v20.2, on again from v20.3 (the full round's
+answer-step control); either way nothing else changes."""
 
 from __future__ import annotations
 
@@ -90,16 +91,25 @@ class TestTheAnswerPath(unittest.TestCase):
         self.assertEqual(result.extra["ours_plain_answer"], PLAIN)
         self.assertNotEqual(result.answer, PLAIN)
 
-    def test_the_plain_answer_is_off_by_default(self):
-        self.assertFalse(settings.PLAIN_ANSWER)
+    def test_the_plain_answer_is_on_by_default_again(self):
+        """v20.3: every row holds the plain answer, asked once, as round 2's rows do."""
+        self.assertTrue(settings.PLAIN_ANSWER)
         reader = ReasoningReader()
         result = run(reader)
+        self.assertEqual(result.extra["ours_plain_answer"], PLAIN)
+        self.assertEqual(sum(s == settings.ANSWER_PROMPT for s, _ in reader.prompts), 1)
+
+    def test_switched_off_it_is_not_asked(self):
+        reader = ReasoningReader()
+        with mock.patch.object(settings, "PLAIN_ANSWER", False):
+            result = run(reader)
         self.assertNotIn("ours_plain_answer", result.extra)
         self.assertFalse(any(s == settings.ANSWER_PROMPT for s, _ in reader.prompts))
 
     def test_turning_it_on_changes_nothing_but_the_plain_answer(self):
         off_reader, on_reader = ReasoningReader(), ReasoningReader()
-        off = run(off_reader)
+        with mock.patch.object(settings, "PLAIN_ANSWER", False):
+            off = run(off_reader)
         with mock.patch.object(settings, "PLAIN_ANSWER", True):
             on = run(on_reader)
         self.assertEqual(on.answer, off.answer)
