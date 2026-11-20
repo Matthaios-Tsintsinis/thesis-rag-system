@@ -12,7 +12,6 @@ from ..retrievers.base import RetrievedChunk
 from .alignment import score_retrieval_ck2, score_retrieval_rank_aware
 from .sampling import SUBSAMPLE_SEED, subsample_indices
 from .scorers.extractive import (
-    assert_gold_not_empty,
     normalize_qasper_answer,
     token_f1,
 )
@@ -84,14 +83,14 @@ def hotpot_token_f1_prf(predicted: str, gold: str) -> tuple[float, float, float]
     if np_ != ng_ and (np_ in _HOTPOT_SENTINELS or ng_ in _HOTPOT_SENTINELS):
         return 0.0, 0.0, 0.0
 
-    # Empty side: 1.0 only when both are empty; an empty prediction scores 0
-    # here as in the official, which returns zero on no shared token.
-    # SQuAD 2.0 evaluate-v2.0.py rule; unreachable, loaders refuse empty gold
+    # An empty side shares no token, so zero, both sides empty included, as in
+    # the official. Two dev answers normalise to nothing ("The The", "!!!"):
+    # every prediction scores F1 0 on them, as the official scores them.
+    # official: hotpot_evaluate_v1.py::f1_score @ 36358534 (num_same == 0)
     pred_tokens = np_.split()
     gold_tokens = ng_.split()
     if not pred_tokens or not gold_tokens:
-        agree = float(pred_tokens == gold_tokens)
-        return agree, agree, agree
+        return 0.0, 0.0, 0.0
     # P = shared/pred, R = shared/gold, F1 = 2PR/(P+R).
     # official: hotpot_evaluate_v1.py::f1_score @ 36358534
     common = Counter(pred_tokens) & Counter(gold_tokens)
@@ -140,10 +139,15 @@ def _gold_atoms(row: Any) -> frozenset[tuple[str, str]]:
 def _query(row: Any, variant: str, parent_scope: str | None) -> EvalQuery:
     """Build the EvalQuery for one row."""
     answer = (row.get("answer") or "").strip()
-    # HotpotQA has no unanswerable questions, so every gold must survive
-    # normalisation.
-    assert_gold_not_empty(query_id=str(row["id"]), gold=answer,
-                          benchmark="hotpotqa")
+    # HotpotQA has no unanswerable questions, so an empty answer is malformed.
+    # An answer the normalisation erases is a real one ("The The", "!!!" in the
+    # dev set, outside the registered 1,000): the official evaluator keeps it,
+    # every prediction scoring F1 0 and EM by normalised equality, and so does
+    # the scorer here.
+    if not answer:
+        raise ValueError(
+            f"hotpotqa: query {row['id']!r} has no gold answer; ground truth is "
+            "malformed")
     atoms = _gold_atoms(row)
     return EvalQuery(
         query_id=str(row["id"]),

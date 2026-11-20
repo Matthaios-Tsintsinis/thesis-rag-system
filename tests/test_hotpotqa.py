@@ -476,5 +476,63 @@ class TestTheGuardIsHotpotLocal(unittest.TestCase):
         self.assertAlmostEqual(s.value, 0.2222, places=4)
 
 
+class TestAnswersTheNormalisationErases(unittest.TestCase):
+    """Two dev answers are names the official normalisation erases: 'The The' and '!!!'
+    (5ae4988655429970de88d9c1, 5a8b3d795542997f31a41cc1). The official evaluator keeps both:
+    every prediction scores F1 0 (no gold token to share) and EM 1 only for a prediction that
+    also normalises to nothing. The loader keeps them and the scorer scores them so; an empty
+    answer is still malformed and refused."""
+
+    @staticmethod
+    def official(prediction, ground_truth):
+        # official: hotpot_evaluate_v1.py::f1_score and exact_match_score @ 36358534
+        import re
+        import string
+        from collections import Counter
+
+        def norm(s):
+            s = "".join(ch for ch in s.lower() if ch not in set(string.punctuation))
+            return " ".join(re.sub(r"\b(a|an|the)\b", " ", s).split())
+        np_, ng = norm(prediction), norm(ground_truth)
+        em = float(np_ == ng)
+        if (np_ in ("yes", "no", "noanswer") or ng in ("yes", "no", "noanswer")) and np_ != ng:
+            return 0.0, em
+        num_same = sum((Counter(np_.split()) & Counter(ng.split())).values())
+        if num_same == 0:
+            return 0.0, em
+        p, r = num_same / len(np_.split()), num_same / len(ng.split())
+        return 2 * p * r / (p + r), em
+
+    def _query(self, answer):
+        row = _row("e1", [("Alpha", ["A one."]), ("Beta", ["B one."])], ["Alpha"], [0],
+                   answer=answer, qtype="comparison")
+        return _install(HotpotQABenchmark(), _FakeDS([row]))
+
+    def test_the_loader_keeps_them(self):
+        for answer in ("The The", "!!!"):
+            units = list(self._query(answer).iter_eval_units(split="validation"))
+            self.assertEqual(units[0].queries[0].gold_answers[0].free_form, answer)
+
+    def test_an_empty_answer_is_still_refused(self):
+        for answer in ("", "   "):
+            with self.assertRaisesRegex(ValueError, "no gold answer"):
+                list(self._query(answer).iter_eval_units(split="validation"))
+
+    def test_scored_as_the_official_evaluator_scores_them(self):
+        bench = HotpotQABenchmark()
+        for gold in ("The The", "!!!"):
+            q = list(self._query(gold).iter_eval_units(split="validation"))[0].queries[0]
+            for pred in ("The The", "!!!", "the", "", "The The (band)", "Matt Johnson", "yes"):
+                s = bench.score_answer(pred, q)
+                self.assertEqual((s.value, s.metadata["exact_match"]), self.official(pred, gold),
+                                 (gold, pred))
+
+    def test_both_empty_scores_zero_as_the_official(self):
+        self.assertEqual(hotpot_token_f1_prf("The The", "!!!"), (0.0, 0.0, 0.0))
+        self.assertEqual(hotpot_token_f1("", "The The"), 0.0)
+        # The shared scorer (MultiHop, NarrativeQA) keeps SQuAD's rule; its loaders refuse such gold.
+        self.assertEqual(token_f1("", ""), 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()
